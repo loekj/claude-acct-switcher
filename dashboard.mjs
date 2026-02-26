@@ -311,8 +311,8 @@ function saveProbeLogToDisk() {
 function recordProbe() { probeTracker.record(); saveProbeLogToDisk(); }
 function getProbeStats() { return probeTracker.getStats(); }
 
-const utilizationHistory = createUtilizationHistory(); // 5hr: 6h window, ~5 min intervals
-const weeklyHistory = createUtilizationHistory(7 * 24 * 60 * 60 * 1000, 168); // 7d: ~1hr intervals
+const utilizationHistory = createUtilizationHistory(); // 5h window, ~2 min intervals
+const weeklyHistory = createUtilizationHistory(7 * 24 * 60 * 60 * 1000, 15 * 60 * 1000); // 7d window, ~15 min intervals
 
 const HISTORY_FILE = join(__dirname, 'utilization-history.json');
 
