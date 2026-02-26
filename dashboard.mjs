@@ -428,17 +428,13 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
   const persisted = persistedState[fp];
   let fromPersisted = null;
   if (persisted && persisted.updatedAt) {
-    const nowSec = Math.floor(Date.now() / 1000);
-    // If the 5h window has reset since we last saved, utilization is effectively 0
-    const u5h = (persisted.resetAt && persisted.resetAt < nowSec) ? 0 : (persisted.utilization5h || 0);
-    const r5h = (persisted.resetAt && persisted.resetAt < nowSec) ? 0 : (persisted.resetAt || 0);
-    // If the 7d window has reset since we last saved, utilization is effectively 0
-    const u7d = (persisted.resetAt7d && persisted.resetAt7d < nowSec) ? 0 : (persisted.utilization7d || 0);
-    const r7d = (persisted.resetAt7d && persisted.resetAt7d < nowSec) ? 0 : (persisted.resetAt7d || 0);
+    // Pass through last-known values as-is. Don't zero out when the window
+    // epoch has passed — that causes the UI to flash "0% / rolling window"
+    // between data sources. The staleness indicator communicates the age.
     fromPersisted = {
       status: 'ok',
-      fiveH: { status: 'ok', reset: r5h, utilization: u5h },
-      sevenD: { status: 'ok', reset: r7d, utilization: u7d },
+      fiveH: { status: 'ok', reset: persisted.resetAt || 0, utilization: persisted.utilization5h || 0 },
+      sevenD: { status: 'ok', reset: persisted.resetAt7d || 0, utilization: persisted.utilization7d || 0 },
       fetchedAt: persisted.updatedAt,
     };
     // If probe suppressed, return persisted state (with reset-aware values)
@@ -2118,15 +2114,17 @@ function updateAccountState(token, name, headers, fingerprint) {
     const reset5h = Number(headers['anthropic-ratelimit-unified-5h-reset'] || 0);
 
     // Detect window resets using actual reset timestamps from API headers.
-    // Only clear history when the API reports a new rate-limit window, not on
-    // normal utilization fluctuations (avoids false positives at low usage).
+    // Rolling windows advance the reset epoch by seconds on each request,
+    // so require a large jump (>1h) to distinguish a true window reset from
+    // normal rolling advancement.  Also require utilization to have dropped.
+    const RESET_JUMP = 3600; // 1 hour in seconds
     const prevReset5h = persistedState[fingerprint]?.resetAt || 0;
-    if (reset5h > prevReset5h && prevReset5h > 0 && u5h < (utilizationHistory.getHistory(fingerprint).slice(-1)[0]?.u5h ?? u5h)) {
+    if (reset5h > prevReset5h + RESET_JUMP && prevReset5h > 0 && u5h < (utilizationHistory.getHistory(fingerprint).slice(-1)[0]?.u5h ?? u5h)) {
       utilizationHistory.load(fingerprint, []);
       delete _sparkCache[fingerprint + '_5h'];
     }
     const prevReset7d = persistedState[fingerprint]?.resetAt7d || 0;
-    if (reset7d > prevReset7d && prevReset7d > 0 && u7d < (weeklyHistory.getHistory(fingerprint).slice(-1)[0]?.u7d ?? u7d)) {
+    if (reset7d > prevReset7d + RESET_JUMP && prevReset7d > 0 && u7d < (weeklyHistory.getHistory(fingerprint).slice(-1)[0]?.u7d ?? u7d)) {
       weeklyHistory.load(fingerprint, []);
       delete _sparkCache[fingerprint + '_7d'];
     }
