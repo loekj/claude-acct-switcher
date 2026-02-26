@@ -318,7 +318,19 @@ export function createProbeTracker(maxAge = PROBE_LOG_MAX_AGE) {
     return log;
   }
 
-  return { record, getStats, getLog };
+  function load(entries) {
+    if (!entries || !entries.length) return;
+    const cutoff = Date.now() - maxAge;
+    const valid = entries.filter(e => e.ts >= cutoff);
+    log.length = 0;
+    for (const e of valid) log.push(e);
+  }
+
+  function toJSON() {
+    return log.slice();
+  }
+
+  return { record, getStats, getLog, load, toJSON };
 }
 
 // Re-export constants for tests
