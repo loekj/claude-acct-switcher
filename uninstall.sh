@@ -13,7 +13,7 @@ DIM='\033[2m'
 NC='\033[0m'
 
 INSTALL_DIR="$HOME/.claude/account-switcher"
-SNIPPET_MARKER="# claude-account-switcher"
+SNIPPET_MARKER="# BEGIN claude-account-switcher"
 
 echo ""
 echo -e "${BOLD}  Claude Account Switcher  - Uninstaller${NC}"
@@ -24,10 +24,9 @@ echo ""
 
 echo -e "  ${BOLD}This will:${NC}"
 echo -e "    1. Stop the running dashboard/proxy"
-echo -e "    2. Remove the auto-start block from your shell config"
-echo -e "    3. Remove the ${CYAN}ANTHROPIC_BASE_URL${NC} export"
-echo -e "    4. Remove the ${CYAN}csw${NC} symlink from PATH"
-echo -e "    5. Remove ${CYAN}$INSTALL_DIR${NC}"
+echo -e "    2. Remove the shell config block from your shell rc file"
+echo -e "    3. Remove the ${CYAN}csw${NC} symlink from PATH"
+echo -e "    4. Remove ${CYAN}$INSTALL_DIR${NC}"
 echo ""
 
 if [[ -d "$INSTALL_DIR/accounts" ]]; then
@@ -74,7 +73,7 @@ fi
 
 echo -e "  ${GREEN}✓${NC} Stopped dashboard/proxy"
 
-# ── 2 & 3. Remove shell config block ──
+# ── 2. Remove shell config block ──
 
 SHELL_RC=""
 for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
@@ -85,24 +84,14 @@ for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
 done
 
 if [[ -n "$SHELL_RC" ]]; then
-  # Remove the auto-start block (from marker line through the export line)
-  # Creates a backup first
   cp "$SHELL_RC" "${SHELL_RC}.csw-backup"
 
-  # Use sed to remove the block:
-  #   # claude-account-switcher  - auto-start proxy + set base URL
-  #   if ! lsof -iTCP:3333 ...
-  #     nohup node ...
-  #     disown
-  #   fi
-  #   export ANTHROPIC_BASE_URL=http://localhost:3334
-  sed -i '' '/^# claude-account-switcher/,/^export ANTHROPIC_BASE_URL.*localhost:3334/d' "$SHELL_RC"
+  sed -i '' '/^# BEGIN claude-account-switcher/,/^# END claude-account-switcher/d' "$SHELL_RC"
 
-  # Clean up any leftover blank lines at the end of the file
-  # (only strip trailing blank lines, nothing else)
-  while [[ -s "$SHELL_RC" ]] && [[ "$(tail -c 1 "$SHELL_RC" | xxd -p)" == "0a" ]] && [[ -z "$(tail -1 "$SHELL_RC")" ]]; do
-    # Check the last two lines  - only strip if the last TWO lines are blank (double newline from our insertion)
-    if [[ -z "$(tail -2 "$SHELL_RC" | head -1)" ]]; then
+  # Clean up trailing blank lines left behind
+  while [[ -s "$SHELL_RC" ]] && [[ -z "$(tail -1 "$SHELL_RC")" ]]; do
+    last_two=$(tail -2 "$SHELL_RC" | head -1)
+    if [[ -z "$last_two" ]]; then
       sed -i '' '$ d' "$SHELL_RC"
     else
       break
@@ -115,7 +104,7 @@ else
   echo -e "  ${DIM}No shell config block found (already clean)${NC}"
 fi
 
-# ── 4. Remove csw symlink ──
+# ── 3. Remove csw symlink ──
 
 removed_link=false
 for link in "$HOME/.local/bin/csw" "/usr/local/bin/csw"; do
@@ -132,7 +121,7 @@ if [[ "$removed_link" != "true" ]]; then
   echo -e "  ${DIM}No csw symlink found${NC}"
 fi
 
-# ── 5. Remove install directory ──
+# ── 4. Remove install directory ──
 
 if [[ -d "$INSTALL_DIR" ]]; then
   rm -rf "$INSTALL_DIR"
