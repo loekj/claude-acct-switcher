@@ -37,6 +37,8 @@ Van Damme-o-Matic does the splits across multiple accounts so you never have to.
 - **macOS Keychain** — credentials are stored securely in the system keychain, never in plaintext
 - **Zero dependencies** — pure Node.js + bash. No npm install needed.
 
+![Dashboard](VDM.png)
+
 ## Requirements
 
 - **macOS** (uses Keychain for credential storage)
@@ -92,25 +94,18 @@ ln -sf ~/.claude/account-switcher/vdm ~/.local/bin/vdm
 
 ### Adding Accounts
 
+Accounts are auto-discovered. Just log in and they're picked up:
+
 ```bash
-# Log in to account A
-claude login
-vdm add work
-
-# Log in to account B
-claude login
-vdm add personal
-
-# Label them (optional — auto-detected from Anthropic API)
-vdm label work alice@company.com
-vdm label personal bob@gmail.com
+claude login    # account A
+claude login    # account B — that's it
 ```
+
+Emails are fetched automatically from the Anthropic API. No manual naming or labeling needed.
 
 ### CLI Commands
 
 ```
-vdm add <name>              Save current login as a named profile
-vdm label <name> <label>    Add a label (email/description) to a profile
 vdm list                    List all saved profiles
 vdm switch [name]           Switch to a profile (interactive if no name)
 vdm remove <name>           Delete a saved profile
@@ -283,7 +278,7 @@ rm -f ~/.local/bin/vdm
 ## Troubleshooting
 
 **"No accounts configured"**
-Run `claude login` then `vdm add my-account`.
+Run `claude login` — the account will be auto-discovered on the next proxy request.
 
 **Dashboard not loading**
 Check if the server is running: `lsof -iTCP:3333`. If not, start it: `node ~/.claude/account-switcher/dashboard.mjs`
@@ -295,7 +290,7 @@ Verify the env var: `echo $ANTHROPIC_BASE_URL` — should be `http://localhost:3
 The account is already rate-limited and can't be probed. Rate limit data will appear once traffic flows through the proxy or the limit resets.
 
 **Token expired**
-Tokens auto-refresh now. If it still fails, re-login: `claude login`, then `vdm add <name>` (overwrites the old profile).
+Tokens auto-refresh now. If it still fails, re-login: `claude login`.
 
 ## License
 

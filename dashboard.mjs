@@ -113,12 +113,12 @@ function writeKeychain(creds) {
   try {
     execSync(
       `security delete-generic-password -s "${KEYCHAIN_SERVICE}" -a "${KEYCHAIN_ACCOUNT}"`,
-      { stdio: 'pipe' }
+      { stdio: 'pipe', timeout: 5000 }
     );
   } catch { /* might not exist */ }
   execSync(
     `security add-generic-password -s "${KEYCHAIN_SERVICE}" -a "${KEYCHAIN_ACCOUNT}" -w "${json.replace(/"/g, '\\"')}"`,
-    { stdio: 'pipe' }
+    { stdio: 'pipe', timeout: 5000 }
   );
 }
 
@@ -2054,6 +2054,9 @@ loadPersistedState();
   saveHistoryToDisk();
 })();
 
+// Server-side sparkline cache (cleared on window resets to force re-render)
+const _sparkCache = {};
+
 function updateAccountState(token, name, headers, fingerprint) {
   accountState.update(token, name, headers);
   if (fingerprint) {
@@ -2181,9 +2184,14 @@ function forwardToAnthropic(method, path, headers, body, timeout = PROXY_TIMEOUT
 // Drain a response and return the body (for error responses)
 function drainResponse(res) {
   return new Promise(r => {
+    let done = false;
     const chunks = [];
+    const finish = () => { if (!done) { done = true; r(Buffer.concat(chunks)); } };
     res.on('data', c => chunks.push(c));
-    res.on('end', () => r(Buffer.concat(chunks)));
+    res.on('end', finish);
+    res.on('error', finish);
+    // Safety: if stream stalls, resolve after 5s to prevent hanging forever
+    setTimeout(finish, 5000);
   });
 }
 
@@ -2249,6 +2257,7 @@ function callRefreshEndpoint(refreshToken) {
       res.on('end', () => {
         resolve(parseRefreshResponse(res.statusCode, data));
       });
+      res.on('error', (err) => resolve({ ok: false, error: `response stream: ${err.message}`, retriable: true }));
     });
     req.on('error', (err) => resolve({ ok: false, error: err.message, retriable: true }));
     req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'timeout', retriable: true }); });
@@ -2383,11 +2392,15 @@ async function refreshAccountToken(accountName) {
     // 7. Update keychain if this is the active account
     const activeToken = getActiveToken();
     if (activeToken === oldToken) {
-      await withSwitchLock(() => {
-        writeKeychain(newCreds);
-        invalidateTokenCache();
-      });
-      log('refresh', `${accountName}: updated keychain (was active account)`);
+      try {
+        await withSwitchLock(() => {
+          writeKeychain(newCreds);
+          invalidateTokenCache();
+        });
+        log('refresh', `${accountName}: updated keychain (was active account)`);
+      } catch (e) {
+        log('warn', `${accountName}: keychain update failed after refresh: ${e.message}`);
+      }
     }
 
     // 8. Invalidate caches
@@ -2443,10 +2456,10 @@ setInterval(async () => {
 
 const proxyServer = createServer((clientReq, clientRes) => {
   handleProxyRequest(clientReq, clientRes).catch(err => {
-    log('error', 'Unhandled proxy error:', err.message);
+    log('error', `Unhandled proxy error: ${err.message}\n${err.stack}`);
     if (!clientRes.headersSent) {
       clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({ error: 'Internal proxy error' }));
+      clientRes.end(JSON.stringify({ error: `Proxy error: ${err.message}` }));
     }
   });
 });
@@ -2484,10 +2497,14 @@ async function handleProxyRequest(clientReq, clientRes) {
         clientReq.pipe(req);
       });
       clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
+      clientReq.on('close', () => { proxyRes.destroy(); });
       proxyRes.pipe(clientRes);
     } catch (err) {
-      clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({ error: `Passthrough error: ${err.message}` }));
+      if (!clientRes.headersSent) {
+        clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({ error: `Passthrough error: ${err.message}` }));
+      }
     }
     return;
   }
@@ -2534,10 +2551,14 @@ async function handleProxyRequest(clientReq, clientRes) {
       const oldName = activeAcct?.label || activeAcct?.name || 'none';
       const reason = rotated ? settings.rotationStrategy : 'unavailable';
       log('proactive', `${oldName} → switch to ${strategyPick.label || strategyPick.name} (${reason})`);
-      await withSwitchLock(() => {
-        writeKeychain(strategyPick.creds);
-        invalidateTokenCache();
-      });
+      try {
+        await withSwitchLock(() => {
+          writeKeychain(strategyPick.creds);
+          invalidateTokenCache();
+        });
+      } catch (e) {
+        log('warn', `Keychain write failed during proactive switch: ${e.message}`);
+      }
       token = strategyPick.token;
       lastRotationTime = Date.now();
       logEvent('proactive-switch', { from: oldName, to: strategyPick.label || strategyPick.name, reason });
@@ -2557,31 +2578,54 @@ async function handleProxyRequest(clientReq, clientRes) {
     const acctName = acct?.label || acct?.name || 'unknown';
 
     let proxyRes;
+    let lastNetworkError;
     try {
       const headers = buildForwardHeaders(clientReq.headers, token);
       headers['content-length'] = String(body.length);
       proxyRes = await forwardToAnthropic(clientReq.method, clientReq.url, headers, body);
     } catch (err) {
-      // Network error — retry once on transient errors
-      if (attempt === 0 && (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT' || err.code === 'ECONNREFUSED')) {
+      lastNetworkError = err;
+      // Network error — retry once with same token on transient errors
+      if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT' || err.code === 'ECONNREFUSED') {
         log('retry', `Network error (${err.code}) on ${acctName}, retrying once...`);
         await new Promise(r => setTimeout(r, 500));
         try {
           const headers = buildForwardHeaders(clientReq.headers, token);
           headers['content-length'] = String(body.length);
           proxyRes = await forwardToAnthropic(clientReq.method, clientReq.url, headers, body);
+          lastNetworkError = null;
         } catch (err2) {
-          log('error', `Retry also failed: ${err2.message}`);
-          clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-          clientRes.end(JSON.stringify({ error: `Upstream error: ${err2.message}` }));
-          return;
+          lastNetworkError = err2;
+          log('error', `Retry also failed on ${acctName}: ${err2.message}`);
         }
       } else {
         log('error', `Forward error on ${acctName}: ${err.message}`);
-        clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-        clientRes.end(JSON.stringify({ error: `Upstream error: ${err.message}` }));
-        return;
       }
+    }
+
+    // Network failure after retry — try switching to another account before giving up
+    if (lastNetworkError) {
+      if (settings.autoSwitch) {
+        const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
+        if (next) {
+          log('switch', `  → network error on ${acctName}, switching to ${next.label || next.name}`);
+          try {
+            await withSwitchLock(() => {
+              writeKeychain(next.creds);
+              invalidateTokenCache();
+            });
+          } catch (e) {
+            log('warn', `Keychain write failed during network-error switch: ${e.message}`);
+          }
+          token = next.token;
+          logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: 'network-error' });
+          continue;
+        }
+      }
+      // All accounts tried or autoSwitch off — return the upstream error
+      clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+      clientRes.end(JSON.stringify({ error: `Upstream unreachable: ${lastNetworkError.message}` }));
+      return;
     }
 
     const status = proxyRes.statusCode;
@@ -2596,6 +2640,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       if (!settings.autoSwitch) {
         log('switch', '  → auto-switch OFF, returning 429 as-is');
         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+        proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
         proxyRes.pipe(clientRes);
         return;
       }
@@ -2606,11 +2651,15 @@ async function handleProxyRequest(clientReq, clientRes) {
       const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
       if (next) {
         log('switch', `  → switching to ${next.label || next.name}`);
-        await withSwitchLock(() => {
-          writeKeychain(next.creds);
-          invalidateTokenCache();
-          invalidateAccountsCache();
-        });
+        try {
+          await withSwitchLock(() => {
+            writeKeychain(next.creds);
+            invalidateTokenCache();
+            invalidateAccountsCache();
+          });
+        } catch (e) {
+          log('warn', `Keychain write failed during 429 switch: ${e.message}`);
+        }
         token = next.token;
         logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '429' });
         notify('Account Switched', `${acctName} rate-limited → ${next.label || next.name}`);
@@ -2678,10 +2727,14 @@ async function handleProxyRequest(clientReq, clientRes) {
       const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
       if (next) {
         log('switch', `  → switching to ${next.label || next.name}`);
-        await withSwitchLock(() => {
-          writeKeychain(next.creds);
-          invalidateTokenCache();
-        });
+        try {
+          await withSwitchLock(() => {
+            writeKeychain(next.creds);
+            invalidateTokenCache();
+          });
+        } catch (e) {
+          log('warn', `Keychain write failed during 401 switch: ${e.message}`);
+        }
         token = next.token;
         logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '401' });
         notify('Account Switched', `${acctName} token expired → ${next.label || next.name}`);
@@ -2706,6 +2759,7 @@ async function handleProxyRequest(clientReq, clientRes) {
     if (status === 529) {
       log('info', `${acctName} → 529 overloaded (not switching — server-side issue)`);
       clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
       proxyRes.pipe(clientRes);
       return;
     }
@@ -2720,6 +2774,7 @@ async function handleProxyRequest(clientReq, clientRes) {
     }
 
     clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+    proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
     proxyRes.pipe(clientRes);
     return;
   }
