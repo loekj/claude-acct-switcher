@@ -6,9 +6,9 @@
 
 ## Why This Exists / Who Is This For
 
-You don't sleep. Your Claude Code sessions run 24/7 via `--remote-control`. You're on the move, your machine is doing roundhouse kicks through code while you're grabbing coffee, and then  - **BAM**  - rate limited. Session dead. Work stopped.
+You don't sleep. Your Claude Code sessions run 24/7 via `--remote-control`. You're doing stuff around town, laptop in backpack connected to hotspot where you're remote-controlling Claude the entire day. While you're in line at the DMV your machine's doing roundhouse kicks, and then, ..., you're rate limited. Session dead. Work stopped.
 
-What does Anthropic want you to do? Log in again. Through their slow, annoying UI. Click click click wait click. Meanwhile your autonomous agent is sitting there like a chump, doing nothing.
+What does Anthropic want you to do? Log in again. Through their slow, annoying UI. Click click click wait click. Meanwhile your autonomous agent is sitting there like a DMV sloth, doing absolutely nothing. Valuable vibe code minutes are being wasted...
 
 **No. Absolutely not.**
 
