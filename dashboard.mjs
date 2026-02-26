@@ -1966,7 +1966,19 @@ function log(tag, msg, extra = '') {
 
 const proxyEventLog = []; // { ts, type, from, to, reason }
 
+// Dedup noisy events (rate-limited / all-exhausted) so the activity log
+// doesn't fill up when Claude Code retries against an already-limited account.
+const _eventDedupMap = new Map(); // "type:key" → timestamp
+const EVENT_DEDUP_WINDOW = 5 * 60 * 1000; // 5 min
+
 function logEvent(type, detail = {}) {
+  if (type === 'rate-limited' || type === 'all-exhausted') {
+    const dedupKey = type === 'rate-limited' ? `rate-limited:${detail.account || ''}` : 'all-exhausted';
+    const lastTs = _eventDedupMap.get(dedupKey);
+    if (lastTs && Date.now() - lastTs < EVENT_DEDUP_WINDOW) return;
+    _eventDedupMap.set(dedupKey, Date.now());
+  }
+
   const entry = { ts: Date.now(), type, ...detail };
   proxyEventLog.unshift(entry);
   if (proxyEventLog.length > MAX_EVENT_LOG) proxyEventLog.length = MAX_EVENT_LOG;
