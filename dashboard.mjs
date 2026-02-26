@@ -1337,6 +1337,7 @@ function renderHTML() {
     padding: 0.125rem 0.5rem;
     font-variant-numeric: tabular-nums;
   }
+  .velocity-badge.velocity-ok { color: var(--green); border-color: var(--green-border); background: var(--green-soft); }
   .velocity-badge.velocity-warn { color: var(--yellow); border-color: var(--yellow-border); background: var(--yellow-soft); }
   .velocity-badge.velocity-crit { color: var(--red); border-color: var(--red-border); background: var(--red-soft); }
 
@@ -1653,9 +1654,8 @@ function renderVelocityInline(p) {
   let cls = 'velocity-badge';
   let text;
   if (min <= 0) { cls += ' velocity-crit'; text = 'at limit'; }
-  else if (min <= 30) { cls += ' velocity-crit'; text = 'Est. ' + formatEta(min) + ' to limit'; }
-  else if (min <= 120) { cls += ' velocity-warn'; text = 'Est. ' + formatEta(min) + ' to limit'; }
-  else { text = 'Est. ' + formatEta(min) + ' to limit'; }
+  else if (min < 300) { cls += ' velocity-crit'; text = 'Est. ' + formatEta(min) + ' to limit'; }
+  else { cls += ' velocity-ok'; text = 'Est. ' + formatEta(min) + ' to limit'; }
   return '<span class="card-token-sep">&middot;</span>' +
     '<span class="' + cls + '" title="Estimated time until 5h rate limit is reached, based on current usage velocity">' + text + '</span>';
 }
