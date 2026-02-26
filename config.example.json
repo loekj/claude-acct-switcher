@@ -1,0 +1,7 @@
+{
+  "autoSwitch": true,
+  "proxyEnabled": true,
+  "rotationStrategy": "conserve",
+  "rotationIntervalMin": 60,
+  "notifications": true
+}
