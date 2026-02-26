@@ -340,24 +340,27 @@ export { PROBE_INPUT_TOKENS, PROBE_OUTPUT_TOKENS, PROBE_LOG_MAX_AGE };
 // Utilization history (for sparklines & velocity)
 // ─────────────────────────────────────────────────
 
-const HISTORY_MAX_AGE = 6 * 60 * 60 * 1000; // 6 hours
-const HISTORY_MAX_POINTS = 72; // ~5 min intervals for 6 hours
+const HISTORY_MAX_AGE = 5 * 60 * 60 * 1000; // 5 hours (matches 5h window)
+const HISTORY_MIN_INTERVAL = 2 * 60 * 1000; // 2 min between points
 
-export { HISTORY_MAX_AGE, HISTORY_MAX_POINTS };
+export { HISTORY_MAX_AGE, HISTORY_MIN_INTERVAL };
 
-export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, maxPoints = HISTORY_MAX_POINTS) {
+export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval = HISTORY_MIN_INTERVAL) {
   // Map<fingerprint, Array<{ ts, u5h, u7d }>>
   const history = new Map();
 
   function record(fingerprint, u5h, u7d, ts = Date.now()) {
     if (!history.has(fingerprint)) history.set(fingerprint, []);
     const arr = history.get(fingerprint);
-    arr.push({ ts, u5h, u7d });
-    // Prune old entries
+    // If the last entry is too recent, update it in place (keeps latest value)
+    if (arr.length > 0 && ts - arr[arr.length - 1].ts < minInterval) {
+      arr[arr.length - 1] = { ts, u5h, u7d };
+    } else {
+      arr.push({ ts, u5h, u7d });
+    }
+    // Prune entries older than the window
     const cutoff = ts - maxAge;
     while (arr.length > 0 && arr[0].ts < cutoff) arr.shift();
-    // Cap at maxPoints
-    while (arr.length > maxPoints) arr.shift();
   }
 
   function getHistory(fingerprint) {
@@ -405,10 +408,13 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, maxPoints = H
   }
 
   function load(fingerprint, entries) {
-    if (!entries || !entries.length) return;
+    if (!entries || !entries.length) {
+      history.set(fingerprint, []);
+      return;
+    }
     const cutoff = Date.now() - maxAge;
-    const valid = entries.filter(e => e.ts >= cutoff).slice(-maxPoints);
-    if (valid.length) history.set(fingerprint, valid);
+    const valid = entries.filter(e => e.ts >= cutoff);
+    history.set(fingerprint, valid);
   }
 
   function toJSON() {
