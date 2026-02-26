@@ -1556,30 +1556,56 @@ function renderProbeStats(ps) {
 }
 
 /**
- * Render a time-axis sparkline.
+ * Render a time-axis sparkline with real clock-time labels.
+ * X-axis: (now - windowMs) on the left → now on the right.
+ * Data populates left-to-right as time progresses.
+ *
  * @param {Array} hist - history entries with { ts, u5h, u7d }
  * @param {string} key - 'u5h' or 'u7d'
  * @param {number} windowMs - fixed x-axis span in ms (5h or 7d)
- * @param {Array} labels - x-axis labels, e.g. ['0h','1h',...,'5h'] or ['1d','2d',...,'7d']
+ * @param {string} mode - 'hours' or 'days'  - controls label generation
  */
-function renderSparkline(hist, key, windowMs, labels) {
+function renderSparkline(hist, key, windowMs, mode) {
   const W = 320, H = 44, padL = 1, padR = 1, padT = 1, padB = 12;
   const chartW = W - padL - padR;
   const chartH = H - padT - padB;
   const now = Date.now();
   const windowStart = now - windowMs;
 
-  // Grid lines + labels
+  // Generate real-time labels
   let svg = '';
-  const labelCount = labels.length;
-  for (let i = 0; i < labelCount; i++) {
-    const x = padL + (i / (labelCount - 1)) * chartW;
-    svg += '<line x1="' + x.toFixed(1) + '" y1="' + padT + '" x2="' + x.toFixed(1) + '" y2="' + (padT + chartH) + '" stroke="var(--border)" stroke-width="0.5" />';
-    const anchor = i === 0 ? 'start' : i === labelCount - 1 ? 'end' : 'middle';
-    svg += '<text x="' + x.toFixed(1) + '" y="' + (H - 1) + '" fill="var(--muted)" font-size="6" text-anchor="' + anchor + '" font-family="inherit">' + labels[i] + '</text>';
+  if (mode === 'hours') {
+    // Hourly grid: find the first whole hour >= windowStart, then every hour
+    const firstHour = new Date(windowStart);
+    firstHour.setMinutes(0, 0, 0);
+    if (firstHour.getTime() < windowStart) firstHour.setTime(firstHour.getTime() + 3600000);
+    for (let t = firstHour.getTime(); t <= now; t += 3600000) {
+      const x = padL + ((t - windowStart) / windowMs) * chartW;
+      const d = new Date(t);
+      const label = d.getHours() + ':00';
+      svg += '<line x1="' + x.toFixed(1) + '" y1="' + padT + '" x2="' + x.toFixed(1) + '" y2="' + (padT + chartH) + '" stroke="var(--border)" stroke-width="0.5" />';
+      svg += '<text x="' + x.toFixed(1) + '" y="' + (H - 1) + '" fill="var(--muted)" font-size="6" text-anchor="middle" font-family="inherit">' + label + '</text>';
+    }
+  } else {
+    // Daily grid: find the first midnight >= windowStart, then every day
+    const firstDay = new Date(windowStart);
+    firstDay.setHours(0, 0, 0, 0);
+    if (firstDay.getTime() < windowStart) firstDay.setTime(firstDay.getTime() + 86400000);
+    const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
+    for (let t = firstDay.getTime(); t <= now; t += 86400000) {
+      const x = padL + ((t - windowStart) / windowMs) * chartW;
+      const d = new Date(t);
+      const label = dayNames[d.getDay()];
+      svg += '<line x1="' + x.toFixed(1) + '" y1="' + padT + '" x2="' + x.toFixed(1) + '" y2="' + (padT + chartH) + '" stroke="var(--border)" stroke-width="0.5" />';
+      svg += '<text x="' + x.toFixed(1) + '" y="' + (H - 1) + '" fill="var(--muted)" font-size="6" text-anchor="middle" font-family="inherit">' + label + '</text>';
+    }
   }
 
-  // Data polyline  - position by timestamp on fixed axis
+  // "now" label at right edge
+  svg += '<line x1="' + (padL + chartW).toFixed(1) + '" y1="' + padT + '" x2="' + (padL + chartW).toFixed(1) + '" y2="' + (padT + chartH) + '" stroke="var(--muted)" stroke-width="0.5" stroke-dasharray="2,2" />';
+  svg += '<text x="' + (padL + chartW).toFixed(1) + '" y="' + (H - 1) + '" fill="var(--muted)" font-size="6" text-anchor="end" font-family="inherit">now</text>';
+
+  // Data polyline  - position by real timestamp on the window axis
   if (hist && hist.length >= 2) {
     const points = hist
       .filter(h => h.ts >= windowStart)
@@ -1702,16 +1728,16 @@ function renderAccounts(profiles, animate) {
       const f = Math.round(rl.fiveH.utilization * 100);
       const s = Math.round(rl.sevenD.utilization * 100);
 
-      // 5hr sparkline
+      // 5hr sparkline  - real clock-time labels, left=5h ago, right=now
       const hist5h = p.utilizationHistory || [];
       const spark5h = '<div class="sparkline-wrap">' +
-        renderSparkline(hist5h, 'u5h', 5*60*60*1000, ['0h','1h','2h','3h','4h','5h']) +
+        renderSparkline(hist5h, 'u5h', 5*60*60*1000, 'hours') +
         '</div>';
 
-      // Weekly sparkline
+      // Weekly sparkline  - day-of-week labels, left=7d ago, right=now
       const hist7d = p.weeklyHistory || [];
       const spark7d = '<div class="sparkline-wrap">' +
-        renderSparkline(hist7d, 'u7d', 7*24*60*60*1000, ['1d','2d','3d','4d','5d','6d','7d']) +
+        renderSparkline(hist7d, 'u7d', 7*24*60*60*1000, 'days') +
         '</div>';
 
       barsHtml = '<div class="rate-bars">' +
