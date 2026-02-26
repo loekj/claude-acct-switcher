@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Claude Account Switcher — Installer
+# Claude Account Switcher  - Installer
 # Installs csw to ~/.claude/account-switcher/ and configures your shell.
 
 set -euo pipefail
@@ -16,7 +16,7 @@ INSTALL_DIR="$HOME/.claude/account-switcher"
 SCRIPT_DIR="$(cd "$(dirname "$(readlink -f "$0" 2>/dev/null || realpath "$0" 2>/dev/null || echo "$0")")" && pwd)"
 
 echo ""
-echo -e "${BOLD}  Claude Account Switcher — Installer${NC}"
+echo -e "${BOLD}  Claude Account Switcher  - Installer${NC}"
 echo -e "  ────────────────────────────────────────"
 echo ""
 
@@ -101,7 +101,7 @@ if [[ -n "$SHELL_RC" ]]; then
   else
     echo "" >> "$SHELL_RC"
     cat >> "$SHELL_RC" << 'SHELL_EOF'
-# claude-account-switcher — auto-start proxy + set base URL
+# claude-account-switcher  - auto-start proxy + set base URL
 if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then
   nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &
   disown
@@ -114,7 +114,7 @@ else
   echo -e "  ${YELLOW}Could not detect shell config file.${NC}"
   echo "  Add this to your shell profile manually:"
   echo ""
-  echo '    # claude-account-switcher — auto-start proxy + set base URL'
+  echo '    # claude-account-switcher  - auto-start proxy + set base URL'
   echo '    if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then'
   echo '      nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &'
   echo '      disown'

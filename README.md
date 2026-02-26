@@ -6,7 +6,7 @@
 
 ## Why This Exists / Who Is This For
 
-You don't sleep. Your Claude Code sessions run 24/7 via `--remote-control`. You're on the move, your machine is doing roundhouse kicks through code while you're grabbing coffee, and then — **BAM** — rate limited. Session dead. Work stopped.
+You don't sleep. Your Claude Code sessions run 24/7 via `--remote-control`. You're on the move, your machine is doing roundhouse kicks through code while you're grabbing coffee, and then  - **BAM**  - rate limited. Session dead. Work stopped.
 
 What does Anthropic want you to do? Log in again. Through their slow, annoying UI. Click click click wait click. Meanwhile your autonomous agent is sitting there like a chump, doing nothing.
 
@@ -16,26 +16,26 @@ Jean-Claude's on automatic mode from now on.
 
 Van Damme-o-Matic does the splits across multiple accounts so you never have to. It auto-switches on rate limits, auto-refreshes expiring tokens, and keeps your sessions alive while you're nowhere near a keyboard. NEVER EVER get bogged down because you need to log in to a new account through Anthropic's slow annoying UI again.
 
-- **`--remote-control` power users** — your machine works while you don't
-- **People running multiple Claude Code sessions** — spread the load, never hit a wall
-- **Anyone who refuses to babysit token expiry** — tokens refresh themselves, accounts rotate automatically
-- **Night owls, insomniacs, and the simply relentless** — your AI doesn't sleep and neither should your account management
+- **`--remote-control` power users**  - your machine works while you don't
+- **People running multiple Claude Code sessions**  - spread the load, never hit a wall
+- **Anyone who refuses to babysit token expiry**  - tokens refresh themselves, accounts rotate automatically
+- **Night owls, insomniacs, and the simply relentless**  - your AI doesn't sleep and neither should your account management
 
 ---
 
 ## What It Does
 
-- **Transparent API proxy** — sits between Claude Code and Anthropic's API, swapping auth tokens invisibly
-- **Auto-switch on 429** — when one account hits its rate limit, the proxy retries with the next available account
-- **Auto-switch on 401** — attempts token refresh first, falls back to switching accounts
-- **OAuth token auto-refresh** — background timer refreshes tokens before they expire, no manual re-login ever
-- **Proactive switching** — before each request, picks the least-utilized account
-- **5 rotation strategies** — sticky, conserve, round-robin, spread, drain-first
-- **Web dashboard** — see all accounts, rate limits, usage stats, and activity log at `http://localhost:3333`
-- **CLI tool (`vdm`)** — add, list, switch, and remove accounts from the terminal
-- **Auto-discover** — log in with `claude login` and accounts are detected automatically
-- **macOS Keychain** — credentials are stored securely in the system keychain, never in plaintext
-- **Zero dependencies** — pure Node.js + bash. No npm install needed.
+- **Transparent API proxy**  - sits between Claude Code and Anthropic's API, swapping auth tokens invisibly
+- **Auto-switch on 429**  - when one account hits its rate limit, the proxy retries with the next available account
+- **Auto-switch on 401**  - attempts token refresh first, falls back to switching accounts
+- **OAuth token auto-refresh**  - background timer refreshes tokens before they expire, no manual re-login ever
+- **Proactive switching**  - before each request, picks the least-utilized account
+- **5 rotation strategies**  - sticky, conserve, round-robin, spread, drain-first
+- **Web dashboard**  - see all accounts, rate limits, usage stats, and activity log at `http://localhost:3333`
+- **CLI tool (`vdm`)**  - add, list, switch, and remove accounts from the terminal
+- **Auto-discover**  - log in with `claude login` and accounts are detected automatically
+- **macOS Keychain**  - credentials are stored securely in the system keychain, never in plaintext
+- **Zero dependencies**  - pure Node.js + bash. No npm install needed.
 
 ![Dashboard](VDM.png)
 
@@ -76,7 +76,7 @@ chmod +x ~/.claude/account-switcher/vdm
 # 2. Add to your shell profile (~/.zshrc, ~/.bashrc, etc.)
 cat >> ~/.zshrc << 'EOF'
 
-# van-damme-o-matic — auto-start proxy + set base URL
+# van-damme-o-matic  - auto-start proxy + set base URL
 if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then
   nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &
   disown
@@ -98,7 +98,7 @@ Accounts are auto-discovered. Just log in and they're picked up:
 
 ```bash
 claude login    # account A
-claude login    # account B — that's it
+claude login    # account B  - that's it
 ```
 
 Emails are fetched automatically from the Anthropic API. No manual naming or labeling needed.
@@ -161,7 +161,7 @@ All strategies still auto-switch on 429/401 when `autoSwitch` is enabled. The ro
 | Strategy | Behavior |
 |----------|----------|
 | **Sticky** (default) | Stay on current account. Only switches when rate-limited. Safest option. |
-| **Conserve** | Drain active accounts first (weekly limit is primary, 5hr is tiebreaker). Untouched accounts stay dormant — their windows never start. Maximizes total runway. |
+| **Conserve** | Drain active accounts first (weekly limit is primary, 5hr is tiebreaker). Untouched accounts stay dormant  - their windows never start. Maximizes total runway. |
 | **Round-robin** | Rotate to the least-utilized account every N minutes (configurable). |
 | **Spread** | Always pick the least-utilized account on every request. Switches often. |
 | **Drain first** | Use the account with the highest 5hr utilization. Good for short sessions. |
@@ -184,17 +184,17 @@ Claude Code  ──ANTHROPIC_BASE_URL──>  Local Proxy (:3334)  ──>  api.
 
 The proxy runs alongside a dashboard server on port 3333. Both start automatically when you open a new terminal.
 
-Credentials live in the macOS Keychain under the service `Claude Code-credentials`. The proxy reads the active token, replaces the auth header, and forwards to Anthropic. When it gets a 429, it writes the next account's credentials to the Keychain and retries — Claude Code picks up the change seamlessly.
+Credentials live in the macOS Keychain under the service `Claude Code-credentials`. The proxy reads the active token, replaces the auth header, and forwards to Anthropic. When it gets a 429, it writes the next account's credentials to the Keychain and retries  - Claude Code picks up the change seamlessly.
 
 ### Token Refresh
 
 Refresh tokens are single-use. After a refresh, the old token is dead. Van Damme-o-Matic handles this with:
 
-- **Atomic file writes** — tmp file, chmod 600, rename over original
-- **Per-account locks** — no two refreshes for the same account run concurrently
-- **Fingerprint migration** — all state (utilization, history, caches) transfers to the new token
-- **Retry with backoff** — 3 attempts at 1s, 2s, 4s for transient failures
-- **Reactive + proactive** — background timer catches tokens before expiry, 401 handler catches the rest
+- **Atomic file writes**  - tmp file, chmod 600, rename over original
+- **Per-account locks**  - no two refreshes for the same account run concurrently
+- **Fingerprint migration**  - all state (utilization, history, caches) transfers to the new token
+- **Retry with backoff**  - 3 attempts at 1s, 2s, 4s for transient failures
+- **Reactive + proactive**  - background timer catches tokens before expiry, 401 handler catches the rest
 
 ## Ports
 
@@ -227,7 +227,7 @@ Zero-dependency tests using Node.js built-in `node:test` (Node 18+):
 # Run all tests
 node --test 'test/*.test.mjs'
 
-# Unit tests only (pure logic — fast, no servers)
+# Unit tests only (pure logic  - fast, no servers)
 node --test test/lib.test.mjs
 
 # Integration tests only (starts real server, tests HTTP API)
@@ -236,7 +236,7 @@ node --test test/api.test.mjs
 
 ## Uninstall
 
-Run the uninstaller — it confirms before deleting anything:
+Run the uninstaller  - it confirms before deleting anything:
 
 ```bash
 # From the repo directory:
@@ -250,7 +250,7 @@ The uninstaller will:
 4. Remove the `vdm` symlink from PATH
 5. Remove `~/.claude/account-switcher/` (including saved account profiles)
 
-Your **Keychain credentials are not touched** — Claude Code will continue to work normally with whichever account was last active.
+Your **Keychain credentials are not touched**  - Claude Code will continue to work normally with whichever account was last active.
 
 <details>
 <summary>Manual uninstall (if you prefer)</summary>
@@ -264,7 +264,7 @@ rm -rf ~/.claude/account-switcher
 rm -f ~/.local/bin/vdm
 
 # Edit your shell config (~/.zshrc, ~/.bashrc, etc.) and delete this block:
-#   # van-damme-o-matic — auto-start proxy + set base URL
+#   # van-damme-o-matic  - auto-start proxy + set base URL
 #   if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then
 #     nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &
 #     disown
@@ -278,13 +278,13 @@ rm -f ~/.local/bin/vdm
 ## Troubleshooting
 
 **"No accounts configured"**
-Run `claude login` — the account will be auto-discovered on the next proxy request.
+Run `claude login`  - the account will be auto-discovered on the next proxy request.
 
 **Dashboard not loading**
 Check if the server is running: `lsof -iTCP:3333`. If not, start it: `node ~/.claude/account-switcher/dashboard.mjs`
 
 **Claude Code not using the proxy**
-Verify the env var: `echo $ANTHROPIC_BASE_URL` — should be `http://localhost:3334`. Restart your terminal if it's missing.
+Verify the env var: `echo $ANTHROPIC_BASE_URL`  - should be `http://localhost:3334`. Restart your terminal if it's missing.
 
 **"Rate limits unavailable" on a card**
 The account is already rate-limited and can't be probed. Rate limit data will appear once traffic flows through the proxy or the limit resets.
@@ -294,7 +294,7 @@ Tokens auto-refresh now. If it still fails, re-login: `claude login`.
 
 ## License
 
-[The Unlicense](LICENSE) — public domain. Do whatever you want with it.
+[The Unlicense](LICENSE)  - public domain. Do whatever you want with it.
 
 ---
 

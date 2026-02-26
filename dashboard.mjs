@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-// Van Damme-o-Matic — Dashboard
+// Van Damme-o-Matic  - Dashboard
 // Zero dependencies, uses Node.js built-in modules only.
 
 import { createServer } from 'node:http';
@@ -81,7 +81,7 @@ function loadSettings() {
     if (existsSync(CONFIG_FILE)) {
       return { ...DEFAULT_SETTINGS, ...JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) };
     }
-  } catch { /* corrupt file — use defaults */ }
+  } catch { /* corrupt file  - use defaults */ }
   return { ...DEFAULT_SETTINGS };
 }
 
@@ -213,7 +213,7 @@ function logActivity(type, detail = {}) {
   const cutoff = Date.now() - ACTIVITY_MAX_AGE;
   while (activityLog.length > 0 && activityLog[activityLog.length - 1].ts < cutoff) activityLog.pop();
   if (activityLog.length > ACTIVITY_MAX_ENTRIES) activityLog.length = ACTIVITY_MAX_ENTRIES;
-  // Persist async — fire and forget
+  // Persist async  - fire and forget
   writeFile(ACTIVITY_LOG_FILE, JSON.stringify(activityLog)).catch(() => {});
 }
 
@@ -242,7 +242,7 @@ async function autoDiscoverAccount() {
     } catch { /* skip */ }
   }
 
-  // Unknown account — auto-save it
+  // Unknown account  - auto-save it
   // Generate a name like "auto-1", "auto-2", ...
   let idx = 1;
   while (existsSync(join(ACCOUNTS_DIR, `auto-${idx}.json`))) idx++;
@@ -267,14 +267,14 @@ async function autoDiscoverAccount() {
 }
 
 // Auto-discover runs on proxy requests (see handleProxyRequest),
-// not on a timer — no wasted work when idle.
+// not on a timer  - no wasted work when idle.
 
 // ─────────────────────────────────────────────────
-// Rate limit fetcher — uses a minimal haiku call
+// Rate limit fetcher  - uses a minimal haiku call
 // to read back the rate-limit response headers.
 // ─────────────────────────────────────────────────
 const rateLimitCache = new Map(); // fingerprint -> { data, fetchedAt }
-const RATE_LIMIT_CACHE_TTL = 5 * 60 * 1000; // 5 min — proxy state fills the gap between probes
+const RATE_LIMIT_CACHE_TTL = 5 * 60 * 1000; // 5 min  - proxy state fills the gap between probes
 
 // ── Probe cost tracking (uses lib.mjs) ──
 const probeTracker = createProbeTracker();
@@ -389,7 +389,7 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
     return cached.data;
   }
 
-  // 2. Check proxy-tracked state (populated from real traffic — no extra API calls)
+  // 2. Check proxy-tracked state (populated from real traffic  - no extra API calls)
   if (typeof accountState !== 'undefined') {
     const proxyState = accountState.get(token);
     if (proxyState && proxyState.updatedAt && Date.now() - proxyState.updatedAt < RATE_LIMIT_CACHE_TTL) {
@@ -432,7 +432,7 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
     if (Date.now() - persisted.updatedAt < RATE_LIMIT_CACHE_TTL) return fromPersisted;
   }
 
-  // 4. Fall back to API probe — but NOT if probing is suppressed
+  // 4. Fall back to API probe  - but NOT if probing is suppressed
   //    (conserve strategy: probing a dormant account activates its rate limit window)
   if (!allowProbe) return null;
 
@@ -497,7 +497,7 @@ async function loadProfiles() {
         let allowProbe = true;
         if (conserveMode && !isActive) {
           if (hasProxyState) {
-            // Proxy traffic is keeping it updated — no probe needed
+            // Proxy traffic is keeping it updated  - no probe needed
             allowProbe = false;
           } else if (persisted) {
             // Check reset-aware utilization (if window reset since we saved, it's now 0)
@@ -508,9 +508,9 @@ async function loadProfiles() {
               allowProbe = false;
               dormant = true;
             }
-            // else: has usage — probe to refresh
+            // else: has usage  - probe to refresh
           }
-          // else: no state at all — probe once to discover
+          // else: no state at all  - probe once to discover
         }
 
         rateLimits = await getRateLimitsForToken(oauth.accessToken, fp, { allowProbe });
@@ -1321,7 +1321,7 @@ function renderHTML() {
 
   <div id="exhausted-banner" class="exhausted-banner" style="display:none">
     <span class="exhausted-icon">!</span>
-    <span>All accounts rate-limited. Next available: <strong id="exhausted-reset">—</strong></span>
+    <span>All accounts rate-limited. Next available: <strong id="exhausted-reset"> -</strong></span>
   </div>
 
   <div class="tabs">
@@ -1345,7 +1345,7 @@ function renderHTML() {
 
   <div id="tab-usage" class="tab-content">
     <div id="stats-section" class="usage-card" style="display:none">
-      <div class="usage-title">Usage — All Accounts</div>
+      <div class="usage-title">Usage  - All Accounts</div>
       <div id="stats-grid" class="stat-grid"></div>
       <div>
         <div class="chart-legend">
@@ -1560,7 +1560,7 @@ function renderSparkline(hist, key, windowMs, labels) {
     svg += '<text x="' + x.toFixed(1) + '" y="' + (H - 1) + '" fill="var(--muted)" font-size="6" text-anchor="' + anchor + '" font-family="inherit">' + labels[i] + '</text>';
   }
 
-  // Data polyline — position by timestamp on fixed axis
+  // Data polyline  - position by timestamp on fixed axis
   if (hist && hist.length >= 2) {
     const points = hist
       .filter(h => h.ts >= windowStart)
@@ -1651,7 +1651,7 @@ async function refresh() {
 function renderAccounts(profiles, animate) {
   const el = document.getElementById('accounts');
   if (!profiles.length) {
-    el.innerHTML = '<div class="empty-state">No accounts yet. Run <code>/login</code> in Claude Code — accounts are auto-discovered.</div>';
+    el.innerHTML = '<div class="empty-state">No accounts yet. Run <code>/login</code> in Claude Code  - accounts are auto-discovered.</div>';
     return;
   }
   el.innerHTML = profiles.map((p, i) => {
@@ -1693,7 +1693,7 @@ function renderAccounts(profiles, animate) {
         '</div>' +
       '</div>';
     } else if (p.dormant) {
-      barsHtml = '<div style="font-size:0.8125rem;color:var(--cyan);margin-top:0.25rem;font-weight:500">Dormant — window preserved</div>';
+      barsHtml = '<div style="font-size:0.8125rem;color:var(--cyan);margin-top:0.25rem;font-weight:500">Dormant  - window preserved</div>';
     } else {
       barsHtml = '<div style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem">Rate limits unavailable</div>';
     }
@@ -1813,9 +1813,9 @@ function tickCountdowns() {
 
 const STRATEGY_HINTS = {
   sticky: 'Stays on current account. Only switches when rate-limited (429/401).',
-  conserve: 'Drains active accounts first (weekly limit primary). Untouched accounts stay dormant — their windows never start.',
+  conserve: 'Drains active accounts first (weekly limit primary). Untouched accounts stay dormant  - their windows never start.',
   'round-robin': 'Rotates to the least-used account on a timer. Good balance of safety and efficiency.',
-  spread: 'Picks the least-used account on every request. Switches often — may trigger Anthropic notices.',
+  spread: 'Picks the least-used account on every request. Switches often  - may trigger Anthropic notices.',
   'drain-first': 'Uses the account with highest 5hr utilization first. Good for short sessions.',
 };
 
@@ -1832,10 +1832,10 @@ async function loadSettingsUI() {
 }
 
 const STRATEGY_DETAILS = {
-  sticky:        { name: 'Sticky',      desc: 'Stay on the current account until it hits a rate limit (429) or auth error (401). Never switches proactively — minimal disruption.' },
-  conserve:      { name: 'Conserve',    desc: 'Concentrate usage on accounts whose rate-limit windows are already active. Untouched accounts stay dormant so their 5hr and weekly windows never start — maximizes total available capacity over time.' },
+  sticky:        { name: 'Sticky',      desc: 'Stay on the current account until it hits a rate limit (429) or auth error (401). Never switches proactively  - minimal disruption.' },
+  conserve:      { name: 'Conserve',    desc: 'Concentrate usage on accounts whose rate-limit windows are already active. Untouched accounts stay dormant so their 5hr and weekly windows never start  - maximizes total available capacity over time.' },
   'round-robin': { name: 'Round-robin', desc: 'Rotate to the least-used account on a fixed timer. Balances load evenly while limiting switch frequency.' },
-  spread:        { name: 'Spread',      desc: 'Always pick the account with the lowest 5hr utilization on every request. Switches often — best for short, bursty sessions.' },
+  spread:        { name: 'Spread',      desc: 'Always pick the account with the lowest 5hr utilization on every request. Switches often  - best for short, bursty sessions.' },
   'drain-first': { name: 'Drain first', desc: 'Use the account with the highest 5hr utilization first, draining it before moving on. Good for finishing off nearly-exhausted windows.' },
 };
 
@@ -1859,7 +1859,7 @@ async function toggleSetting(key, value) {
       body: JSON.stringify({ [key]: value })
     });
     const msgs = {
-      proxyEnabled: value ? 'Proxy enabled' : 'Proxy disabled — passthrough mode',
+      proxyEnabled: value ? 'Proxy enabled' : 'Proxy disabled  - passthrough mode',
       autoSwitch: value ? 'Auto-switch enabled' : 'Auto-switch disabled',
       notifications: value ? 'Notifications enabled' : 'Notifications disabled',
     };
@@ -2065,13 +2065,13 @@ function updateAccountState(token, name, headers, fingerprint) {
     const reset7d = Number(headers['anthropic-ratelimit-unified-7d-reset'] || 0);
     const reset5h = Number(headers['anthropic-ratelimit-unified-5h-reset'] || 0);
 
-    // Detect window resets — if utilization dropped significantly, the window reset
+    // Detect window resets  - if utilization dropped significantly, the window reset
     // Clear stale history so sparklines start fresh
     const prev5h = utilizationHistory.getHistory(fingerprint);
     if (prev5h.length > 0) {
       const lastU5h = prev5h[prev5h.length - 1].u5h;
       if (lastU5h > 0.05 && u5h < lastU5h * 0.5) {
-        // 5hr window reset — clear 5hr history
+        // 5hr window reset  - clear 5hr history
         utilizationHistory.load(fingerprint, []);
         delete _sparkCache[fingerprint + '_5h'];
       }
@@ -2080,7 +2080,7 @@ function updateAccountState(token, name, headers, fingerprint) {
     if (prev7d.length > 0) {
       const lastU7d = prev7d[prev7d.length - 1].u7d;
       if (lastU7d > 0.05 && u7d < lastU7d * 0.5) {
-        // Weekly window reset — clear weekly history
+        // Weekly window reset  - clear weekly history
         weeklyHistory.load(fingerprint, []);
         delete _sparkCache[fingerprint + '_7d'];
       }
@@ -2105,7 +2105,7 @@ function markAccountExpired(token, name) {
 
 let _accountsCache = null;
 let _accountsCacheAt = 0;
-const ACCOUNTS_CACHE_TTL = 5000; // 5s — covers hot path without stale data
+const ACCOUNTS_CACHE_TTL = 5000; // 5s  - covers hot path without stale data
 
 function loadAllAccountTokens() {
   const now = Date.now();
@@ -2438,11 +2438,11 @@ setInterval(async () => {
       const tmpPath = join(ACCOUNTS_DIR, file);
       const origPath = join(ACCOUNTS_DIR, original);
       if (existsSync(origPath)) {
-        // Original exists — tmp is leftover from interrupted write
+        // Original exists  - tmp is leftover from interrupted write
         try { unlinkSync(tmpPath); } catch {}
         log('startup', `Cleaned orphaned tmp file: ${file}`);
       } else {
-        // Original missing — recover from crash after write, before rename
+        // Original missing  - recover from crash after write, before rename
         try {
           renameSync(tmpPath, origPath);
           log('startup', `Recovered account from tmp file: ${file} → ${original}`);
@@ -2585,7 +2585,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       proxyRes = await forwardToAnthropic(clientReq.method, clientReq.url, headers, body);
     } catch (err) {
       lastNetworkError = err;
-      // Network error — retry once with same token on transient errors
+      // Network error  - retry once with same token on transient errors
       if (err.code === 'ECONNRESET' || err.code === 'ETIMEDOUT' || err.code === 'ECONNREFUSED') {
         log('retry', `Network error (${err.code}) on ${acctName}, retrying once...`);
         await new Promise(r => setTimeout(r, 500));
@@ -2603,7 +2603,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       }
     }
 
-    // Network failure after retry — try switching to another account before giving up
+    // Network failure after retry  - try switching to another account before giving up
     if (lastNetworkError) {
       if (settings.autoSwitch) {
         const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
@@ -2622,7 +2622,7 @@ async function handleProxyRequest(clientReq, clientRes) {
           continue;
         }
       }
-      // All accounts tried or autoSwitch off — return the upstream error
+      // All accounts tried or autoSwitch off  - return the upstream error
       clientRes.writeHead(502, { 'Content-Type': 'application/json' });
       clientRes.end(JSON.stringify({ error: `Upstream unreachable: ${lastNetworkError.message}` }));
       return;
@@ -2710,7 +2710,7 @@ async function handleProxyRequest(clientReq, clientRes) {
         }
       }
 
-      // Refresh failed or already attempted — fall through to existing logic
+      // Refresh failed or already attempted  - fall through to existing logic
       markAccountExpired(token, acctName);
       logEvent('auth-expired', { account: acctName });
 
@@ -2757,7 +2757,7 @@ async function handleProxyRequest(clientReq, clientRes) {
 
     // ── 529: Overloaded → pass through, switching won't help ──
     if (status === 529) {
-      log('info', `${acctName} → 529 overloaded (not switching — server-side issue)`);
+      log('info', `${acctName} → 529 overloaded (not switching  - server-side issue)`);
       clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
       proxyRes.pipe(clientRes);
@@ -2833,7 +2833,7 @@ process.on('SIGINT', () => shutdown('SIGINT'));
 process.on('uncaughtException', (err) => {
   log('fatal', `Uncaught exception: ${err.message}`);
   log('fatal', err.stack);
-  // Keep running — the proxy is more useful alive with a logged error
+  // Keep running  - the proxy is more useful alive with a logged error
 });
 process.on('unhandledRejection', (reason) => {
   log('fatal', `Unhandled rejection: ${reason}`);

@@ -1,4 +1,4 @@
-// Van Damme-o-Matic — Core Library
+// Van Damme-o-Matic  - Core Library
 // Pure/testable functions extracted from dashboard.mjs.
 // Zero dependencies, uses Node.js built-in modules only.
 
@@ -142,9 +142,9 @@ export function pickDrainFirst(accounts, stateManager, excludeTokens = new Set()
 /**
  * Score for the "conserve" strategy.
  * Concentrates usage on accounts whose windows are already active.
- * Weekly utilization is primary (scarce resource — resets once/week).
+ * Weekly utilization is primary (scarce resource  - resets once/week).
  * 5hr utilization is secondary tiebreaker.
- * Untouched accounts (0% on both) score 0 — their windows stay dormant.
+ * Untouched accounts (0% on both) score 0  - their windows stay dormant.
  */
 export function scoreAccountConserve(token, stateManager) {
   const acctState = stateManager.get(token);
@@ -173,7 +173,7 @@ export function pickAnyUntried(accounts, excludeTokens) {
 
 export const ROTATION_STRATEGIES = {
   sticky:        { label: 'Sticky',        desc: 'Stay on current account, only switch on rate limit' },
-  conserve:      { label: 'Conserve',      desc: 'Max out active accounts first — untouched windows stay dormant' },
+  conserve:      { label: 'Conserve',      desc: 'Max out active accounts first  - untouched windows stay dormant' },
   'round-robin': { label: 'Round-robin',   desc: 'Rotate to lowest-utilization account on a timer' },
   spread:        { label: 'Spread',        desc: 'Always pick lowest utilization (switches often)' },
   'drain-first': { label: 'Drain first',   desc: 'Use highest 5hr-utilization account first' },
@@ -209,19 +209,19 @@ export function pickByStrategy(opts) {
     isAccountAvailable(currentToken, currentAcct.expiresAt, stateManager, now);
 
   if (!currentAvailable) {
-    // Must switch — pick lowest utilization as safe default
+    // Must switch  - pick lowest utilization as safe default
     const best = pickBestAccount(accounts, stateManager, excludeTokens);
     return { account: best, rotated: !!best };
   }
 
   switch (strategy) {
     case 'sticky':
-      // Never proactively switch — keep current
+      // Never proactively switch  - keep current
       return { account: null, rotated: false };
 
     case 'conserve': {
       // Pick account with highest weekly utilization (windows already active)
-      // Untouched accounts stay dormant — their windows don't start
+      // Untouched accounts stay dormant  - their windows don't start
       const conserved = pickConserve(accounts, stateManager, excludeTokens);
       if (conserved && conserved.token !== currentToken) {
         return { account: conserved, rotated: true };
@@ -409,7 +409,7 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, maxPoints = H
 }
 
 // ─────────────────────────────────────────────────
-// OAuth Token Refresh — Pure Functions
+// OAuth Token Refresh  - Pure Functions
 // ─────────────────────────────────────────────────
 
 /**

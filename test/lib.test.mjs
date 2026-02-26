@@ -1,4 +1,4 @@
-// Unit tests for lib.mjs — pure functions
+// Unit tests for lib.mjs  - pure functions
 import { describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 

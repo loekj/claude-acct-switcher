@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Claude Account Switcher — Uninstaller
+# Claude Account Switcher  - Uninstaller
 # Safely removes csw, the dashboard, shell config, and optionally saved accounts.
 
 set -euo pipefail
@@ -16,7 +16,7 @@ INSTALL_DIR="$HOME/.claude/account-switcher"
 SNIPPET_MARKER="# claude-account-switcher"
 
 echo ""
-echo -e "${BOLD}  Claude Account Switcher — Uninstaller${NC}"
+echo -e "${BOLD}  Claude Account Switcher  - Uninstaller${NC}"
 echo -e "  ──────────────────────────────────────────"
 echo ""
 
@@ -34,7 +34,7 @@ if [[ -d "$INSTALL_DIR/accounts" ]]; then
   ACCT_COUNT=$(find "$INSTALL_DIR/accounts" -name '*.json' 2>/dev/null | wc -l | tr -d ' ')
   if [[ "$ACCT_COUNT" -gt 0 ]]; then
     echo -e "  ${YELLOW}Note:${NC} You have ${BOLD}$ACCT_COUNT saved account profile(s)${NC} in $INSTALL_DIR/accounts/"
-    echo -e "  ${DIM}(These are cached credentials — your Keychain entries are not affected.)${NC}"
+    echo -e "  ${DIM}(These are cached credentials  - your Keychain entries are not affected.)${NC}"
     echo ""
   fi
 fi
@@ -90,7 +90,7 @@ if [[ -n "$SHELL_RC" ]]; then
   cp "$SHELL_RC" "${SHELL_RC}.csw-backup"
 
   # Use sed to remove the block:
-  #   # claude-account-switcher — auto-start proxy + set base URL
+  #   # claude-account-switcher  - auto-start proxy + set base URL
   #   if ! lsof -iTCP:3333 ...
   #     nohup node ...
   #     disown
@@ -101,7 +101,7 @@ if [[ -n "$SHELL_RC" ]]; then
   # Clean up any leftover blank lines at the end of the file
   # (only strip trailing blank lines, nothing else)
   while [[ -s "$SHELL_RC" ]] && [[ "$(tail -c 1 "$SHELL_RC" | xxd -p)" == "0a" ]] && [[ -z "$(tail -1 "$SHELL_RC")" ]]; do
-    # Check the last two lines — only strip if the last TWO lines are blank (double newline from our insertion)
+    # Check the last two lines  - only strip if the last TWO lines are blank (double newline from our insertion)
     if [[ -z "$(tail -2 "$SHELL_RC" | head -1)" ]]; then
       sed -i '' '$ d' "$SHELL_RC"
     else
@@ -146,6 +146,6 @@ echo -e "  ${BOLD}${GREEN}Uninstall complete.${NC}"
 echo ""
 echo -e "  ${BOLD}To finish:${NC}"
 echo -e "    1. Restart your terminal (or run: ${DIM}source ${SHELL_RC:-~/.zshrc}${NC})"
-echo -e "    2. Your Keychain credentials are untouched — Claude Code will"
+echo -e "    2. Your Keychain credentials are untouched  - Claude Code will"
 echo -e "       continue to work normally with whichever account was last active."
 echo ""
