@@ -366,15 +366,21 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, maxPoints = H
 
   /**
    * Calculate utilization velocity (change per hour) for the 5h window.
+   * Uses only the last 30 minutes of data to reflect current usage rate,
+   * not stale history from hours ago that inflates the slope.
    * Returns null if insufficient data.
    */
   function getVelocity(fingerprint) {
     const arr = history.get(fingerprint);
     if (!arr || arr.length < 2) return null;
-    const first = arr[0];
-    const last = arr[arr.length - 1];
+    // Use recent window (last 30 min) for velocity, not entire history
+    const recentCutoff = Date.now() - 30 * 60 * 1000;
+    const recent = arr.filter(e => e.ts >= recentCutoff);
+    if (recent.length < 2) return null;
+    const first = recent[0];
+    const last = recent[recent.length - 1];
     const timeDeltaHrs = (last.ts - first.ts) / (1000 * 60 * 60);
-    if (timeDeltaHrs < 0.05) return null; // need at least ~3 min of data
+    if (timeDeltaHrs < 0.16) return null; // need at least ~10 min of recent data
     const utilizationDelta = last.u5h - first.u5h;
     return utilizationDelta / timeDeltaHrs; // change per hour (0-1 scale)
   }
