@@ -93,7 +93,7 @@ elif [[ -f "$HOME/.bash_profile" ]]; then
   SHELL_RC="$HOME/.bash_profile"
 fi
 
-SNIPPET_MARKER="# claude-account-switcher"
+SNIPPET_MARKER="# BEGIN claude-account-switcher"
 
 if [[ -n "$SHELL_RC" ]]; then
   if grep -q "$SNIPPET_MARKER" "$SHELL_RC" 2>/dev/null; then
@@ -101,12 +101,13 @@ if [[ -n "$SHELL_RC" ]]; then
   else
     echo "" >> "$SHELL_RC"
     cat >> "$SHELL_RC" << 'SHELL_EOF'
-# claude-account-switcher  - auto-start proxy + set base URL
+# BEGIN claude-account-switcher
 if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then
   nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &
   disown
 fi
 export ANTHROPIC_BASE_URL=http://localhost:3334
+# END claude-account-switcher
 SHELL_EOF
     echo -e "  ${GREEN}✓${NC} Added auto-start to ${CYAN}$SHELL_RC${NC}"
   fi
@@ -114,12 +115,13 @@ else
   echo -e "  ${YELLOW}Could not detect shell config file.${NC}"
   echo "  Add this to your shell profile manually:"
   echo ""
-  echo '    # claude-account-switcher  - auto-start proxy + set base URL'
+  echo '    # BEGIN claude-account-switcher'
   echo '    if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then'
   echo '      nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &'
   echo '      disown'
   echo '    fi'
   echo '    export ANTHROPIC_BASE_URL=http://localhost:3334'
+  echo '    # END claude-account-switcher'
 fi
 
 echo ""
@@ -129,9 +131,7 @@ echo -e "  ${BOLD}Next steps:${NC}"
 echo -e "    1. Restart your terminal (or run: ${DIM}source $SHELL_RC${NC})"
 echo -e "    2. Log in to your first account:  ${DIM}claude login${NC}"
 echo -e "    3. Save it:                       ${DIM}csw add account-1${NC}"
-echo -e "    4. Log in to another account:     ${DIM}claude login${NC}"
-echo -e "    5. Save it:                       ${DIM}csw add account-2${NC}"
-echo -e "    6. Open the dashboard:            ${DIM}csw dashboard${NC}"
+echo -e "    4. Switch accounts or open the dashboard: ${DIM}csw dashboard${NC}"
 echo ""
 echo -e "  Dashboard:  ${CYAN}http://localhost:3333${NC}"
 echo -e "  API Proxy:  ${CYAN}http://localhost:3334${NC}"
