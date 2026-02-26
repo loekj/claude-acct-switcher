@@ -1620,10 +1620,6 @@ function renderSparkline(hist, key, windowMs, mode) {
     }
   }
 
-  // "now" label at right edge
-  svg += '<line x1="' + (padL + chartW).toFixed(1) + '" y1="' + padT + '" x2="' + (padL + chartW).toFixed(1) + '" y2="' + (padT + chartH) + '" stroke="var(--muted)" stroke-width="0.5" stroke-dasharray="2,2" />';
-  svg += '<text x="' + (padL + chartW).toFixed(1) + '" y="' + (H - 1) + '" fill="var(--muted)" font-size="6" text-anchor="end" font-family="inherit">now</text>';
-
   // Data polyline  - position by real timestamp on the window axis
   if (hist && hist.length >= 2) {
     const points = hist
