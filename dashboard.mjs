@@ -1655,7 +1655,7 @@ function renderVelocityInline(p) {
   let text;
   if (min <= 0) { cls += ' velocity-crit'; text = 'at limit'; }
   else if (min < 300) { cls += ' velocity-crit'; text = 'Est. ' + formatEta(min) + ' to limit'; }
-  else { cls += ' velocity-ok'; text = 'Est. ' + formatEta(min) + ' to limit'; }
+  else { cls += ' velocity-ok'; text = '>5hr to limit'; }
   return '<span class="card-token-sep">&middot;</span>' +
     '<span class="' + cls + '" title="Estimated time until 5h rate limit is reached, based on current usage velocity">' + text + '</span>';
 }
@@ -2718,12 +2718,20 @@ async function handleProxyRequest(clientReq, clientRes) {
     // ── 429: Rate limited → auto-switch (if enabled) ──
     if (status === 429) {
       const retryAfter = parseInt(proxyRes.headers['retry-after'] || '0', 10);
-      markAccountLimited(token, acctName, retryAfter);
-      logEvent('rate-limited', { account: acctName, retryAfter });
-      log('switch', `${acctName} → 429 rate limited (retry-after: ${retryAfter}s)`);
 
-      if (!settings.autoSwitch) {
-        log('switch', '  → auto-switch OFF, returning 429 as-is');
+      // Transient burst 429s (short retry-after) are normal — Claude Code
+      // retries on its own.  Pass through silently without noisy logging,
+      // marking the account as limited, or sending notifications.
+      const isTransient = retryAfter < 60;
+
+      if (!isTransient) {
+        markAccountLimited(token, acctName, retryAfter);
+        logEvent('rate-limited', { account: acctName, retryAfter });
+      }
+      log('switch', `${acctName} → 429 ${isTransient ? 'transient' : 'rate limited'} (retry-after: ${retryAfter}s)`);
+
+      if (!settings.autoSwitch || isTransient) {
+        if (!isTransient) log('switch', '  → auto-switch OFF, returning 429 as-is');
         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
         proxyRes.pipe(clientRes);
