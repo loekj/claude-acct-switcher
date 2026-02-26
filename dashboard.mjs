@@ -1597,9 +1597,10 @@ function renderSparkline(hist, key, windowMs, labels) {
 }
 
 function formatEta(minutes) {
+  if (minutes < 5) return '<5m';
   // Round to nearest 10 minutes
   const rounded = Math.round(minutes / 10) * 10;
-  if (rounded <= 0) return '0:00';
+  if (rounded <= 0) return '<5m';
   const h = Math.floor(rounded / 60);
   const m = rounded % 60;
   return h + ':' + String(m).padStart(2, '0');
@@ -1610,7 +1611,7 @@ function renderVelocityInline(p) {
   const min = p.minutesToLimit;
   let cls = 'velocity-badge';
   let text;
-  if (min === 0) { cls += ' velocity-crit'; text = 'at limit'; }
+  if (min <= 0) { cls += ' velocity-crit'; text = 'at limit'; }
   else if (min <= 30) { cls += ' velocity-crit'; text = 'Est. ' + formatEta(min) + ' to limit'; }
   else if (min <= 120) { cls += ' velocity-warn'; text = 'Est. ' + formatEta(min) + ' to limit'; }
   else { text = 'Est. ' + formatEta(min) + ' to limit'; }
