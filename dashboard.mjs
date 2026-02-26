@@ -234,16 +234,35 @@ async function autoDiscoverAccount() {
     files = [];
   }
 
+  // Resolve email for the new token so we can deduplicate by identity
+  const token = creds.claudeAiOauth.accessToken;
+  const email = await fetchAccountEmail(token);
+
   for (const file of files) {
+    const savedName = basename(file, '.json');
     try {
       const raw = await readFile(join(ACCOUNTS_DIR, file), 'utf8');
       const saved = JSON.parse(raw);
-      if (getFingerprint(saved) === fp) return; // already saved
+      if (getFingerprint(saved) === fp) return; // exact same token already saved
+
+      // Same email = same account with a refreshed token  - update in place
+      if (email) {
+        let savedEmail = '';
+        try { savedEmail = (await readFile(join(ACCOUNTS_DIR, `${savedName}.label`), 'utf8')).trim(); } catch {}
+        if (savedEmail === email) {
+          writeFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(creds, null, 2));
+          // Migrate persisted state / history from old fingerprint to new
+          const oldFp = getFingerprint(saved);
+          migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
+          console.log(`[auto-discover] Updated "${savedName}" with refreshed token (${email})`);
+          if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
+          return;
+        }
+      }
     } catch { /* skip */ }
   }
 
-  // Unknown account  - auto-save it
-  // Generate a name like "auto-1", "auto-2", ...
+  // Truly new account  - save it
   let idx = 1;
   while (existsSync(join(ACCOUNTS_DIR, `auto-${idx}.json`))) idx++;
   const name = `auto-${idx}`;
@@ -251,9 +270,6 @@ async function autoDiscoverAccount() {
   try { mkdirSync(ACCOUNTS_DIR, { recursive: true }); } catch {}
   writeFileSync(join(ACCOUNTS_DIR, `${name}.json`), JSON.stringify(creds, null, 2));
 
-  // Try to fetch email for the label
-  const token = creds.claudeAiOauth.accessToken;
-  const email = await fetchAccountEmail(token);
   if (email) {
     writeFileSync(join(ACCOUNTS_DIR, `${name}.label`), email);
   }
@@ -493,10 +509,13 @@ async function loadProfiles() {
       const oauth = creds.claudeAiOauth || {};
       const fp = getFingerprint(creds);
 
-      // Always resolve email as the display name
+      // Resolve display name: try live API, then persisted .label file, then account name
       let email = '';
       if (oauth.accessToken) {
         email = await getEmailForToken(oauth.accessToken, fp);
+      }
+      if (!email) {
+        try { email = (await readFile(join(ACCOUNTS_DIR, `${name}.label`), 'utf8')).trim(); } catch {}
       }
 
       // Rate limit fetching strategy:
