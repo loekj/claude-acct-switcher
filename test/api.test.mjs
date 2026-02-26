@@ -45,7 +45,7 @@ import {
   shouldRefreshToken,
 } from '../lib.mjs';
 
-describe('/api/refresh — mock OAuth server', () => {
+describe('/api/refresh  - mock OAuth server', () => {
   let mockServer, mockPort, mockUrl;
   let refreshCount = 0;
 

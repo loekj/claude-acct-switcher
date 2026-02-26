@@ -730,7 +730,7 @@ cmd_dashboard() {
 
 cmd_help() {
   echo ""
-  echo -e "${BOLD}  vdm${NC} — Van Damme-o-Matic"
+  echo -e "${BOLD}  vdm${NC}  - Van Damme-o-Matic"
   echo ""
   echo -e "  ${BOLD}USAGE${NC}"
   echo -e "    vdm <command> [args]"
@@ -758,7 +758,7 @@ cmd_help() {
   echo -e "  ${BOLD}HOW IT WORKS${NC}"
   echo -e "    Accounts are auto-discovered when you run ${DIM}claude login${NC}."
   echo -e "    The proxy (port ${PROXY_PORT}) auto-switches on rate limits."
-  echo -e "    Emails are fetched automatically — no manual labeling needed."
+  echo -e "    Emails are fetched automatically  - no manual labeling needed."
   echo ""
 }
 
