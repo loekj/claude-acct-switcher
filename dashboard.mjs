@@ -278,7 +278,21 @@ const RATE_LIMIT_CACHE_TTL = 5 * 60 * 1000; // 5 min  - proxy state fills the ga
 
 // ── Probe cost tracking (uses lib.mjs) ──
 const probeTracker = createProbeTracker();
-function recordProbe() { probeTracker.record(); }
+const PROBE_LOG_FILE = join(__dirname, 'probe-log.json');
+
+// Load persisted probe log on startup
+try {
+  if (existsSync(PROBE_LOG_FILE)) {
+    const raw = readFileSync(PROBE_LOG_FILE, 'utf8');
+    probeTracker.load(JSON.parse(raw));
+  }
+} catch { /* corrupt file - start fresh */ }
+
+function saveProbeLogToDisk() {
+  try { writeFileSync(PROBE_LOG_FILE, JSON.stringify(probeTracker.toJSON())); } catch {}
+}
+
+function recordProbe() { probeTracker.record(); saveProbeLogToDisk(); }
 function getProbeStats() { return probeTracker.getStats(); }
 
 const utilizationHistory = createUtilizationHistory(); // 5hr: 6h window, ~5 min intervals
@@ -412,6 +426,7 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
 
   // 3. Check persisted state (survives restarts)
   const persisted = persistedState[fp];
+  let fromPersisted = null;
   if (persisted && persisted.updatedAt) {
     const nowSec = Math.floor(Date.now() / 1000);
     // If the 5h window has reset since we last saved, utilization is effectively 0
@@ -420,7 +435,7 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
     // If the 7d window has reset since we last saved, utilization is effectively 0
     const u7d = (persisted.resetAt7d && persisted.resetAt7d < nowSec) ? 0 : (persisted.utilization7d || 0);
     const r7d = (persisted.resetAt7d && persisted.resetAt7d < nowSec) ? 0 : (persisted.resetAt7d || 0);
-    const fromPersisted = {
+    fromPersisted = {
       status: 'ok',
       fiveH: { status: 'ok', reset: r5h, utilization: u5h },
       sevenD: { status: 'ok', reset: r7d, utilization: u7d },
@@ -447,8 +462,15 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
       resetAt: data.fiveH.reset,
       resetAt7d: data.sevenD.reset,
     });
+    return data;
   }
-  return data;
+
+  // 5. Probe failed  - fall back to stale persisted data instead of null
+  if (fromPersisted) {
+    fromPersisted.staleAt = fromPersisted.fetchedAt;
+    return fromPersisted;
+  }
+  return null;
 }
 
 // ─────────────────────────────────────────────────
@@ -940,6 +962,7 @@ function renderHTML() {
   }
   .card:hover { box-shadow: var(--shadow-lg); }
   .card.active { border-color: var(--green); border-width: 2px; }
+  .card.stale { opacity: 0.5; }
 
   .card-top {
     display: flex;
@@ -1614,7 +1637,10 @@ async function refresh() {
     const resp = await fetch('/api/profiles');
     const { profiles, stats, probeStats, allExhausted, earliestReset } = await resp.json();
     const ph = quickHash(profiles);
-    if (ph !== _lastProfilesHash) {
+    // Always re-render when stale data exists so the "Xm ago" label stays current
+    const hasStale = profiles.some(p => p.rateLimits && p.rateLimits.fetchedAt && !p.dormant &&
+      Date.now() - p.rateLimits.fetchedAt > STALE_THRESHOLD);
+    if (ph !== _lastProfilesHash || hasStale) {
       _lastProfilesHash = ph;
       renderAccounts(profiles, _firstRender);
     }
@@ -1648,6 +1674,8 @@ async function refresh() {
   _firstRender = false;
 }
 
+const STALE_THRESHOLD = 10 * 60 * 1000; // 10 min
+
 function renderAccounts(profiles, animate) {
   const el = document.getElementById('accounts');
   if (!profiles.length) {
@@ -1659,6 +1687,17 @@ function renderAccounts(profiles, animate) {
     const displayName = p.label || p.name;
     const eName = p.name.replace(/'/g, "\\\\'");
     const tok = tokenStatus(p.expiresAt);
+
+    // Staleness detection  - purely visual, no persisted state modified
+    // Dormant accounts (0% on both windows) are excluded  - 0% doesn't go stale
+    const isStale = !p.dormant && p.rateLimits && p.rateLimits.fetchedAt &&
+      (Date.now() - p.rateLimits.fetchedAt > STALE_THRESHOLD);
+    let staleLabel = '';
+    if (isStale) {
+      const agoMin = Math.round((Date.now() - p.rateLimits.fetchedAt) / 60000);
+      const agoText = agoMin >= 60 ? Math.round(agoMin / 60) + 'h' : agoMin + 'm';
+      staleLabel = '<span style="font-size:0.75rem;color:var(--muted);margin-left:0.25rem">(stale \\u00b7 ' + agoText + ' ago)</span>';
+    }
 
     let barsHtml = '';
     if (p.rateLimits) {
@@ -1680,7 +1719,7 @@ function renderAccounts(profiles, animate) {
 
       barsHtml = '<div class="rate-bars">' +
         '<div class="rate-group">' +
-          '<div class="rate-head"><span class="rate-label">5h window</span><span class="rate-pct ' + pctClass(f) + '">' + f + '%</span></div>' +
+          '<div class="rate-head"><span class="rate-label">5h window' + staleLabel + '</span><span class="rate-pct ' + pctClass(f) + '">' + f + '%</span></div>' +
           '<div class="rate-track"><div class="rate-fill ' + fillClass(rl.fiveH.utilization) + '" style="width:' + Math.min(f,100) + '%"></div></div>' +
           '<div class="rate-reset" data-reset="' + rl.fiveH.reset + '">' + formatTimeLeft(rl.fiveH.reset) + '</div>' +
           spark5h +
@@ -1698,8 +1737,9 @@ function renderAccounts(profiles, animate) {
       barsHtml = '<div style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem">Rate limits unavailable</div>';
     }
 
+    const staleClass = isStale ? ' stale' : '';
     const animStyle = animate ? ' style="animation-delay:' + (i*0.05) + 's"' : ' style="animation:none"';
-    return '<div class="card' + (active ? ' active' : '') + '"' + animStyle + '>' +
+    return '<div class="card' + (active ? ' active' : '') + staleClass + '"' + animStyle + '>' +
       '<div class="card-top">' +
         '<div class="card-identity">' +
           '<div class="status-dot ' + (active ? 'active' : 'inactive') + '"></div>' +
@@ -2077,25 +2117,18 @@ function updateAccountState(token, name, headers, fingerprint) {
     const reset7d = Number(headers['anthropic-ratelimit-unified-7d-reset'] || 0);
     const reset5h = Number(headers['anthropic-ratelimit-unified-5h-reset'] || 0);
 
-    // Detect window resets  - if utilization dropped significantly, the window reset
-    // Clear stale history so sparklines start fresh
-    const prev5h = utilizationHistory.getHistory(fingerprint);
-    if (prev5h.length > 0) {
-      const lastU5h = prev5h[prev5h.length - 1].u5h;
-      if (lastU5h > 0.05 && u5h < lastU5h * 0.5) {
-        // 5hr window reset  - clear 5hr history
-        utilizationHistory.load(fingerprint, []);
-        delete _sparkCache[fingerprint + '_5h'];
-      }
+    // Detect window resets using actual reset timestamps from API headers.
+    // Only clear history when the API reports a new rate-limit window, not on
+    // normal utilization fluctuations (avoids false positives at low usage).
+    const prevReset5h = persistedState[fingerprint]?.resetAt || 0;
+    if (reset5h > prevReset5h && prevReset5h > 0 && u5h < (utilizationHistory.getHistory(fingerprint).slice(-1)[0]?.u5h ?? u5h)) {
+      utilizationHistory.load(fingerprint, []);
+      delete _sparkCache[fingerprint + '_5h'];
     }
-    const prev7d = weeklyHistory.getHistory(fingerprint);
-    if (prev7d.length > 0) {
-      const lastU7d = prev7d[prev7d.length - 1].u7d;
-      if (lastU7d > 0.05 && u7d < lastU7d * 0.5) {
-        // Weekly window reset  - clear weekly history
-        weeklyHistory.load(fingerprint, []);
-        delete _sparkCache[fingerprint + '_7d'];
-      }
+    const prevReset7d = persistedState[fingerprint]?.resetAt7d || 0;
+    if (reset7d > prevReset7d && prevReset7d > 0 && u7d < (weeklyHistory.getHistory(fingerprint).slice(-1)[0]?.u7d ?? u7d)) {
+      weeklyHistory.load(fingerprint, []);
+      delete _sparkCache[fingerprint + '_7d'];
     }
 
     utilizationHistory.record(fingerprint, u5h, u7d);
