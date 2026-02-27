@@ -256,6 +256,7 @@ async function autoDiscoverAccount() {
           migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
           console.log(`[auto-discover] Updated "${savedName}" with refreshed token (${email})`);
           if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
+          invalidateTokenCache(); // ensure getActiveToken() sees the updated token
           return;
         }
       }
@@ -2634,8 +2635,12 @@ async function handleProxyRequest(clientReq, clientRes) {
 
     if (strategyPick) {
       const oldName = activeAcct?.label || activeAcct?.name || 'none';
+      const pickName = strategyPick.label || strategyPick.name;
+      const isSameAccount = activeAcct && strategyPick.name === activeAcct.name;
       const reason = rotated ? settings.rotationStrategy : 'unavailable';
-      log('proactive', `${oldName} → switch to ${strategyPick.label || strategyPick.name} (${reason})`);
+      if (!isSameAccount) {
+        log('proactive', `${oldName} → switch to ${pickName} (${reason})`);
+      }
       try {
         await withSwitchLock(() => {
           writeKeychain(strategyPick.creds);
@@ -2646,9 +2651,11 @@ async function handleProxyRequest(clientReq, clientRes) {
       }
       token = strategyPick.token;
       lastRotationTime = Date.now();
-      logEvent('proactive-switch', { from: oldName, to: strategyPick.label || strategyPick.name, reason });
-      if (reason === 'unavailable') {
-        notify('Account Switched', `${oldName} unavailable → ${strategyPick.label || strategyPick.name}`);
+      if (!isSameAccount) {
+        logEvent('proactive-switch', { from: oldName, to: pickName, reason });
+        if (reason === 'unavailable') {
+          notify('Account Switched', `${oldName} unavailable → ${pickName}`);
+        }
       }
     } else if (!token) {
       clientRes.writeHead(502, { 'Content-Type': 'application/json' });
