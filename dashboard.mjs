@@ -103,7 +103,8 @@ function readKeychain() {
       { encoding: 'utf8', stdio: ['pipe', 'pipe', 'pipe'] }
     ).trim();
     return JSON.parse(raw);
-  } catch {
+  } catch (e) {
+    log('error', `Keychain read failed: ${e.message}`);
     return null;
   }
 }
@@ -2758,6 +2759,14 @@ async function handleProxyRequest(clientReq, clientRes) {
       clientRes.end(JSON.stringify({ error: 'No active account in keychain' }));
       return;
     }
+  }
+
+  // Guard: never forward a null/empty token (causes 400 with no body)
+  if (!token) {
+    log('error', 'No active token available (keychain read may have failed)');
+    clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+    clientRes.end(JSON.stringify({ error: 'No active token available — check keychain access' }));
+    return;
   }
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
