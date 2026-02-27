@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Claude Account Switcher  - Uninstaller
-# Safely removes csw, the dashboard, shell config, and optionally saved accounts.
+# Safely removes vdm, the dashboard, shell config, and optionally saved accounts.
 
 set -euo pipefail
 
@@ -25,7 +25,7 @@ echo ""
 echo -e "  ${BOLD}This will:${NC}"
 echo -e "    1. Stop the running dashboard/proxy"
 echo -e "    2. Remove the shell config block from your shell rc file"
-echo -e "    3. Remove the ${CYAN}csw${NC} symlink from PATH"
+echo -e "    3. Remove the ${CYAN}vdm${NC} symlink from PATH"
 echo -e "    4. Remove ${CYAN}$INSTALL_DIR${NC}"
 echo ""
 
@@ -51,9 +51,9 @@ echo ""
 
 stopped=false
 
-# Try csw dashboard stop
-if [[ -x "$INSTALL_DIR/csw" ]]; then
-  "$INSTALL_DIR/csw" dashboard stop 2>/dev/null && stopped=true || true
+# Try vdm dashboard stop
+if [[ -x "$INSTALL_DIR/vdm" ]]; then
+  "$INSTALL_DIR/vdm" dashboard stop 2>/dev/null && stopped=true || true
 fi
 
 # Fallback: kill by port
@@ -84,7 +84,7 @@ for rc in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
 done
 
 if [[ -n "$SHELL_RC" ]]; then
-  cp "$SHELL_RC" "${SHELL_RC}.csw-backup"
+  cp "$SHELL_RC" "${SHELL_RC}.vdm-backup"
 
   sed -i '' '/^# BEGIN claude-account-switcher/,/^# END claude-account-switcher/d' "$SHELL_RC"
 
@@ -99,15 +99,15 @@ if [[ -n "$SHELL_RC" ]]; then
   done
 
   echo -e "  ${GREEN}✓${NC} Removed auto-start block from ${CYAN}$SHELL_RC${NC}"
-  echo -e "    ${DIM}Backup: ${SHELL_RC}.csw-backup${NC}"
+  echo -e "    ${DIM}Backup: ${SHELL_RC}.vdm-backup${NC}"
 else
   echo -e "  ${DIM}No shell config block found (already clean)${NC}"
 fi
 
-# ── 3. Remove csw symlink ──
+# ── 3. Remove vdm symlink (and legacy csw) ──
 
 removed_link=false
-for link in "$HOME/.local/bin/csw" "/usr/local/bin/csw"; do
+for link in "$HOME/.local/bin/vdm" "/usr/local/bin/vdm" "$HOME/.local/bin/csw" "/usr/local/bin/csw"; do
   if [[ -L "$link" ]]; then
     target=$(readlink "$link" 2>/dev/null || true)
     if [[ "$target" == *"account-switcher"* ]]; then
@@ -118,7 +118,7 @@ for link in "$HOME/.local/bin/csw" "/usr/local/bin/csw"; do
   fi
 done
 if [[ "$removed_link" != "true" ]]; then
-  echo -e "  ${DIM}No csw symlink found${NC}"
+  echo -e "  ${DIM}No vdm symlink found${NC}"
 fi
 
 # ── 4. Remove install directory ──

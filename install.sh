@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Claude Account Switcher  - Installer
-# Installs csw to ~/.claude/account-switcher/ and configures your shell.
+# Installs vdm to ~/.claude/account-switcher/ and configures your shell.
 
 set -euo pipefail
 
@@ -53,8 +53,8 @@ mkdir -p "$INSTALL_DIR/accounts"
 
 cp "$SCRIPT_DIR/dashboard.mjs" "$INSTALL_DIR/dashboard.mjs"
 cp "$SCRIPT_DIR/lib.mjs" "$INSTALL_DIR/lib.mjs"
-cp "$SCRIPT_DIR/csw" "$INSTALL_DIR/csw"
-chmod +x "$INSTALL_DIR/csw"
+cp "$SCRIPT_DIR/vdm" "$INSTALL_DIR/vdm"
+chmod +x "$INSTALL_DIR/vdm"
 
 # Create default config if it doesn't exist
 if [[ ! -f "$INSTALL_DIR/config.json" ]]; then
@@ -68,24 +68,23 @@ fi
 
 echo -e "  ${GREEN}✓${NC} Installed to ${CYAN}$INSTALL_DIR${NC}"
 
-# ── Symlink csw to PATH ──
+# ── Symlink vdm to PATH ──
 
-CSW_LINK=""
+LINK_DIR=""
 if [[ -d "$HOME/.local/bin" ]]; then
-  CSW_LINK="$HOME/.local/bin/csw"
+  LINK_DIR="$HOME/.local/bin"
 elif [[ -d "/usr/local/bin" ]]; then
-  CSW_LINK="/usr/local/bin/csw"
-fi
-
-if [[ -n "$CSW_LINK" ]]; then
-  ln -sf "$INSTALL_DIR/csw" "$CSW_LINK"
-  echo -e "  ${GREEN}✓${NC} Linked ${CYAN}csw${NC} to ${DIM}$CSW_LINK${NC}"
+  LINK_DIR="/usr/local/bin"
 else
   mkdir -p "$HOME/.local/bin"
-  ln -sf "$INSTALL_DIR/csw" "$HOME/.local/bin/csw"
-  echo -e "  ${GREEN}✓${NC} Linked ${CYAN}csw${NC} to ${DIM}$HOME/.local/bin/csw${NC}"
+  LINK_DIR="$HOME/.local/bin"
   echo -e "  ${YELLOW}Note:${NC} Add ${DIM}$HOME/.local/bin${NC} to your PATH if not already."
 fi
+
+ln -sf "$INSTALL_DIR/vdm" "$LINK_DIR/vdm"
+# Clean up legacy csw symlink if present
+rm -f "$LINK_DIR/csw"
+echo -e "  ${GREEN}✓${NC} Linked ${CYAN}vdm${NC} to ${DIM}$LINK_DIR${NC}"
 
 # ── Configure shell ──
 
@@ -135,8 +134,8 @@ echo ""
 echo -e "  ${BOLD}Next steps:${NC}"
 echo -e "    1. Restart your terminal (or run: ${DIM}source $SHELL_RC${NC})"
 echo -e "    2. Log in to your first account:  ${DIM}claude login${NC}"
-echo -e "    3. Save it:                       ${DIM}csw add account-1${NC}"
-echo -e "    4. Switch accounts or open the dashboard: ${DIM}csw dashboard${NC}"
+echo -e "    3. Save it:                       ${DIM}vdm add account-1${NC}"
+echo -e "    4. Switch accounts or open the dashboard: ${DIM}vdm dashboard${NC}"
 echo ""
 echo -e "  Dashboard:  ${CYAN}http://localhost:3333${NC}"
 echo -e "  API Proxy:  ${CYAN}http://localhost:3334${NC}"
