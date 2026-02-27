@@ -728,6 +728,88 @@ cmd_dashboard() {
   esac
 }
 
+cmd_upgrade() {
+  local REPO_URL="https://github.com/loekj/claude-acct-switcher.git"
+  local tmpdir
+  tmpdir=$(mktemp -d)
+  # Ensure cleanup on any exit from this function
+  trap "rm -rf '$tmpdir'" RETURN
+
+  echo ""
+  echo -e "${BOLD}  Upgrading Van Damme-o-Matic…${NC}"
+  echo ""
+
+  # Fetch latest from remote
+  echo -e "  ${DIM}Fetching latest version…${NC}"
+  if ! git clone --depth 1 "$REPO_URL" "$tmpdir" 2>/dev/null; then
+    echo -e "  ${RED}Failed to fetch from $REPO_URL${NC}"
+    return 1
+  fi
+
+  # Compare versions (use git short hash as version marker)
+  local current_hash=""
+  if [[ -f "$SCRIPT_DIR/.version" ]]; then
+    current_hash=$(cat "$SCRIPT_DIR/.version")
+  fi
+  local latest_hash
+  latest_hash=$(git -C "$tmpdir" rev-parse --short HEAD 2>/dev/null)
+
+  if [[ -n "$current_hash" && "$current_hash" == "$latest_hash" ]]; then
+    echo -e "  ${GREEN}✓${NC} Already on the latest version (${DIM}$current_hash${NC})"
+    return 0
+  fi
+
+  # Verify the fetched repo has the files we need
+  for f in csw dashboard.mjs lib.mjs; do
+    if [[ ! -f "$tmpdir/$f" ]]; then
+      echo -e "  ${RED}Fetched repo is missing $f — aborting.${NC}"
+      return 1
+    fi
+  done
+
+  # Check if dashboard is running so we can restart it
+  local dashboard_was_running=false
+  if [[ -f "$DASHBOARD_PID_FILE" ]]; then
+    local pid=$(cat "$DASHBOARD_PID_FILE")
+    if kill -0 "$pid" 2>/dev/null; then
+      dashboard_was_running=true
+    fi
+  fi
+
+  # Stop dashboard before overwriting files
+  if [[ "$dashboard_was_running" == "true" ]]; then
+    echo -e "  ${DIM}Stopping dashboard…${NC}"
+    cmd_dashboard stop
+  fi
+
+  # Overwrite only code files — never touch accounts/, config.json,
+  # activity-log.json, .label files, or any other user data.
+  echo -e "  ${DIM}Updating files…${NC}"
+  cp "$tmpdir/csw"          "$SCRIPT_DIR/csw"
+  cp "$tmpdir/dashboard.mjs" "$SCRIPT_DIR/dashboard.mjs"
+  cp "$tmpdir/lib.mjs"      "$SCRIPT_DIR/lib.mjs"
+  chmod +x "$SCRIPT_DIR/csw"
+
+  # Write version marker
+  echo "$latest_hash" > "$SCRIPT_DIR/.version"
+
+  # Restart dashboard if it was running
+  if [[ "$dashboard_was_running" == "true" ]]; then
+    echo -e "  ${DIM}Restarting dashboard…${NC}"
+    cmd_dashboard start
+  fi
+
+  echo ""
+  if [[ -n "$current_hash" ]]; then
+    echo -e "  ${GREEN}✓${NC} Upgraded ${DIM}$current_hash${NC} → ${BOLD}$latest_hash${NC}"
+  else
+    echo -e "  ${GREEN}✓${NC} Upgraded to ${BOLD}$latest_hash${NC}"
+  fi
+  echo ""
+
+  log_activity "upgrade" "from=${current_hash:-unknown}" "to=$latest_hash"
+}
+
 cmd_help() {
   echo ""
   echo -e "${BOLD}  vdm${NC}  - Van Damme-o-Matic"
@@ -742,6 +824,7 @@ cmd_help() {
   echo -e "    ${CYAN}status${NC}                  Show current account details + settings"
   echo -e "    ${CYAN}config${NC} [key] [on|off]   View or toggle settings (proxy, autoswitch)"
   echo -e "    ${CYAN}dashboard${NC} [start|stop]  Launch/stop the web dashboard"
+  echo -e "    ${CYAN}upgrade${NC}                 Update to the latest version"
   echo -e "    ${CYAN}help${NC}                    Show this help"
   echo ""
   echo -e "  ${BOLD}QUICK START${NC}"
@@ -778,6 +861,7 @@ case "$command" in
   status|st) cmd_status ;;
   config|cfg) cmd_config "$@" ;;
   dashboard) cmd_dashboard "$@" ;;
+  upgrade|update) cmd_upgrade ;;
   help|--help|-h) cmd_help ;;
   *)
     echo -e "${RED}Unknown command: $command${NC}"
