@@ -760,7 +760,7 @@ cmd_upgrade() {
   fi
 
   # Verify the fetched repo has the files we need
-  for f in csw dashboard.mjs lib.mjs; do
+  for f in vdm dashboard.mjs lib.mjs; do
     if [[ ! -f "$tmpdir/$f" ]]; then
       echo -e "  ${RED}Fetched repo is missing $f — aborting.${NC}"
       return 1
@@ -785,10 +785,10 @@ cmd_upgrade() {
   # Overwrite only code files — never touch accounts/, config.json,
   # activity-log.json, .label files, or any other user data.
   echo -e "  ${DIM}Updating files…${NC}"
-  cp "$tmpdir/csw"          "$SCRIPT_DIR/csw"
+  cp "$tmpdir/vdm"          "$SCRIPT_DIR/vdm"
   cp "$tmpdir/dashboard.mjs" "$SCRIPT_DIR/dashboard.mjs"
   cp "$tmpdir/lib.mjs"      "$SCRIPT_DIR/lib.mjs"
-  chmod +x "$SCRIPT_DIR/csw"
+  chmod +x "$SCRIPT_DIR/vdm"
 
   # Write version marker
   echo "$latest_hash" > "$SCRIPT_DIR/.version"
