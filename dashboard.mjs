@@ -1672,17 +1672,38 @@ function renderSparkline(hist, key, windowMs, mode) {
     }
   }
 
-  // Data polyline  - position by real timestamp on the window axis
-  if (hist && hist.length >= 2) {
-    const points = hist
-      .filter(h => h.ts >= windowStart && h.ts <= windowEnd)
-      .map(h => {
-        const x = padL + ((h.ts - windowStart) / windowMs) * chartW;
-        const y = padT + chartH - (h[key] || 0) * chartH;
-        return x.toFixed(1) + ',' + y.toFixed(1);
-      }).join(' ');
-    if (points) {
-      svg += '<polyline points="' + points + '" fill="none" stroke="var(--primary)" stroke-width="1.5" stroke-linejoin="round" stroke-linecap="round" />';
+  // Binary activity area: ON (utilization > 0) vs OFF, with shaded fill
+  if (hist && hist.length >= 1) {
+    var pts = hist.filter(function(h) { return h.ts >= windowStart && h.ts <= windowEnd; });
+    if (pts.length) {
+      var yOn = padT, yOff = padT + chartH;
+      var d = 'M' + (padL + ((pts[0].ts - windowStart) / windowMs) * chartW).toFixed(1) + ',' + yOff;
+      for (var pi = 0; pi < pts.length; pi++) {
+        var x = padL + ((pts[pi].ts - windowStart) / windowMs) * chartW;
+        var on = (pts[pi][key] || 0) > 0;
+        d += ' L' + x.toFixed(1) + ',' + (on ? yOn : yOff).toFixed(1);
+        // Step to next point (hold value until next timestamp)
+        if (pi < pts.length - 1) {
+          var xNext = padL + ((pts[pi + 1].ts - windowStart) / windowMs) * chartW;
+          d += ' L' + xNext.toFixed(1) + ',' + (on ? yOn : yOff).toFixed(1);
+        }
+      }
+      // Close path back to baseline
+      var xLast = padL + ((pts[pts.length - 1].ts - windowStart) / windowMs) * chartW;
+      d += ' L' + xLast.toFixed(1) + ',' + yOff + ' Z';
+      svg += '<path d="' + d + '" fill="var(--primary)" opacity="0.25" />';
+      // Top edge line for clarity
+      var edge = '';
+      for (var ei = 0; ei < pts.length; ei++) {
+        var ex = padL + ((pts[ei].ts - windowStart) / windowMs) * chartW;
+        var eOn = (pts[ei][key] || 0) > 0;
+        edge += (ei === 0 ? 'M' : ' L') + ex.toFixed(1) + ',' + (eOn ? yOn : yOff).toFixed(1);
+        if (ei < pts.length - 1) {
+          var exNext = padL + ((pts[ei + 1].ts - windowStart) / windowMs) * chartW;
+          edge += ' L' + exNext.toFixed(1) + ',' + (eOn ? yOn : yOff).toFixed(1);
+        }
+      }
+      svg += '<path d="' + edge + '" fill="none" stroke="var(--primary)" stroke-width="1" />';
     }
   }
 
@@ -1819,9 +1840,9 @@ function renderAccounts(profiles, animate) {
     var staleMsg = '';
     if (isStale) {
       if (p.refreshFailed && !p.refreshFailed.retriable) {
-        staleMsg = '<div class="stale-msg">Token expired \\u2014 run <code>claude login</code> to reactivate</div>';
+        staleMsg = '<div class="stale-msg">Token expired. Run <code>claude login</code> to reactivate.</div>';
       } else {
-        staleMsg = '<div class="stale-msg">Token expired \\u2014 auto-refresh will retry shortly</div>';
+        staleMsg = '<div class="stale-msg">Token expired. Auto-refresh will retry shortly.</div>';
       }
     }
     var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '');
@@ -2486,6 +2507,9 @@ async function refreshAccountToken(accountName) {
       return { ok: false, error: 'No claudeAiOauth in credentials' };
     }
 
+    let accountLabel = accountName;
+    try { accountLabel = readFileSync(join(ACCOUNTS_DIR, `${accountName}.label`), 'utf8').trim() || accountName; } catch {}
+
     // 2. Check if still needs refresh (double-check after lock)
     if (!shouldRefreshToken(oauth.expiresAt, REFRESH_BUFFER_MS)) {
       log('refresh', `${accountName}: token still valid, skipping refresh`);
@@ -2516,7 +2540,7 @@ async function refreshAccountToken(accountName) {
     if (!result.ok) {
       log('refresh', `${accountName}: refresh failed after retries: ${result.error}`);
       refreshFailures.set(accountName, { error: result.error, retriable: !!result.retriable, ts: Date.now() });
-      logActivity('refresh-failed', { account: accountName, error: result.error, retriable: !!result.retriable });
+      logActivity('refresh-failed', { account: accountLabel, error: result.error, retriable: !!result.retriable });
       return { ok: false, error: result.error };
     }
 
@@ -2556,7 +2580,7 @@ async function refreshAccountToken(accountName) {
     // 8. Invalidate caches
     invalidateAccountsCache();
     refreshFailures.delete(accountName);
-    logActivity('token-refreshed', { account: accountName });
+    logActivity('token-refreshed', { account: accountLabel });
 
     return { ok: true, accessToken: result.accessToken, expiresAt: newExpiresAt };
   });
@@ -2579,7 +2603,7 @@ setInterval(async () => {
       } catch (e) {
         log('refresh-bg', `${acct.label || acct.name}: background refresh error: ${e.message}`);
         refreshFailures.set(acct.name, { error: e.message, retriable: true, ts: Date.now() });
-        logActivity('refresh-failed', { account: acct.name, error: e.message, retriable: true });
+        logActivity('refresh-failed', { account: acct.label || acct.name, error: e.message, retriable: true });
       }
     }
   }
