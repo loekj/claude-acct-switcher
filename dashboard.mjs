@@ -1578,20 +1578,30 @@ function renderProbeStats(ps) {
 
 /**
  * Render a time-axis sparkline with real clock-time labels.
- * X-axis: (now - windowMs) on the left → now on the right.
- * Data populates left-to-right as time progresses.
+ * X-axis is anchored to the actual rate-limit window: [resetAt - windowMs, resetAt].
+ * Falls back to [now - windowMs, now] if resetAt is unavailable.
+ * A dashed "now" marker is drawn when now falls inside a future-ending window.
  *
  * @param {Array} hist - history entries with { ts, u5h, u7d }
  * @param {string} key - 'u5h' or 'u7d'
  * @param {number} windowMs - fixed x-axis span in ms (5h or 7d)
  * @param {string} mode - 'hours' or 'days'  - controls label generation
+ * @param {number} [resetAtSec] - window reset time (unix seconds)
  */
-function renderSparkline(hist, key, windowMs, mode) {
+function renderSparkline(hist, key, windowMs, mode, resetAtSec) {
   const W = 320, H = 44, padL = 1, padR = 1, padT = 1, padB = 12;
   const chartW = W - padL - padR;
   const chartH = H - padT - padB;
   const now = Date.now();
-  const windowStart = now - windowMs;
+
+  // Anchor window to the actual rate-limit window boundaries.
+  // resetAt defines the right edge; left edge = resetAt - windowMs.
+  // Fall back to [now - windowMs, now] if resetAt is unavailable or stale.
+  let windowEnd = now;
+  if (resetAtSec && resetAtSec * 1000 > now - windowMs) {
+    windowEnd = resetAtSec * 1000;
+  }
+  const windowStart = windowEnd - windowMs;
 
   // Generate real-time labels
   let svg = '';
@@ -1600,7 +1610,7 @@ function renderSparkline(hist, key, windowMs, mode) {
     const firstHour = new Date(windowStart);
     firstHour.setMinutes(0, 0, 0);
     if (firstHour.getTime() < windowStart) firstHour.setTime(firstHour.getTime() + 3600000);
-    for (let t = firstHour.getTime(); t <= now; t += 3600000) {
+    for (let t = firstHour.getTime(); t <= windowEnd; t += 3600000) {
       const x = padL + ((t - windowStart) / windowMs) * chartW;
       const d = new Date(t);
       const label = d.getHours() + ':00';
@@ -1613,7 +1623,7 @@ function renderSparkline(hist, key, windowMs, mode) {
     firstDay.setHours(0, 0, 0, 0);
     if (firstDay.getTime() < windowStart) firstDay.setTime(firstDay.getTime() + 86400000);
     const dayNames = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'];
-    for (let t = firstDay.getTime(); t <= now; t += 86400000) {
+    for (let t = firstDay.getTime(); t <= windowEnd; t += 86400000) {
       const x = padL + ((t - windowStart) / windowMs) * chartW;
       const d = new Date(t);
       const label = dayNames[d.getDay()];
@@ -1622,10 +1632,16 @@ function renderSparkline(hist, key, windowMs, mode) {
     }
   }
 
+  // "Now" marker  - dashed vertical line at current time (if within the window)
+  if (now > windowStart && now < windowEnd) {
+    const xNow = padL + ((now - windowStart) / windowMs) * chartW;
+    svg += '<line x1="' + xNow.toFixed(1) + '" y1="' + padT + '" x2="' + xNow.toFixed(1) + '" y2="' + (padT + chartH) + '" stroke="var(--muted)" stroke-width="0.7" stroke-dasharray="2,2" />';
+  }
+
   // Data polyline  - position by real timestamp on the window axis
   if (hist && hist.length >= 2) {
     const points = hist
-      .filter(h => h.ts >= windowStart)
+      .filter(h => h.ts >= windowStart && h.ts <= windowEnd)
       .map(h => {
         const x = padL + ((h.ts - windowStart) / windowMs) * chartW;
         const y = padT + chartH - (h[key] || 0) * chartH;
@@ -1744,16 +1760,16 @@ function renderAccounts(profiles, animate) {
       const f = Math.round(rl.fiveH.utilization * 100);
       const s = Math.round(rl.sevenD.utilization * 100);
 
-      // 5hr sparkline  - real clock-time labels, left=5h ago, right=now
+      // 5hr sparkline  - anchored to actual rate-limit window
       const hist5h = p.utilizationHistory || [];
       const spark5h = '<div class="sparkline-wrap">' +
-        renderSparkline(hist5h, 'u5h', 5*60*60*1000, 'hours') +
+        renderSparkline(hist5h, 'u5h', 5*60*60*1000, 'hours', rl.fiveH.reset) +
         '</div>';
 
-      // Weekly sparkline  - day-of-week labels, left=7d ago, right=now
+      // Weekly sparkline  - anchored to actual rate-limit window
       const hist7d = p.weeklyHistory || [];
       const spark7d = '<div class="sparkline-wrap">' +
-        renderSparkline(hist7d, 'u7d', 7*24*60*60*1000, 'days') +
+        renderSparkline(hist7d, 'u7d', 7*24*60*60*1000, 'days', rl.sevenD.reset) +
         '</div>';
 
       barsHtml = '<div class="rate-bars">' +
