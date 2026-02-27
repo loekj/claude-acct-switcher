@@ -28,6 +28,9 @@ export function buildForwardHeaders(originalHeaders, token) {
     if (lk === 'host' || lk === 'connection' || lk === 'content-length') continue;
     fwd[k] = v;
   }
+  if (!token || typeof token !== 'string') {
+    throw new Error(`Cannot forward request: token is ${token === null ? 'null' : typeof token}`);
+  }
   fwd['authorization'] = `Bearer ${token}`;
   fwd['host'] = 'api.anthropic.com';
   // Ensure OAuth beta
