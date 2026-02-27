@@ -340,7 +340,7 @@ export { PROBE_INPUT_TOKENS, PROBE_OUTPUT_TOKENS, PROBE_LOG_MAX_AGE };
 // Utilization history (for sparklines & velocity)
 // ─────────────────────────────────────────────────
 
-const HISTORY_MAX_AGE = 5 * 60 * 60 * 1000; // 5 hours (matches 5h window)
+const HISTORY_MAX_AGE = 24 * 60 * 60 * 1000; // 24 hours
 const HISTORY_MIN_INTERVAL = 2 * 60 * 1000; // 2 min between points
 
 export { HISTORY_MAX_AGE, HISTORY_MIN_INTERVAL };

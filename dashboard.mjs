@@ -312,7 +312,7 @@ function saveProbeLogToDisk() {
 function recordProbe() { probeTracker.record(); saveProbeLogToDisk(); }
 function getProbeStats() { return probeTracker.getStats(); }
 
-const utilizationHistory = createUtilizationHistory(); // 5h window, ~2 min intervals
+const utilizationHistory = createUtilizationHistory(); // 24h window, ~2 min intervals
 const weeklyHistory = createUtilizationHistory(7 * 24 * 60 * 60 * 1000, 15 * 60 * 1000); // 7d window, ~15 min intervals
 
 const HISTORY_FILE = join(__dirname, 'utilization-history.json');
@@ -605,7 +605,7 @@ async function handleAPI(req, res) {
     const allExhausted = allAccounts.length > 0 &&
       allAccounts.every(a => !isAccountAvailable(a.token, a.expiresAt));
     const earliestReset = allExhausted ? getEarliestReset() : null;
-    json(res, { profiles, stats, probeStats, allExhausted, earliestReset });
+    json(res, { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy: settings.rotationStrategy });
     return true;
   }
 
@@ -626,8 +626,22 @@ async function handleAPI(req, res) {
       // Log the manual switch
       let label = '';
       try { label = (await readFile(join(ACCOUNTS_DIR, `${name}.label`), 'utf8')).trim(); } catch {}
+      // Auto-set strategy to sticky so the manual switch isn't overridden
+      let strategyChanged = false;
+      const prevStrategy = settings.rotationStrategy;
+      if (prevStrategy !== 'sticky' && prevStrategy !== 'round-robin') {
+        settings.rotationStrategy = 'sticky';
+        saveSettings(settings);
+        strategyChanged = true;
+        logActivity('settings-changed', {
+          autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
+          rotationStrategy: 'sticky', rotationIntervalMin: settings.rotationIntervalMin,
+          reason: 'manual-switch',
+        });
+      }
+      lastRotationTime = Date.now();
       logActivity('manual-switch', { to: label || name });
-      json(res, { ok: true, switched: name });
+      json(res, { ok: true, switched: name, label: label || name, strategyChanged, strategy: settings.rotationStrategy });
     } catch (e) {
       json(res, { ok: false, error: e.message }, 400);
     }
@@ -978,7 +992,6 @@ function renderHTML() {
   }
   .card:hover { box-shadow: var(--shadow-lg); }
   .card.active { border-color: var(--green); border-width: 2px; }
-  .card.stale { opacity: 0.5; }
 
   .card-top {
     display: flex;
@@ -1355,7 +1368,7 @@ function renderHTML() {
   <div class="header">
     <div class="header-left">
       <h1>Van Damme-o-Matic</h1>
-      <div class="header-sub"><span id="account-count">0</span> accounts connected<span id="probe-stats"></span></div>
+      <div class="header-sub"><span id="account-count">0</span> accounts connected<span id="current-strategy"></span><span id="probe-stats"></span></div>
     </div>
   </div>
 
@@ -1538,7 +1551,7 @@ function showToast(msg) {
   t._tid = setTimeout(() => t.classList.remove('show'), 2200);
 }
 
-async function doSwitch(name, e) {
+async function doSwitch(name, displayName, e) {
   if (e) e.stopPropagation();
   document.querySelectorAll('.card').forEach(c => c.classList.add('switching'));
   try {
@@ -1548,7 +1561,17 @@ async function doSwitch(name, e) {
       body: JSON.stringify({ name })
     });
     const data = await resp.json();
-    if (data.ok) { showToast('Switched to ' + name); setTimeout(refresh, 300); }
+    if (data.ok) {
+      const toastName = data.label || displayName || name;
+      let msg = 'Switched to ' + toastName;
+      if (data.strategyChanged) msg += ' (strategy set to Sticky)';
+      showToast(msg);
+      if (data.strategyChanged) {
+        document.getElementById('sel-strategy').value = data.strategy;
+        updateStrategyUI(data.strategy);
+      }
+      setTimeout(refresh, 300);
+    }
     else showToast('Error: ' + data.error);
   } catch(e) { showToast('Failed to switch'); }
   document.querySelectorAll('.card').forEach(c => c.classList.remove('switching'));
@@ -1578,44 +1601,40 @@ function renderProbeStats(ps) {
 
 /**
  * Render a time-axis sparkline with real clock-time labels.
- * X-axis is anchored to the actual rate-limit window: [resetAt - windowMs, resetAt].
- * Falls back to [now - windowMs, now] if resetAt is unavailable.
- * A dashed "now" marker is drawn when now falls inside a future-ending window.
+ * X-axis is a simple sliding window: [now - windowMs, now].
  *
  * @param {Array} hist - history entries with { ts, u5h, u7d }
  * @param {string} key - 'u5h' or 'u7d'
- * @param {number} windowMs - fixed x-axis span in ms (5h or 7d)
+ * @param {number} windowMs - fixed x-axis span in ms (24h or 7d)
  * @param {string} mode - 'hours' or 'days'  - controls label generation
- * @param {number} [resetAtSec] - window reset time (unix seconds)
  */
-function renderSparkline(hist, key, windowMs, mode, resetAtSec) {
+function renderSparkline(hist, key, windowMs, mode) {
   const W = 320, H = 44, padL = 1, padR = 1, padT = 1, padB = 12;
   const chartW = W - padL - padR;
   const chartH = H - padT - padB;
   const now = Date.now();
 
-  // Anchor window to the actual rate-limit window boundaries.
-  // resetAt defines the right edge; left edge = resetAt - windowMs.
-  // Fall back to [now - windowMs, now] if resetAt is unavailable or stale.
-  let windowEnd = now;
-  if (resetAtSec && resetAtSec * 1000 > now - windowMs) {
-    windowEnd = resetAtSec * 1000;
-  }
+  const windowEnd = now;
   const windowStart = windowEnd - windowMs;
 
   // Generate real-time labels
   let svg = '';
   if (mode === 'hours') {
-    // Hourly grid: find the first whole hour >= windowStart, then every hour
+    // Hourly grid: show labels every 6 hours, minor gridlines every 3 hours
+    const stepMs = 3 * 3600000; // 3-hour gridline step
     const firstHour = new Date(windowStart);
     firstHour.setMinutes(0, 0, 0);
-    if (firstHour.getTime() < windowStart) firstHour.setTime(firstHour.getTime() + 3600000);
-    for (let t = firstHour.getTime(); t <= windowEnd; t += 3600000) {
+    firstHour.setHours(Math.ceil(firstHour.getHours() / 3) * 3);
+    if (firstHour.getTime() < windowStart) firstHour.setTime(firstHour.getTime() + stepMs);
+    for (let t = firstHour.getTime(); t <= windowEnd; t += stepMs) {
       const x = padL + ((t - windowStart) / windowMs) * chartW;
       const d = new Date(t);
-      const label = d.getHours() + ':00';
+      const h = d.getHours();
       svg += '<line x1="' + x.toFixed(1) + '" y1="' + padT + '" x2="' + x.toFixed(1) + '" y2="' + (padT + chartH) + '" stroke="var(--border)" stroke-width="0.5" />';
-      svg += '<text x="' + x.toFixed(1) + '" y="' + (H - 1) + '" fill="var(--muted)" font-size="6" text-anchor="middle" font-family="inherit">' + label + '</text>';
+      // Only label every 6 hours to prevent overlap
+      if (h % 6 === 0) {
+        svg += '<text x="' + x.toFixed(1) + '" y="' + (H - 1) + '" fill="var(--muted)" font-size="6" text-anchor="middle" font-family="inherit">' + h + ':00</text>';
+      }
     }
   } else {
     // Daily grid: find the first midnight >= windowStart, then every day
@@ -1630,12 +1649,6 @@ function renderSparkline(hist, key, windowMs, mode, resetAtSec) {
       svg += '<line x1="' + x.toFixed(1) + '" y1="' + padT + '" x2="' + x.toFixed(1) + '" y2="' + (padT + chartH) + '" stroke="var(--border)" stroke-width="0.5" />';
       svg += '<text x="' + x.toFixed(1) + '" y="' + (H - 1) + '" fill="var(--muted)" font-size="6" text-anchor="middle" font-family="inherit">' + label + '</text>';
     }
-  }
-
-  // "Now" marker  - dashed vertical line at current time (if within the window)
-  if (now > windowStart && now < windowEnd) {
-    const xNow = padL + ((now - windowStart) / windowMs) * chartW;
-    svg += '<line x1="' + xNow.toFixed(1) + '" y1="' + padT + '" x2="' + xNow.toFixed(1) + '" y2="' + (padT + chartH) + '" stroke="var(--muted)" stroke-width="0.7" stroke-dasharray="2,2" />';
   }
 
   // Data polyline  - position by real timestamp on the window axis
@@ -1690,16 +1703,17 @@ function quickHash(obj) {
 async function refresh() {
   try {
     const resp = await fetch('/api/profiles');
-    const { profiles, stats, probeStats, allExhausted, earliestReset } = await resp.json();
+    const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy } = await resp.json();
     const ph = quickHash(profiles);
-    // Always re-render when stale data exists so the "Xm ago" label stays current
-    const hasStale = profiles.some(p => p.rateLimits && p.rateLimits.fetchedAt && !p.dormant &&
-      Date.now() - p.rateLimits.fetchedAt > STALE_THRESHOLD);
-    if (ph !== _lastProfilesHash || hasStale) {
+    if (ph !== _lastProfilesHash) {
       _lastProfilesHash = ph;
       renderAccounts(profiles, _firstRender);
     }
     document.getElementById('account-count').textContent = profiles.length;
+    if (rotationStrategy) {
+      const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first' };
+      document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy);
+    }
     if (probeStats) renderProbeStats(probeStats);
     // Exhausted banner
     const banner = document.getElementById('exhausted-banner');
@@ -1729,8 +1743,6 @@ async function refresh() {
   _firstRender = false;
 }
 
-const STALE_THRESHOLD = 10 * 60 * 1000; // 10 min
-
 function renderAccounts(profiles, animate) {
   const el = document.getElementById('accounts');
   if (!profiles.length) {
@@ -1743,38 +1755,27 @@ function renderAccounts(profiles, animate) {
     const eName = p.name.replace(/'/g, "\\\\'");
     const tok = tokenStatus(p.expiresAt);
 
-    // Staleness detection  - purely visual, no persisted state modified
-    // Dormant accounts (0% on both windows) are excluded  - 0% doesn't go stale
-    const isStale = !p.dormant && p.rateLimits && p.rateLimits.fetchedAt &&
-      (Date.now() - p.rateLimits.fetchedAt > STALE_THRESHOLD);
-    let staleLabel = '';
-    if (isStale) {
-      const agoMin = Math.round((Date.now() - p.rateLimits.fetchedAt) / 60000);
-      const agoText = agoMin >= 60 ? Math.round(agoMin / 60) + 'h' : agoMin + 'm';
-      staleLabel = '<span style="font-size:0.75rem;color:var(--muted);margin-left:0.25rem">(stale \\u00b7 ' + agoText + ' ago)</span>';
-    }
-
     let barsHtml = '';
     if (p.rateLimits) {
       const rl = p.rateLimits;
       const f = Math.round(rl.fiveH.utilization * 100);
       const s = Math.round(rl.sevenD.utilization * 100);
 
-      // 5hr sparkline  - anchored to actual rate-limit window
+      // 5hr sparkline  - 24h sliding window
       const hist5h = p.utilizationHistory || [];
       const spark5h = '<div class="sparkline-wrap">' +
-        renderSparkline(hist5h, 'u5h', 5*60*60*1000, 'hours', rl.fiveH.reset) +
+        renderSparkline(hist5h, 'u5h', 24*60*60*1000, 'hours') +
         '</div>';
 
-      // Weekly sparkline  - anchored to actual rate-limit window
+      // Weekly sparkline  - 7d sliding window
       const hist7d = p.weeklyHistory || [];
       const spark7d = '<div class="sparkline-wrap">' +
-        renderSparkline(hist7d, 'u7d', 7*24*60*60*1000, 'days', rl.sevenD.reset) +
+        renderSparkline(hist7d, 'u7d', 7*24*60*60*1000, 'days') +
         '</div>';
 
       barsHtml = '<div class="rate-bars">' +
         '<div class="rate-group">' +
-          '<div class="rate-head"><span class="rate-label">5h window' + staleLabel + '</span><span class="rate-pct ' + pctClass(f) + '">' + f + '%</span></div>' +
+          '<div class="rate-head"><span class="rate-label">5h window</span><span class="rate-pct ' + pctClass(f) + '">' + f + '%</span></div>' +
           '<div class="rate-track"><div class="rate-fill ' + fillClass(rl.fiveH.utilization) + '" style="width:' + Math.min(f,100) + '%"></div></div>' +
           '<div class="rate-reset" data-reset="' + rl.fiveH.reset + '">' + formatTimeLeft(rl.fiveH.reset) + '</div>' +
           spark5h +
@@ -1792,9 +1793,8 @@ function renderAccounts(profiles, animate) {
       barsHtml = '<div style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem">Rate limits unavailable</div>';
     }
 
-    const staleClass = isStale ? ' stale' : '';
     const animStyle = animate ? ' style="animation-delay:' + (i*0.05) + 's"' : ' style="animation:none"';
-    return '<div class="card' + (active ? ' active' : '') + staleClass + '"' + animStyle + '>' +
+    return '<div class="card' + (active ? ' active' : '') + '"' + animStyle + '>' +
       '<div class="card-top">' +
         '<div class="card-identity">' +
           '<div class="status-dot ' + (active ? 'active' : 'inactive') + '"></div>' +
@@ -1807,7 +1807,7 @@ function renderAccounts(profiles, animate) {
         '</div>' +
       '</div>' +
       barsHtml +
-      (active ? '' : '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center"><button class="remove-btn" onclick="doRemove(\\''+eName+'\\',event)">Remove</button><button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',event)">Switch to this account</button></div>') +
+      (active ? '' : '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center"><button class="remove-btn" onclick="doRemove(\\''+eName+'\\',event)">Remove</button><button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayName.replace(/'/g, "\\\\'")+'\\''+',event)">Switch to this account</button></div>') +
     '</div>';
   }).join('');
 }
