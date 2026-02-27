@@ -767,19 +767,24 @@ cmd_upgrade() {
     fi
   done
 
-  # Check if dashboard is running so we can restart it
+  # Check if dashboard is running (PID file or listening on port)
   local dashboard_was_running=false
-  if [[ -f "$DASHBOARD_PID_FILE" ]]; then
-    local pid=$(cat "$DASHBOARD_PID_FILE")
-    if kill -0 "$pid" 2>/dev/null; then
-      dashboard_was_running=true
-    fi
+  if [[ -f "$DASHBOARD_PID_FILE" ]] && kill -0 "$(cat "$DASHBOARD_PID_FILE")" 2>/dev/null; then
+    dashboard_was_running=true
+  elif lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t >/dev/null 2>&1; then
+    dashboard_was_running=true
   fi
 
   # Stop dashboard before overwriting files
   if [[ "$dashboard_was_running" == "true" ]]; then
     echo -e "  ${DIM}Stopping dashboard…${NC}"
     cmd_dashboard stop
+    # Also kill any process on the port not tracked by PID file (e.g. shell auto-start)
+    local port_pid
+    port_pid=$(lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) || true
+    if [[ -n "$port_pid" ]]; then
+      kill "$port_pid" 2>/dev/null || true
+    fi
   fi
 
   # Overwrite only code files — never touch accounts/, config.json,
