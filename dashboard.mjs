@@ -1821,7 +1821,7 @@ function renderAccounts(profiles, animate) {
       if (p.refreshFailed && !p.refreshFailed.retriable) {
         staleMsg = '<div class="stale-msg">Token expired \\u2014 run <code>claude login</code> to reactivate</div>';
       } else {
-        staleMsg = '<div class="stale-msg">Token expired \\u2014 refresh pending\\u2026</div>';
+        staleMsg = '<div class="stale-msg">Token expired \\u2014 auto-refresh will retry shortly</div>';
       }
     }
     var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '');

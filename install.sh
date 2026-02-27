@@ -61,9 +61,10 @@ if [[ ! -f "$INSTALL_DIR/config.json" ]]; then
   cp "$SCRIPT_DIR/config.example.json" "$INSTALL_DIR/config.json"
 fi
 
-# Write version marker from git if available
+# Write version marker from git if available (prefer semver tag, fall back to hash)
 if command -v git &>/dev/null && git -C "$SCRIPT_DIR" rev-parse --git-dir &>/dev/null 2>&1; then
-  git -C "$SCRIPT_DIR" rev-parse --short HEAD > "$INSTALL_DIR/.version" 2>/dev/null || true
+  ( git -C "$SCRIPT_DIR" describe --tags --abbrev=0 2>/dev/null \
+    || git -C "$SCRIPT_DIR" rev-parse --short HEAD 2>/dev/null ) > "$INSTALL_DIR/.version" || true
 fi
 
 echo -e "  ${GREEN}✓${NC} Installed to ${CYAN}$INSTALL_DIR${NC}"

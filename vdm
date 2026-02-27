@@ -746,13 +746,14 @@ cmd_upgrade() {
     return 1
   fi
 
-  # Compare versions (use git short hash as version marker)
+  # Compare versions (prefer semver tag, fall back to commit hash)
   local current_hash=""
   if [[ -f "$SCRIPT_DIR/.version" ]]; then
     current_hash=$(cat "$SCRIPT_DIR/.version")
   fi
   local latest_hash
-  latest_hash=$(git -C "$tmpdir" rev-parse --short HEAD 2>/dev/null)
+  latest_hash=$(git -C "$tmpdir" describe --tags --abbrev=0 2>/dev/null \
+    || git -C "$tmpdir" rev-parse --short HEAD 2>/dev/null)
 
   if [[ -n "$current_hash" && "$current_hash" == "$latest_hash" ]]; then
     echo -e "  ${GREEN}✓${NC} Already on the latest version (${DIM}$current_hash${NC})"
