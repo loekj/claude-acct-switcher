@@ -61,6 +61,11 @@ if [[ ! -f "$INSTALL_DIR/config.json" ]]; then
   cp "$SCRIPT_DIR/config.example.json" "$INSTALL_DIR/config.json"
 fi
 
+# Write version marker from git if available
+if command -v git &>/dev/null && git -C "$SCRIPT_DIR" rev-parse --git-dir &>/dev/null 2>&1; then
+  git -C "$SCRIPT_DIR" rev-parse --short HEAD > "$INSTALL_DIR/.version" 2>/dev/null || true
+fi
+
 echo -e "  ${GREEN}✓${NC} Installed to ${CYAN}$INSTALL_DIR${NC}"
 
 # ── Symlink csw to PATH ──
