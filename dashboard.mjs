@@ -554,16 +554,23 @@ async function loadProfiles() {
         rateLimits = await getRateLimitsForToken(oauth.accessToken, fp, { allowProbe });
       }
 
+      // Clear stale refresh failures if token is now valid (e.g. user ran `claude login`)
+      const expiresAt = oauth.expiresAt || 0;
+      if (refreshFailures.has(name) && expiresAt > Date.now()) {
+        refreshFailures.delete(name);
+      }
+
       profiles.push({
         name,
         label: email || name,
         subscriptionType: oauth.subscriptionType || 'unknown',
         rateLimitTier: oauth.rateLimitTier || 'unknown',
-        expiresAt: oauth.expiresAt || 0,
+        expiresAt,
         isActive: fp === activeFp,
         fingerprint: fp,
         rateLimits,
         dormant,
+        refreshFailed: refreshFailures.get(name) || null,
       });
     } catch {
       // skip corrupt files
@@ -992,6 +999,20 @@ function renderHTML() {
   }
   .card:hover { box-shadow: var(--shadow-lg); }
   .card.active { border-color: var(--green); border-width: 2px; }
+  .card.stale { opacity: 0.5; }
+  .card.stale:hover { opacity: 0.7; }
+  .stale-msg {
+    margin-top: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--red);
+    line-height: 1.4;
+  }
+  .stale-msg code {
+    background: var(--bg);
+    padding: 0.1em 0.4em;
+    border-radius: 3px;
+    font-size: 0.85em;
+  }
 
   .card-top {
     display: flex;
@@ -1794,7 +1815,24 @@ function renderAccounts(profiles, animate) {
     }
 
     const animStyle = animate ? ' style="animation-delay:' + (i*0.05) + 's"' : ' style="animation:none"';
-    return '<div class="card' + (active ? ' active' : '') + '"' + animStyle + '>' +
+    const isStale = !active && p.expiresAt && p.expiresAt < Date.now();
+    var staleMsg = '';
+    if (isStale) {
+      if (p.refreshFailed && !p.refreshFailed.retriable) {
+        staleMsg = '<div class="stale-msg">Token expired \\u2014 run <code>claude login</code> to reactivate</div>';
+      } else {
+        staleMsg = '<div class="stale-msg">Token expired \\u2014 refresh pending\\u2026</div>';
+      }
+    }
+    var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '');
+    var buttonsHtml = '';
+    if (!active) {
+      buttonsHtml = '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center">' +
+        '<button class="remove-btn" onclick="doRemove(\\''+eName+'\\',event)">Remove</button>' +
+        (isStale ? '' : '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayName.replace(/'/g, "\\\\'")+'\\''+',event)">Switch to this account</button>') +
+      '</div>';
+    }
+    return '<div class="' + cardClass + '"' + animStyle + '>' +
       '<div class="card-top">' +
         '<div class="card-identity">' +
           '<div class="status-dot ' + (active ? 'active' : 'inactive') + '"></div>' +
@@ -1807,7 +1845,8 @@ function renderAccounts(profiles, animate) {
         '</div>' +
       '</div>' +
       barsHtml +
-      (active ? '' : '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center"><button class="remove-btn" onclick="doRemove(\\''+eName+'\\',event)">Remove</button><button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayName.replace(/'/g, "\\\\'")+'\\''+',event)">Switch to this account</button></div>') +
+      staleMsg +
+      buttonsHtml +
     '</div>';
   }).join('');
 }
@@ -1821,6 +1860,7 @@ const evtColors = {
   'account-discovered': 'var(--green)', 'account-renamed': 'var(--muted)',
   'settings-changed': 'var(--muted)',
   'upgrade': 'var(--green)',
+  'refresh-failed': 'var(--red)', 'token-refreshed': 'var(--green)',
 };
 
 function evtMsg(e) {
@@ -1835,6 +1875,8 @@ function evtMsg(e) {
     case 'account-renamed': return 'Renamed <b>' + (e.name||'?') + '</b> to <b>' + (e.label||'?') + '</b>';
     case 'settings-changed': return 'Settings updated';
     case 'upgrade': return 'Upgraded to <b>v' + (e.to||'?') + '</b>';
+    case 'refresh-failed': return '<b>' + (e.account||'?') + '</b> refresh failed: ' + (e.error||'unknown');
+    case 'token-refreshed': return '<b>' + (e.account||'?') + '</b> token refreshed';
     default: return e.type;
   }
 }
@@ -2321,6 +2363,8 @@ const REFRESH_MAX_RETRIES = 3;
 const REFRESH_BACKOFF_BASE = 1000; // 1s, 2s, 4s
 
 const refreshLock = createPerAccountLock();
+// Track refresh failures per account: name → { error, retriable, ts }
+const refreshFailures = new Map();
 
 /**
  * Atomic file write: write to .tmp, chmod 600, rename over original.
@@ -2471,6 +2515,8 @@ async function refreshAccountToken(accountName) {
 
     if (!result.ok) {
       log('refresh', `${accountName}: refresh failed after retries: ${result.error}`);
+      refreshFailures.set(accountName, { error: result.error, retriable: !!result.retriable, ts: Date.now() });
+      logActivity('refresh-failed', { account: accountName, error: result.error, retriable: !!result.retriable });
       return { ok: false, error: result.error };
     }
 
@@ -2509,6 +2555,7 @@ async function refreshAccountToken(accountName) {
 
     // 8. Invalidate caches
     invalidateAccountsCache();
+    refreshFailures.delete(accountName);
     logActivity('token-refreshed', { account: accountName });
 
     return { ok: true, accessToken: result.accessToken, expiresAt: newExpiresAt };
@@ -2521,11 +2568,18 @@ setInterval(async () => {
   const accounts = loadAllAccountTokens();
   for (const acct of accounts) {
     if (shouldRefreshToken(acct.expiresAt, REFRESH_BUFFER_MS)) {
+      const prior = refreshFailures.get(acct.name);
+      if (prior && !prior.retriable) {
+        // Non-retriable failure (e.g. 400/401) — skip until user re-authenticates
+        continue;
+      }
       log('refresh-bg', `${acct.label || acct.name}: token near expiry, refreshing...`);
       try {
         await refreshAccountToken(acct.name);
       } catch (e) {
         log('refresh-bg', `${acct.label || acct.name}: background refresh error: ${e.message}`);
+        refreshFailures.set(acct.name, { error: e.message, retriable: true, ts: Date.now() });
+        logActivity('refresh-failed', { account: acct.name, error: e.message, retriable: true });
       }
     }
   }
