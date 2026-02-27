@@ -1820,6 +1820,7 @@ const evtColors = {
   'auth-expired': 'var(--red)', 'all-exhausted': 'var(--red)',
   'account-discovered': 'var(--green)', 'account-renamed': 'var(--muted)',
   'settings-changed': 'var(--muted)',
+  'upgrade': 'var(--green)',
 };
 
 function evtMsg(e) {
@@ -1833,6 +1834,7 @@ function evtMsg(e) {
     case 'account-discovered': return 'Discovered <b>' + (e.label||e.name||'?') + '</b>';
     case 'account-renamed': return 'Renamed <b>' + (e.name||'?') + '</b> to <b>' + (e.label||'?') + '</b>';
     case 'settings-changed': return 'Settings updated';
+    case 'upgrade': return 'Upgraded to <b>v' + (e.to||'?') + '</b>';
     default: return e.type;
   }
 }
