@@ -9,6 +9,7 @@ import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
+import { Transform } from 'node:stream';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -18,6 +19,7 @@ const ACCOUNTS_DIR = join(__dirname, 'accounts');
 const STATS_CACHE = join(process.env.HOME, '.claude', 'stats-cache.json');
 const CONFIG_FILE = join(__dirname, 'config.json');
 const STATE_FILE = join(__dirname, 'account-state.json');
+const TOKEN_USAGE_FILE = join(__dirname, 'token-usage.json');
 const KEYCHAIN_ACCOUNT = process.env.USER || execSync('whoami').toString().trim();
 
 // Detect installed Claude Code version for User-Agent mimicry
@@ -74,6 +76,8 @@ const DEFAULT_SETTINGS = {
   rotationStrategy: 'conserve',
   rotationIntervalMin: 60,
   notifications: true,
+  serializeRequests: false,
+  serializeDelayMs: 200,
 };
 
 function loadSettings() {
@@ -614,7 +618,7 @@ async function handleAPI(req, res) {
     const allExhausted = allAccounts.length > 0 &&
       allAccounts.every(a => !isAccountAvailable(a.token, a.expiresAt));
     const earliestReset = allExhausted ? getEarliestReset() : null;
-    json(res, { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy: settings.rotationStrategy });
+    json(res, { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy: settings.rotationStrategy, queueStats: getQueueStats() });
     return true;
   }
 
@@ -727,12 +731,107 @@ async function handleAPI(req, res) {
       settings.rotationIntervalMin = patch.rotationIntervalMin;
       lastRotationTime = Date.now(); // reset timer on interval change
     }
+    if (typeof patch.serializeRequests === 'boolean') {
+      settings.serializeRequests = patch.serializeRequests;
+      // If turning off, drain queued requests immediately
+      if (!patch.serializeRequests) drainSerializationQueue();
+    }
+    if (typeof patch.serializeDelayMs === 'number' && patch.serializeDelayMs >= 0 && patch.serializeDelayMs <= 2000) {
+      settings.serializeDelayMs = patch.serializeDelayMs;
+    }
     saveSettings(settings);
     logActivity('settings-changed', {
       autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
       rotationStrategy: settings.rotationStrategy, rotationIntervalMin: settings.rotationIntervalMin,
     });
     json(res, settings);
+    return true;
+  }
+
+  // ── [BETA] Session tracking for token usage ──
+
+  if (url.pathname === '/api/session-start' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const data = JSON.parse(body);
+      const sessionId = data.session_id;
+      const cwd = data.cwd;
+      if (!sessionId || !cwd) {
+        json(res, { ok: false, error: 'session_id and cwd required' }, 400);
+        return true;
+      }
+      // Resolve git context from cwd
+      let repo = cwd, branch = '(no git)', commitHash = '';
+      try {
+        repo = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+        branch = execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+        commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+      } catch { /* not a git repo */ }
+      pendingSessions.set(sessionId, { repo, branch, commitHash, startedAt: Date.now() });
+      // Prune stale sessions (>30 min)
+      const staleThreshold = Date.now() - 30 * 60 * 1000;
+      for (const [id, s] of pendingSessions) {
+        if (s.startedAt < staleThreshold) pendingSessions.delete(id);
+      }
+      json(res, { ok: true });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  if (url.pathname === '/api/session-stop' && req.method === 'POST') {
+    try {
+      const body = await readBody(req);
+      const data = JSON.parse(body);
+      const sessionId = data.session_id;
+      if (!sessionId) {
+        json(res, { ok: false, error: 'session_id required' }, 400);
+        return true;
+      }
+      const session = pendingSessions.get(sessionId);
+      if (!session) {
+        json(res, { ok: true, claimed: 0 });
+        return true;
+      }
+      const stopAt = Date.now();
+      const claimed = claimUsageInRange(session.startedAt, stopAt);
+      for (const entry of claimed) {
+        appendTokenUsage({
+          ts: entry.ts,
+          repo: session.repo,
+          branch: session.branch,
+          commitHash: session.commitHash,
+          model: entry.model,
+          inputTokens: entry.inputTokens,
+          outputTokens: entry.outputTokens,
+          account: entry.account,
+        });
+      }
+      pendingSessions.delete(sessionId);
+      json(res, { ok: true, claimed: claimed.length });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
+  if (url.pathname === '/api/token-usage' && req.method === 'GET') {
+    try {
+      const usage = loadTokenUsage();
+      let filtered = usage;
+      const repo = url.searchParams.get('repo');
+      const branch = url.searchParams.get('branch');
+      const since = url.searchParams.get('since');
+      const limit = parseInt(url.searchParams.get('limit') || '0', 10);
+      if (repo) filtered = filtered.filter(e => e.repo === repo);
+      if (branch) filtered = filtered.filter(e => e.branch === branch);
+      if (since) filtered = filtered.filter(e => e.ts >= Number(since));
+      if (limit > 0) filtered = filtered.slice(-limit);
+      json(res, filtered);
+    } catch (e) {
+      json(res, [], 500);
+    }
     return true;
   }
 
@@ -1384,6 +1483,109 @@ function renderHTML() {
     to { opacity: 1; transform: translateY(0); }
   }
   .card { animation: fadeInUp 0.3s ease-out; }
+
+  /* ── Tokens tab ── */
+  .tok-filters {
+    display: flex;
+    gap: 0.5rem;
+    margin-bottom: 1.25rem;
+    flex-wrap: wrap;
+  }
+  .tok-filters .config-select {
+    flex: 1;
+    min-width: 100px;
+  }
+  .tok-proportion {
+    display: flex;
+    height: 8px;
+    border-radius: 4px;
+    overflow: hidden;
+    margin-bottom: 1rem;
+  }
+  .tok-proportion-seg {
+    height: 100%;
+    transition: width 0.3s;
+  }
+  .tok-model-row {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.5rem 0;
+    font-size: 0.875rem;
+    flex-wrap: wrap;
+  }
+  .tok-model-row + .tok-model-row {
+    border-top: 1px solid var(--bg);
+  }
+  .tok-model-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 2px;
+    flex-shrink: 0;
+  }
+  .tok-model-name {
+    font-weight: 500;
+    min-width: 120px;
+  }
+  .tok-model-detail {
+    color: var(--muted);
+    font-size: 0.8125rem;
+    flex: 1;
+  }
+  .tok-model-total {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .tok-model-pct {
+    color: var(--muted);
+    font-size: 0.8125rem;
+    font-variant-numeric: tabular-nums;
+    min-width: 3rem;
+    text-align: right;
+  }
+  .tok-branch-row {
+    padding: 0.75rem 0;
+    font-size: 0.875rem;
+  }
+  .tok-branch-row + .tok-branch-row {
+    border-top: 1px solid var(--bg);
+  }
+  .tok-branch-name {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-weight: 500;
+  }
+  .tok-branch-badge {
+    font-size: 0.6875rem;
+    font-weight: 500;
+    color: var(--cyan);
+    background: var(--cyan-soft);
+    border: 1px solid var(--cyan-border);
+    border-radius: 4px;
+    padding: 0.0625rem 0.375rem;
+  }
+  .tok-branch-stats {
+    display: flex;
+    align-items: center;
+    gap: 1rem;
+    margin-top: 0.25rem;
+  }
+  .tok-branch-total {
+    font-weight: 600;
+    font-variant-numeric: tabular-nums;
+  }
+  .tok-branch-pct {
+    color: var(--muted);
+    font-size: 0.8125rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .tok-branch-detail {
+    font-size: 0.75rem;
+    color: var(--muted);
+    margin-top: 0.25rem;
+    line-height: 1.6;
+  }
 </style>
 </head>
 <body>
@@ -1405,6 +1607,7 @@ function renderHTML() {
     <button class="tab" onclick="switchTab('activity')">Activity</button>
     <button class="tab" onclick="switchTab('usage')">Usage</button>
     <button class="tab" onclick="switchTab('config')">Config</button>
+    <button class="tab" onclick="switchTab('tokens')">Tokens <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.25rem;vertical-align:middle">BETA</span></button>
   </div>
 
   <div id="tab-accounts" class="tab-content active">
@@ -1493,6 +1696,61 @@ function renderHTML() {
           <input type="checkbox" class="sw" id="toggle-notifs" checked onchange="toggleSetting('notifications', this.checked)">
         </div>
       </div>
+
+      <div class="config-section">
+        <div class="config-section-title">Request Serialization <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Serialize requests</div>
+            <div class="config-desc">Queue concurrent API requests to avoid 429 collisions from multiple sessions</div>
+          </div>
+          <input type="checkbox" class="sw" id="toggle-serialize" onchange="toggleSetting('serializeRequests', this.checked)">
+        </div>
+        <div class="config-row" id="serialize-delay-ctrl" style="display:none">
+          <div class="config-info">
+            <div class="config-label">Delay between requests</div>
+            <div class="config-desc">Milliseconds to wait between dispatching queued requests</div>
+          </div>
+          <select class="config-select" id="sel-serialize-delay" onchange="changeSerializeDelay(Number(this.value))">
+            <option value="0">0 ms</option>
+            <option value="100">100 ms</option>
+            <option value="200">200 ms</option>
+            <option value="500">500 ms</option>
+            <option value="1000">1000 ms</option>
+          </select>
+        </div>
+        <div id="queue-stats" style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem;display:none"></div>
+      </div>
+    </div>
+  </div>
+
+  <div id="tab-tokens" class="tab-content">
+    <div class="tok-filters">
+      <select class="config-select" id="tok-repo" onchange="tokFilterChange('repo')"><option value="">All repos</option></select>
+      <select class="config-select" id="tok-branch" onchange="tokFilterChange('branch')"><option value="">All branches</option></select>
+      <select class="config-select" id="tok-model" onchange="tokFilterChange('model')"><option value="">All models</option></select>
+      <select class="config-select" id="tok-time" onchange="tokFilterChange('time')">
+        <option value="1">1 day</option>
+        <option value="7" selected>7 days</option>
+        <option value="30">30 days</option>
+        <option value="90">90 days</option>
+      </select>
+    </div>
+    <div id="tok-empty" class="empty-state" style="display:none">No token usage data yet.<br>Install the hooks with <code>vdm upgrade</code> to start tracking.</div>
+    <div id="tok-content" style="display:none">
+      <div id="tok-stats" class="stat-grid" style="margin-bottom:1.25rem"></div>
+      <div class="usage-card" style="margin-bottom:1rem">
+        <div class="usage-title">Daily Usage</div>
+        <div id="tok-chart"></div>
+      </div>
+      <div class="usage-card" style="margin-bottom:1rem">
+        <div class="usage-title">Model Breakdown</div>
+        <div id="tok-models"></div>
+      </div>
+      <div class="usage-card">
+        <div class="usage-title">Repository &amp; Branch</div>
+        <div id="tok-repos"></div>
+      </div>
     </div>
   </div>
 </div>
@@ -1505,6 +1763,7 @@ function switchTab(id) {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.getElementById('tab-' + id).classList.add('active');
   document.querySelector('.tab[onclick*="' + id + '"]').classList.add('active');
+  if (id === 'tokens') refreshTokens();
 }
 
 function formatNum(n) {
@@ -1747,7 +2006,7 @@ function quickHash(obj) {
 async function refresh() {
   try {
     const resp = await fetch('/api/profiles');
-    const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy } = await resp.json();
+    const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy, queueStats } = await resp.json();
     const ph = quickHash(profiles);
     if (ph !== _lastProfilesHash) {
       _lastProfilesHash = ph;
@@ -1759,6 +2018,16 @@ async function refresh() {
       document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy);
     }
     if (probeStats) renderProbeStats(probeStats);
+    // [BETA] Queue stats
+    if (queueStats) {
+      var qEl = document.getElementById('queue-stats');
+      if (queueStats.inflight > 0 || queueStats.queued > 0) {
+        qEl.style.display = '';
+        qEl.textContent = 'Queue: ' + queueStats.inflight + ' inflight, ' + queueStats.queued + ' queued';
+      } else {
+        qEl.style.display = 'none';
+      }
+    }
     // Exhausted banner
     const banner = document.getElementById('exhausted-banner');
     if (allExhausted) {
@@ -1785,6 +2054,7 @@ async function refresh() {
     }
   } catch {}
   _firstRender = false;
+  refreshTokens();
 }
 
 function renderAccounts(profiles, animate) {
@@ -1990,6 +2260,10 @@ async function loadSettingsUI() {
     document.getElementById('sel-strategy').value = s.rotationStrategy || 'conserve';
     document.getElementById('sel-interval').value = s.rotationIntervalMin || 60;
     updateStrategyUI(s.rotationStrategy || 'conserve');
+    // [BETA] Serialization
+    document.getElementById('toggle-serialize').checked = !!s.serializeRequests;
+    document.getElementById('sel-serialize-delay').value = s.serializeDelayMs || 200;
+    document.getElementById('serialize-delay-ctrl').style.display = s.serializeRequests ? '' : 'none';
   } catch {}
 }
 
@@ -2024,8 +2298,24 @@ async function toggleSetting(key, value) {
       proxyEnabled: value ? 'Proxy enabled' : 'Proxy disabled  - passthrough mode',
       autoSwitch: value ? 'Auto-switch enabled' : 'Auto-switch disabled',
       notifications: value ? 'Notifications enabled' : 'Notifications disabled',
+      serializeRequests: value ? 'Request serialization enabled' : 'Request serialization disabled',
     };
     showToast(msgs[key] || (key + ' = ' + value));
+    // Show/hide serialize delay control
+    if (key === 'serializeRequests') {
+      document.getElementById('serialize-delay-ctrl').style.display = value ? '' : 'none';
+    }
+  } catch { showToast('Failed to update'); }
+}
+
+async function changeSerializeDelay(value) {
+  try {
+    await fetch('/api/settings', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ serializeDelayMs: value })
+    });
+    showToast('Serialize delay: ' + value + ' ms');
   } catch { showToast('Failed to update'); }
 }
 
@@ -2050,6 +2340,300 @@ async function changeInterval(value) {
     });
     showToast('Rotation interval: ' + (value >= 60 ? (value/60) + ' hr' : value + ' min'));
   } catch { showToast('Failed to update'); }
+}
+
+// ── Tokens tab ──
+
+var TOK_COLORS = ['var(--primary)', 'var(--purple)', 'var(--cyan)', 'var(--green)', 'var(--yellow)', 'var(--red)'];
+var TOK_MAX_CHART_COLS = 30;
+
+function escHtml(s) {
+  if (!s) return '';
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
+}
+
+function shortModel(m) {
+  if (!m) return 'unknown';
+  var s = m.replace(/^claude-/, '').replace(/-\\d{8}$/, '');
+  var match = s.match(/^([a-z]+(?:-[a-z]+)*)-(\\d+(?:-\\d+)*)$/);
+  if (match) return match[1] + ' ' + match[2].replace(/-/g, '.');
+  return s;
+}
+
+function getModelColor(model, sortedModels) {
+  var idx = sortedModels.indexOf(model);
+  if (idx < 0) idx = 0;
+  return TOK_COLORS[idx % TOK_COLORS.length];
+}
+
+var _lastTokensHash = '';
+var _tokensRawData = [];
+var _tokFetching = false;
+var _tokNeedsRefresh = false;
+
+function tokTimeRange() {
+  var sel = document.getElementById('tok-time');
+  return sel ? parseInt(sel.value, 10) || 7 : 7;
+}
+
+async function refreshTokens() {
+  var tab = document.getElementById('tab-tokens');
+  if (!tab || !tab.classList.contains('active')) return;
+  if (_tokFetching) { _tokNeedsRefresh = true; return; }
+  _tokFetching = true;
+  _tokNeedsRefresh = false;
+  try {
+    var days = tokTimeRange();
+    var since = Date.now() - days * 24 * 60 * 60 * 1000;
+    var url = '/api/token-usage?since=' + since;
+    var repoSel = document.getElementById('tok-repo');
+    var branchSel = document.getElementById('tok-branch');
+    if (repoSel && repoSel.value) url += '&repo=' + encodeURIComponent(repoSel.value);
+    if (branchSel && branchSel.value) url += '&branch=' + encodeURIComponent(branchSel.value);
+    var resp = await fetch(url);
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    var data = await resp.json();
+    if (!Array.isArray(data)) data = [];
+    var hash = quickHash(data);
+    if (hash === _lastTokensHash) return;
+    _lastTokensHash = hash;
+    _tokensRawData = data;
+    applyTokenModelFilter();
+  } catch (e) {
+    console.error('Token fetch:', e);
+    // Show empty state on error if no cached data
+    if (!_tokensRawData.length) {
+      var content = document.getElementById('tok-content');
+      var empty = document.getElementById('tok-empty');
+      if (content) content.style.display = 'none';
+      if (empty) empty.style.display = '';
+    }
+  } finally {
+    _tokFetching = false;
+    if (_tokNeedsRefresh) refreshTokens();
+  }
+}
+
+function applyTokenModelFilter() {
+  var data = _tokensRawData;
+  var modelSel = document.getElementById('tok-model');
+  if (modelSel && modelSel.value) {
+    data = data.filter(function(e) { return e.model === modelSel.value; });
+  }
+  populateTokenFilters(_tokensRawData);
+  renderTokenStats(data);
+  renderTokenChart(data);
+  renderModelBreakdown(data);
+  renderRepoBranchBreakdown(data);
+}
+
+function populateTokenFilters(data) {
+  var repoSel = document.getElementById('tok-repo');
+  var branchSel = document.getElementById('tok-branch');
+  var modelSel = document.getElementById('tok-model');
+  if (!repoSel || !branchSel || !modelSel) return;
+  var prevRepo = repoSel.value;
+  var prevBranch = branchSel.value;
+  var prevModel = modelSel.value;
+  var repoSet = {}, modelSet = {};
+  for (var i = 0; i < data.length; i++) {
+    if (data[i].repo) repoSet[data[i].repo] = 1;
+    if (data[i].model) modelSet[data[i].model] = 1;
+  }
+  var repos = Object.keys(repoSet).sort();
+  repoSel.innerHTML = '<option value="">All repos</option>' +
+    repos.map(function(r) {
+      return '<option value="' + escHtml(r) + '"' + (r === prevRepo ? ' selected' : '') + '>' + escHtml(r.split('/').pop()) + '</option>';
+    }).join('');
+  var branchData = prevRepo ? data.filter(function(e) { return e.repo === prevRepo; }) : data;
+  var filteredBranches = {};
+  for (var j = 0; j < branchData.length; j++) {
+    if (branchData[j].branch) filteredBranches[branchData[j].branch] = 1;
+  }
+  var branches = Object.keys(filteredBranches).sort();
+  branchSel.innerHTML = '<option value="">All branches</option>' +
+    branches.map(function(b) {
+      return '<option value="' + escHtml(b) + '"' + (b === prevBranch ? ' selected' : '') + '>' + escHtml(b) + '</option>';
+    }).join('');
+  var models = Object.keys(modelSet).sort();
+  modelSel.innerHTML = '<option value="">All models</option>' +
+    models.map(function(m) {
+      return '<option value="' + escHtml(m) + '"' + (m === prevModel ? ' selected' : '') + '>' + escHtml(shortModel(m)) + '</option>';
+    }).join('');
+}
+
+function renderTokenStats(data) {
+  var content = document.getElementById('tok-content');
+  var empty = document.getElementById('tok-empty');
+  if (!content || !empty) return;
+  if (!data.length) {
+    content.style.display = 'none';
+    empty.style.display = '';
+    return;
+  }
+  content.style.display = '';
+  empty.style.display = 'none';
+  var totalIn = 0, totalOut = 0, requests = 0;
+  for (var i = 0; i < data.length; i++) {
+    totalIn += data[i].inputTokens || 0;
+    totalOut += data[i].outputTokens || 0;
+    requests++;
+  }
+  var statsEl = document.getElementById('tok-stats');
+  if (statsEl) statsEl.innerHTML = [
+    { v: formatNum(totalIn + totalOut), l: 'Total Tokens' },
+    { v: formatNum(totalIn), l: 'Input' },
+    { v: formatNum(totalOut), l: 'Output' },
+    { v: formatNum(requests), l: 'Requests' },
+  ].map(function(s) { return '<div class="stat-item"><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div></div>'; }).join('');
+}
+
+function tokDateKey(ts) {
+  if (!ts || isNaN(ts)) return null;
+  var d = new Date(ts);
+  if (isNaN(d.getTime())) return null;
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
+}
+
+function renderTokenChart(data) {
+  var el = document.getElementById('tok-chart');
+  if (!el) return;
+  if (!data.length) { el.innerHTML = ''; return; }
+  var dayMap = {};
+  var allModels = {};
+  for (var i = 0; i < data.length; i++) {
+    var key = tokDateKey(data[i].ts);
+    if (!key) continue;
+    if (!dayMap[key]) dayMap[key] = {};
+    var model = data[i].model || 'unknown';
+    allModels[model] = 1;
+    dayMap[key][model] = (dayMap[key][model] || 0) + (data[i].inputTokens || 0) + (data[i].outputTokens || 0);
+  }
+  var sortedModels = Object.keys(allModels).sort();
+  var days = Object.keys(dayMap).sort();
+  // Cap chart columns: show last N days to avoid cramped display
+  if (days.length > TOK_MAX_CHART_COLS) days = days.slice(days.length - TOK_MAX_CHART_COLS);
+  if (!days.length) { el.innerHTML = ''; return; }
+  var maxTotal = 1;
+  for (var di = 0; di < days.length; di++) {
+    var dayTotal = 0;
+    for (var mi = 0; mi < sortedModels.length; mi++) dayTotal += dayMap[days[di]][sortedModels[mi]] || 0;
+    if (dayTotal > maxTotal) maxTotal = dayTotal;
+  }
+  var H = 125;
+  var legend = '<div class="chart-legend">';
+  for (var li = 0; li < sortedModels.length; li++) {
+    legend += '<div class="chart-legend-item"><span class="chart-legend-dot" style="background:' + getModelColor(sortedModels[li], sortedModels) + '"></span> ' + escHtml(shortModel(sortedModels[li])) + '</div>';
+  }
+  legend += '</div>';
+  var bars = '<div class="chart-container">';
+  for (var bi = 0; bi < days.length; bi++) {
+    var lbl = formatChartDate(days[bi]);
+    bars += '<div class="chart-day"><div class="chart-bars" style="flex-direction:column-reverse;align-items:stretch;gap:1px">';
+    for (var si = 0; si < sortedModels.length; si++) {
+      var val = dayMap[days[bi]][sortedModels[si]] || 0;
+      if (val === 0) continue;
+      var h = Math.max(2, (val / maxTotal) * H);
+      var color = getModelColor(sortedModels[si], sortedModels);
+      bars += '<div class="chart-bar" style="height:'+h+'px;background:'+color+';max-width:none;border-radius:2px" data-tooltip="'+escHtml(lbl+': '+shortModel(sortedModels[si]))+' \\u2014 '+formatNum(val)+' tokens"></div>';
+    }
+    bars += '</div><div class="chart-label">'+escHtml(lbl)+'</div></div>';
+  }
+  bars += '</div>';
+  el.innerHTML = legend + bars;
+}
+
+function renderModelBreakdown(data) {
+  var el = document.getElementById('tok-models');
+  if (!el) return;
+  if (!data.length) { el.innerHTML = ''; return; }
+  var modelMap = {};
+  for (var i = 0; i < data.length; i++) {
+    var m = data[i].model || 'unknown';
+    if (!modelMap[m]) modelMap[m] = { input: 0, output: 0, total: 0 };
+    modelMap[m].input += data[i].inputTokens || 0;
+    modelMap[m].output += data[i].outputTokens || 0;
+    modelMap[m].total += (data[i].inputTokens || 0) + (data[i].outputTokens || 0);
+  }
+  var sortedModels = Object.keys(modelMap).sort().filter(function(k) { return modelMap[k].total > 0; });
+  if (!sortedModels.length) { el.innerHTML = ''; return; }
+  var grandTotal = 0;
+  for (var j = 0; j < sortedModels.length; j++) grandTotal += modelMap[sortedModels[j]].total;
+  if (!grandTotal) grandTotal = 1;
+  var propBar = '<div class="tok-proportion">';
+  for (var k = 0; k < sortedModels.length; k++) {
+    var pct = (modelMap[sortedModels[k]].total / grandTotal) * 100;
+    propBar += '<div class="tok-proportion-seg" style="width:'+pct+'%;background:'+getModelColor(sortedModels[k], sortedModels)+'"></div>';
+  }
+  propBar += '</div>';
+  var rows = '';
+  for (var r = 0; r < sortedModels.length; r++) {
+    var md = modelMap[sortedModels[r]];
+    var pctR = Math.round((md.total / grandTotal) * 100);
+    rows += '<div class="tok-model-row">' +
+      '<div class="tok-model-dot" style="background:'+getModelColor(sortedModels[r], sortedModels)+'"></div>' +
+      '<div class="tok-model-name">'+escHtml(shortModel(sortedModels[r]))+'</div>' +
+      '<div class="tok-model-detail">'+formatNum(md.input)+' in / '+formatNum(md.output)+' out</div>' +
+      '<div class="tok-model-total">'+formatNum(md.total)+'</div>' +
+      '<div class="tok-model-pct">'+pctR+'%</div>' +
+    '</div>';
+  }
+  el.innerHTML = propBar + rows;
+}
+
+function renderRepoBranchBreakdown(data) {
+  var el = document.getElementById('tok-repos');
+  if (!el) return;
+  if (!data.length) { el.innerHTML = ''; return; }
+  var map = {};
+  var allModels = {};
+  for (var i = 0; i < data.length; i++) {
+    var key = (data[i].repo || 'unknown') + '::' + (data[i].branch || 'unknown');
+    if (!map[key]) map[key] = { repo: data[i].repo || 'unknown', branch: data[i].branch || 'unknown', total: 0, models: {} };
+    var total = (data[i].inputTokens || 0) + (data[i].outputTokens || 0);
+    map[key].total += total;
+    var m = data[i].model || 'unknown';
+    allModels[m] = 1;
+    map[key].models[m] = (map[key].models[m] || 0) + total;
+  }
+  var sorted = Object.values(map).sort(function(a,b) { return b.total - a.total; });
+  var grandTotal = 0;
+  for (var j = 0; j < sorted.length; j++) grandTotal += sorted[j].total;
+  if (!grandTotal) grandTotal = 1;
+  var sortedAllModels = Object.keys(allModels).sort();
+  var html = '';
+  for (var k = 0; k < sorted.length; k++) {
+    var item = sorted[k];
+    var pct = Math.round((item.total / grandTotal) * 100);
+    var repoName = item.repo.split('/').pop();
+    var modelEntries = Object.entries(item.models).sort(function(a,b) { return b[1] - a[1]; });
+    var modelDetail = modelEntries.map(function(e) {
+      return '<span style="color:'+getModelColor(e[0], sortedAllModels)+'">'+escHtml(shortModel(e[0]))+'</span> '+formatNum(e[1]);
+    }).join(' \\u00b7 ');
+    html += '<div class="tok-branch-row">' +
+      '<div class="tok-branch-name">' + escHtml(repoName) + ' <span class="tok-branch-badge">' + escHtml(item.branch) + '</span></div>' +
+      '<div class="tok-branch-stats">' +
+        '<span class="tok-branch-total">' + formatNum(item.total) + '</span>' +
+        '<span class="tok-branch-pct">' + pct + '%</span>' +
+      '</div>' +
+      '<div class="tok-branch-detail">' + modelDetail + '</div>' +
+    '</div>';
+  }
+  el.innerHTML = html;
+}
+
+function tokFilterChange(which) {
+  if (which === 'repo') {
+    var branchEl = document.getElementById('tok-branch');
+    if (branchEl) branchEl.value = '';
+    _lastTokensHash = '';
+    refreshTokens();
+  } else if (which === 'model') {
+    applyTokenModelFilter();
+  } else {
+    _lastTokensHash = '';
+    refreshTokens();
+  }
 }
 
 refresh();
@@ -2095,6 +2679,9 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Dashboard running at http://localhost:${PORT}`);
+  // Discover any existing keychain token on startup so the dashboard
+  // shows accounts immediately (don't wait for the first proxy request)
+  autoDiscoverAccount().catch(() => {});
 });
 
 // ─────────────────────────────────────────────────
@@ -2652,10 +3239,253 @@ setInterval(async () => {
   } catch {}
 })();
 
+// ─────────────────────────────────────────────────
+// [BETA] Request Serialization Queue
+// ─────────────────────────────────────────────────
+
+let _inflightCount = 0;
+const _requestQueue = [];
+
+function getQueueStats() {
+  return { inflight: _inflightCount, queued: _requestQueue.length };
+}
+
+function drainSerializationQueue() {
+  while (_requestQueue.length > 0) {
+    const next = _requestQueue.shift();
+    next.resolve();
+  }
+}
+
+function withSerializationQueue(fn, isRetry = false) {
+  // If serialization disabled, retries, or nothing inflight → run immediately
+  if (!settings.serializeRequests || isRetry || _inflightCount === 0) {
+    _inflightCount++;
+    return fn().finally(() => {
+      _inflightCount--;
+      _dispatchNext();
+    });
+  }
+
+  // Queue the request
+  return new Promise((resolve, reject) => {
+    const entry = { fn, resolve: null, reject: null };
+    const timeout = setTimeout(() => {
+      const idx = _requestQueue.indexOf(entry);
+      if (idx !== -1) _requestQueue.splice(idx, 1);
+      reject(new Error('queue_timeout'));
+    }, 120_000);
+
+    entry.resolve = () => {
+      clearTimeout(timeout);
+      _inflightCount++;
+      fn().then(resolve, reject).finally(() => {
+        _inflightCount--;
+        _dispatchNext();
+      });
+    };
+    entry.reject = (err) => {
+      clearTimeout(timeout);
+      reject(err);
+    };
+    _requestQueue.push(entry);
+  });
+}
+
+function _dispatchNext() {
+  if (_requestQueue.length === 0) return;
+  const delay = settings.serializeDelayMs || 0;
+  if (delay > 0) {
+    setTimeout(() => {
+      if (_requestQueue.length > 0) {
+        const next = _requestQueue.shift();
+        next.resolve();
+      }
+    }, delay);
+  } else {
+    const next = _requestQueue.shift();
+    next.resolve();
+  }
+}
+
+// ─────────────────────────────────────────────────
+// [BETA] Token Usage Extractor (SSE Transform Stream)
+// ─────────────────────────────────────────────────
+
+function createUsageExtractor() {
+  let inputTokens = 0;
+  let outputTokens = 0;
+  let model = '';
+  let lineBuffer = '';
+  let nextEventType = '';
+
+  const extractor = new Transform({
+    transform(chunk, encoding, callback) {
+      // Pass through bytes unchanged
+      this.push(chunk);
+
+      // Scan for usage data in SSE events
+      const text = chunk.toString('utf8');
+      lineBuffer += text;
+
+      const lines = lineBuffer.split('\n');
+      // Keep the last (potentially incomplete) line in the buffer
+      lineBuffer = lines.pop() || '';
+
+      for (const line of lines) {
+        const trimmed = line.trim();
+        if (trimmed.startsWith('event:')) {
+          nextEventType = trimmed.slice(6).trim();
+        } else if (trimmed.startsWith('data:') && nextEventType) {
+          try {
+            const data = JSON.parse(trimmed.slice(5).trim());
+            if (nextEventType === 'message_start' && data.message) {
+              if (data.message.usage) {
+                inputTokens = data.message.usage.input_tokens || 0;
+              }
+              if (data.message.model) {
+                model = data.message.model;
+              }
+            } else if (nextEventType === 'message_delta' && data.usage) {
+              outputTokens = data.usage.output_tokens || 0;
+            }
+          } catch { /* not JSON or malformed — skip */ }
+          nextEventType = '';
+        }
+      }
+
+      callback();
+    },
+    flush(callback) {
+      callback();
+    },
+  });
+
+  extractor.getUsage = () => ({
+    inputTokens,
+    outputTokens,
+    model,
+    ts: Date.now(),
+  });
+
+  return extractor;
+}
+
+// ─────────────────────────────────────────────────
+// [BETA] Token Usage Ring Buffer
+// ─────────────────────────────────────────────────
+
+const recentUsage = []; // { ts, inputTokens, outputTokens, model, account, claimed }
+const RECENT_USAGE_MAX = 100;
+
+function recordUsage(usage, account) {
+  if (!usage || (!usage.inputTokens && !usage.outputTokens)) return;
+  recentUsage.push({
+    ts: usage.ts || Date.now(),
+    inputTokens: usage.inputTokens,
+    outputTokens: usage.outputTokens,
+    model: usage.model,
+    account,
+    claimed: false,
+  });
+  while (recentUsage.length > RECENT_USAGE_MAX) recentUsage.shift();
+}
+
+function claimUsageInRange(startTs, endTs) {
+  const claimed = [];
+  for (const entry of recentUsage) {
+    if (!entry.claimed && entry.ts >= startTs && entry.ts <= endTs) {
+      entry.claimed = true;
+      claimed.push(entry);
+    }
+  }
+  return claimed;
+}
+
+// ─────────────────────────────────────────────────
+// [BETA] Session Tracking
+// ─────────────────────────────────────────────────
+
+const pendingSessions = new Map(); // session_id → { repo, branch, commitHash, startedAt }
+
+// ─────────────────────────────────────────────────
+// [BETA] Token Usage Storage (token-usage.json)
+// ─────────────────────────────────────────────────
+
+const TOKEN_USAGE_MAX_ENTRIES = 50_000;
+const TOKEN_USAGE_MAX_AGE = 90 * 24 * 60 * 60 * 1000; // 90 days
+let _tokenUsageCache = null;
+
+function loadTokenUsage() {
+  if (_tokenUsageCache) return _tokenUsageCache;
+  try {
+    if (existsSync(TOKEN_USAGE_FILE)) {
+      const raw = readFileSync(TOKEN_USAGE_FILE, 'utf8');
+      _tokenUsageCache = JSON.parse(raw);
+      return _tokenUsageCache;
+    }
+  } catch { /* corrupt file */ }
+  _tokenUsageCache = [];
+  return _tokenUsageCache;
+}
+
+function appendTokenUsage(entry) {
+  const usage = loadTokenUsage();
+  usage.push(entry);
+  // Prune old entries
+  const cutoff = Date.now() - TOKEN_USAGE_MAX_AGE;
+  const pruned = usage.filter(e => e.ts >= cutoff);
+  const final = pruned.length > TOKEN_USAGE_MAX_ENTRIES
+    ? pruned.slice(pruned.length - TOKEN_USAGE_MAX_ENTRIES)
+    : pruned;
+  _tokenUsageCache = final;
+  try {
+    writeFileSync(TOKEN_USAGE_FILE, JSON.stringify(final, null, 2));
+  } catch (e) {
+    log('error', `Failed to write token-usage.json: ${e.message}`);
+  }
+}
+
+// ─────────────────────────────────────────────────
+// [BETA] Pipe helper — waits for stream to complete
+// ─────────────────────────────────────────────────
+
+function pipeAndWait(src, dst) {
+  return new Promise(resolve => {
+    let resolved = false;
+    const done = () => { if (!resolved) { resolved = true; resolve(); } };
+    src.on('end', done);
+    src.on('error', done);
+    dst.on('close', done);
+    dst.on('error', done);
+    src.pipe(dst);
+  });
+}
+
 // ── Proxy server ──
 
 const proxyServer = createServer((clientReq, clientRes) => {
-  handleProxyRequest(clientReq, clientRes).catch(err => {
+  // Health checks bypass the serialization queue
+  if (clientReq.method === 'GET' && clientReq.url === '/health') {
+    handleProxyRequest(clientReq, clientRes).catch(err => {
+      log('error', `Unhandled proxy error: ${err.message}\n${err.stack}`);
+      if (!clientRes.headersSent) {
+        clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({ error: `Proxy error: ${err.message}` }));
+      }
+    });
+    return;
+  }
+
+  withSerializationQueue(() => handleProxyRequest(clientReq, clientRes)).catch(err => {
+    if (err.message === 'queue_timeout') {
+      log('warn', 'Request timed out in serialization queue');
+      if (!clientRes.headersSent) {
+        clientRes.writeHead(504, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({ error: 'Request queued too long (serialization timeout)' }));
+      }
+      return;
+    }
     log('error', `Unhandled proxy error: ${err.message}\n${err.stack}`);
     if (!clientRes.headersSent) {
       clientRes.writeHead(502, { 'Content-Type': 'application/json' });
@@ -2699,7 +3529,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
       clientReq.on('close', () => { proxyRes.destroy(); });
-      proxyRes.pipe(clientRes);
+      await pipeAndWait(proxyRes, clientRes);
     } catch (err) {
       if (!clientRes.headersSent) {
         clientRes.writeHead(502, { 'Content-Type': 'application/json' });
@@ -2911,7 +3741,7 @@ async function handleProxyRequest(clientReq, clientRes) {
         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
         clientRes.on('close', () => { proxyRes.destroy(); });
-        proxyRes.pipe(clientRes);
+        await pipeAndWait(proxyRes, clientRes);
         return;
       }
 
@@ -3105,7 +3935,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
       clientRes.on('close', () => { proxyRes.destroy(); });
-      proxyRes.pipe(clientRes);
+      await pipeAndWait(proxyRes, clientRes);
       return;
     }
 
@@ -3121,7 +3951,23 @@ async function handleProxyRequest(clientReq, clientRes) {
     clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
     clientRes.on('close', () => { proxyRes.destroy(); });
-    proxyRes.pipe(clientRes);
+
+    // [BETA] Extract token usage from SSE streaming responses
+    const contentType = proxyRes.headers['content-type'] || '';
+    if (contentType.includes('text/event-stream')) {
+      const extractor = createUsageExtractor();
+      proxyRes.pipe(extractor).pipe(clientRes);
+      await new Promise(resolve => {
+        let done = false;
+        const finish = () => { if (!done) { done = true; resolve(); } };
+        extractor.on('end', finish);
+        extractor.on('error', finish);
+        clientRes.on('close', finish);
+      });
+      recordUsage(extractor.getUsage(), acctName);
+    } else {
+      await pipeAndWait(proxyRes, clientRes);
+    }
     return;
   }
 
