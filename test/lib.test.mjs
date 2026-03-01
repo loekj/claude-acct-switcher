@@ -6,6 +6,8 @@ import {
   getFingerprint,
   getFingerprintFromToken,
   buildForwardHeaders,
+  stripHopByHopHeaders,
+  HOP_BY_HOP,
   createAccountStateManager,
   isAccountAvailable,
   scoreAccount,
@@ -42,6 +44,123 @@ describe('getFingerprint', () => {
     const fp1 = getFingerprint({ claudeAiOauth: { accessToken: 'token-a' } });
     const fp2 = getFingerprint({ claudeAiOauth: { accessToken: 'token-b' } });
     assert.notEqual(fp1, fp2);
+  });
+});
+
+describe('stripHopByHopHeaders', () => {
+  it('strips all RFC 7230 hop-by-hop headers', () => {
+    const input = {
+      'connection': 'keep-alive',
+      'keep-alive': 'timeout=5',
+      'proxy-authenticate': 'Basic',
+      'proxy-authorization': 'Bearer xyz',
+      'te': 'trailers',
+      'trailer': 'Expires',
+      'transfer-encoding': 'chunked',
+      'upgrade': 'websocket',
+      'host': 'localhost:3334',
+      'content-length': '42',
+      // These should survive:
+      'content-type': 'application/json',
+      'authorization': 'Bearer tok',
+      'x-custom': 'value',
+    };
+    const result = stripHopByHopHeaders(input);
+    for (const h of HOP_BY_HOP) {
+      assert.ok(!(h in result), `${h} should be stripped`);
+    }
+    assert.equal(result['content-type'], 'application/json');
+    assert.equal(result['authorization'], 'Bearer tok');
+    assert.equal(result['x-custom'], 'value');
+  });
+
+  it('strips custom hop-by-hop headers declared in Connection', () => {
+    const result = stripHopByHopHeaders({
+      'connection': 'X-Custom-Hop, X-Another',
+      'x-custom-hop': 'secret',
+      'x-another': 'also-secret',
+      'x-safe': 'keep-me',
+    });
+    assert.ok(!('x-custom-hop' in result));
+    assert.ok(!('x-another' in result));
+    assert.ok(!('connection' in result));
+    assert.equal(result['x-safe'], 'keep-me');
+  });
+
+  it('handles empty Connection header', () => {
+    const result = stripHopByHopHeaders({ 'connection': '', 'content-type': 'text/plain' });
+    assert.equal(result['content-type'], 'text/plain');
+    assert.ok(!('connection' in result));
+  });
+
+  it('handles missing Connection header', () => {
+    const result = stripHopByHopHeaders({ 'content-type': 'text/plain' });
+    assert.equal(result['content-type'], 'text/plain');
+  });
+});
+
+describe('buildForwardHeaders', () => {
+  it('sets authorization and host headers', () => {
+    const headers = buildForwardHeaders({ 'content-type': 'application/json' }, 'test-token');
+    assert.equal(headers['authorization'], 'Bearer test-token');
+    assert.equal(headers['host'], 'api.anthropic.com');
+  });
+
+  it('strips all hop-by-hop headers via stripHopByHopHeaders', () => {
+    const headers = buildForwardHeaders({
+      'host': 'localhost:3334',
+      'connection': 'keep-alive',
+      'keep-alive': 'timeout=5',
+      'content-length': '42',
+      'transfer-encoding': 'chunked',
+      'proxy-authorization': 'Basic abc',
+      'te': 'trailers',
+      'trailer': 'Expires',
+      'upgrade': 'websocket',
+      'content-type': 'application/json',
+    }, 'test-token');
+    assert.equal(headers['content-type'], 'application/json');
+    assert.equal(headers['host'], 'api.anthropic.com');
+    assert.ok(!('connection' in headers));
+    assert.ok(!('keep-alive' in headers));
+    assert.ok(!('content-length' in headers));
+    assert.ok(!('transfer-encoding' in headers));
+    assert.ok(!('proxy-authorization' in headers));
+    assert.ok(!('te' in headers));
+    assert.ok(!('trailer' in headers));
+    assert.ok(!('upgrade' in headers));
+  });
+
+  it('strips custom Connection-declared headers', () => {
+    const headers = buildForwardHeaders({
+      'connection': 'X-My-Hop',
+      'x-my-hop': 'private-value',
+      'content-type': 'application/json',
+    }, 'test-token');
+    assert.ok(!('x-my-hop' in headers));
+    assert.equal(headers['content-type'], 'application/json');
+  });
+
+  it('adds oauth beta header', () => {
+    const headers = buildForwardHeaders({}, 'test-token');
+    assert.ok(headers['anthropic-beta'].includes('oauth-2025-04-20'));
+  });
+
+  it('does not duplicate oauth beta if already present', () => {
+    const headers = buildForwardHeaders({
+      'anthropic-beta': 'oauth-2025-04-20,some-other-beta',
+    }, 'test-token');
+    const betas = headers['anthropic-beta'].split(',').map(s => s.trim());
+    const oauthCount = betas.filter(b => b === 'oauth-2025-04-20').length;
+    assert.equal(oauthCount, 1);
+  });
+
+  it('throws on null token', () => {
+    assert.throws(() => buildForwardHeaders({}, null), /Cannot forward request: token is null/);
+  });
+
+  it('throws on undefined token', () => {
+    assert.throws(() => buildForwardHeaders({}, undefined), /Cannot forward request/);
   });
 });
 

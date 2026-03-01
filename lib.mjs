@@ -21,13 +21,35 @@ export function getFingerprintFromToken(token) {
 // Header building for proxy forwarding
 // ─────────────────────────────────────────────────
 
-export function buildForwardHeaders(originalHeaders, token) {
+// RFC 7230 §6.1: hop-by-hop headers that MUST NOT be forwarded by proxies.
+// Also includes `connection` itself — plus any headers named in its value.
+export const HOP_BY_HOP = new Set([
+  'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
+  'te', 'trailer', 'transfer-encoding', 'upgrade',
+  // Not strictly hop-by-hop, but must be recalculated by the proxy:
+  'host', 'content-length',
+]);
+
+/**
+ * Strip hop-by-hop headers from a headers object (for passthrough / raw forwarding).
+ * Also strips any custom hop-by-hop headers declared in the Connection header.
+ */
+export function stripHopByHopHeaders(originalHeaders) {
+  const connVal = originalHeaders['connection'] || originalHeaders['Connection'] || '';
+  const extraHop = new Set(
+    connVal.split(',').map(s => s.trim().toLowerCase()).filter(Boolean)
+  );
   const fwd = {};
   for (const [k, v] of Object.entries(originalHeaders)) {
     const lk = k.toLowerCase();
-    if (lk === 'host' || lk === 'connection' || lk === 'content-length') continue;
+    if (HOP_BY_HOP.has(lk) || extraHop.has(lk)) continue;
     fwd[k] = v;
   }
+  return fwd;
+}
+
+export function buildForwardHeaders(originalHeaders, token) {
+  const fwd = stripHopByHopHeaders(originalHeaders);
   if (!token || typeof token !== 'string') {
     throw new Error(`Cannot forward request: token is ${token === null ? 'null' : typeof token}`);
   }

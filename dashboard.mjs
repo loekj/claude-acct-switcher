@@ -130,6 +130,7 @@ import {
   getFingerprint,
   getFingerprintFromToken,
   buildForwardHeaders as _buildForwardHeaders,
+  stripHopByHopHeaders,
   createAccountStateManager,
   isAccountAvailable as _isAccountAvailable,
   scoreAccount as _scoreAccount,
@@ -2349,7 +2350,8 @@ function forwardToAnthropic(method, path, headers, body, timeout = PROXY_TIMEOUT
   });
 }
 
-// Drain a response and return the body (for error responses)
+// Drain a response and return the body (for error responses).
+// Destroys the stream on timeout to prevent partial-data races.
 function drainResponse(res) {
   return new Promise(r => {
     let done = false;
@@ -2358,8 +2360,8 @@ function drainResponse(res) {
     res.on('data', c => chunks.push(c));
     res.on('end', finish);
     res.on('error', finish);
-    // Safety: if stream stalls, resolve after 5s to prevent hanging forever
-    setTimeout(finish, 5000);
+    // Safety: if stream stalls, destroy it and resolve with whatever we have
+    setTimeout(() => { res.destroy(); finish(); }, 5000);
   });
 }
 
@@ -2676,13 +2678,13 @@ async function handleProxyRequest(clientReq, clientRes) {
 
   // ── Proxy disabled: pure passthrough ──
   if (!settings.proxyEnabled) {
-    const fwd = {};
-    for (const [k, v] of Object.entries(clientReq.headers)) {
-      const lk = k.toLowerCase();
-      if (lk === 'host' || lk === 'connection') continue;
-      fwd[k] = v;
-    }
+    const fwd = stripHopByHopHeaders(clientReq.headers);
     fwd['host'] = 'api.anthropic.com';
+    // Restore content-length: passthrough pipes the body as-is (not re-buffered),
+    // so the original framing must be preserved to avoid an implicit chunked switch.
+    if (clientReq.headers['content-length']) {
+      fwd['content-length'] = clientReq.headers['content-length'];
+    }
     try {
       const proxyRes = await new Promise((resolve, reject) => {
         const req = https.request({
@@ -2707,13 +2709,32 @@ async function handleProxyRequest(clientReq, clientRes) {
     return;
   }
 
-  // Buffer request body for replay on retry
+  // Buffer request body for replay on retry (with size guard to prevent OOM)
+  const MAX_BODY_SIZE = 50 * 1024 * 1024; // 50 MB
   const bodyChunks = [];
-  await new Promise((resolve, reject) => {
-    clientReq.on('data', c => bodyChunks.push(c));
-    clientReq.on('end', resolve);
-    clientReq.on('error', reject);
-  });
+  let bodySize = 0;
+  try {
+    await new Promise((resolve, reject) => {
+      clientReq.on('data', c => {
+        bodySize += c.length;
+        if (bodySize > MAX_BODY_SIZE) {
+          reject(new Error('body_too_large')); // reject BEFORE destroy to win any sync error-event race
+          clientReq.destroy();
+          return;
+        }
+        bodyChunks.push(c);
+      });
+      clientReq.on('end', resolve);
+      clientReq.on('error', reject);
+    });
+  } catch (e) {
+    if (e.message === 'body_too_large') {
+      clientRes.writeHead(413, { 'Content-Type': 'application/json' });
+      clientRes.end(JSON.stringify({ error: `Request body too large (max ${MAX_BODY_SIZE / 1024 / 1024}MB)` }));
+      return;
+    }
+    throw e;
+  }
   const body = Buffer.concat(bodyChunks);
 
   // Check if keychain has a token we haven't saved yet (e.g. user just did /login)
@@ -2889,6 +2910,7 @@ async function handleProxyRequest(clientReq, clientRes) {
         if (!isTransient) log('switch', '  → auto-switch OFF, returning 429 as-is');
         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
+        clientRes.on('close', () => { proxyRes.destroy(); });
         proxyRes.pipe(clientRes);
         return;
       }
@@ -2947,11 +2969,13 @@ async function handleProxyRequest(clientReq, clientRes) {
             invalidateAccountsCache();
             const refreshedAccounts = loadAllAccountTokens();
             const refreshedAcct = refreshedAccounts.find(a => a.name === acct.name);
-            if (refreshedAcct) {
+            if (refreshedAcct && refreshedAcct.token !== acct.token) {
               token = refreshedAcct.token;
-              triedTokens.delete(acct.token); // allow retry with new token
+              triedTokens.delete(acct.token); // allow retry with genuinely new token
               continue;
             }
+            // Refresh returned same token — treat as failed
+            log('refresh', `${acctName}: refresh returned same token, treating as failed`);
           }
         } catch (e) {
           log('refresh', `${acctName}: refresh failed: ${e.message}`);
@@ -3003,11 +3027,84 @@ async function handleProxyRequest(clientReq, clientRes) {
       return;
     }
 
+    // ── 400: Bad request (no body) → likely corrupted token/headers, try recovery ──
+    if (status === 400) {
+      const bodyBuf = await drainResponse(proxyRes);
+      const bodyStr = bodyBuf.toString('utf8').trim();
+
+      if (bodyStr) {
+        // 400 with a body = legitimate API validation error, pass through as-is
+        log('info', `${acctName} → 400 with body (passing through): ${bodyStr.slice(0, 200)}`);
+        clientRes.writeHead(400, proxyRes.headers);
+        clientRes.end(bodyBuf);
+        return;
+      }
+
+      // 400 with NO body = likely bad token or malformed request from proxy
+      log('error', `${acctName} → 400 with no body (possible bad token or header issue)`);
+      logEvent('bad-request-400', { account: acctName });
+
+      // Try refreshing the token first (like 401 handling)
+      if (acct && !refreshAttempted.has(acctName)) {
+        refreshAttempted.add(acctName);
+        log('refresh', `${acctName}: attempting token refresh after 400 (no body)...`);
+        try {
+          const refreshResult = await refreshAccountToken(acct.name);
+          if (refreshResult.ok && !refreshResult.skipped) {
+            log('refresh', `${acctName}: refresh succeeded, retrying request`);
+            invalidateAccountsCache();
+            const refreshedAccounts = loadAllAccountTokens();
+            const refreshedAcct = refreshedAccounts.find(a => a.name === acct.name);
+            if (refreshedAcct && refreshedAcct.token !== acct.token) {
+              token = refreshedAcct.token;
+              triedTokens.delete(acct.token);
+              continue;
+            }
+            log('refresh', `${acctName}: refresh returned same token, treating as failed`);
+          }
+        } catch (e) {
+          log('refresh', `${acctName}: refresh failed: ${e.message}`);
+        }
+      }
+
+      // Try switching accounts
+      if (settings.autoSwitch) {
+        const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
+        if (next) {
+          log('switch', `  → 400 (no body) on ${acctName}, switching to ${next.label || next.name}`);
+          try {
+            await withSwitchLock(() => {
+              writeKeychain(next.creds);
+              invalidateTokenCache();
+            });
+          } catch (e) {
+            log('warn', `Keychain write failed during 400 switch: ${e.message}`);
+          }
+          token = next.token;
+          logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '400-no-body' });
+          notify('Account Switched', `${acctName} → 400 error → ${next.label || next.name}`);
+          continue;
+        }
+      }
+
+      // No recovery possible — return error to client
+      clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+      clientRes.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'proxy_error',
+          message: `Upstream returned 400 with no body on all accounts. Check proxy logs.`,
+        },
+      }));
+      return;
+    }
+
     // ── 529: Overloaded → pass through, switching won't help ──
     if (status === 529) {
       log('info', `${acctName} → 529 overloaded (not switching  - server-side issue)`);
       clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
       proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
+      clientRes.on('close', () => { proxyRes.destroy(); });
       proxyRes.pipe(clientRes);
       return;
     }
@@ -3023,6 +3120,7 @@ async function handleProxyRequest(clientReq, clientRes) {
 
     clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
     proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
+    clientRes.on('close', () => { proxyRes.destroy(); });
     proxyRes.pipe(clientRes);
     return;
   }
