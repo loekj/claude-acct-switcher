@@ -28,6 +28,25 @@ NC='\033[0m'
 mkdir -p "$ACCOUNTS_DIR"
 
 # ─────────────────────────────────────────────────────────
+# Startup migration: ensure hooks are installed
+# (handles upgrades from versions that didn't ship install-hooks.sh)
+# ─────────────────────────────────────────────────────────
+
+if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
+  _needs_hooks=false
+  if [[ ! -f "$HOME/.claude/settings.json" ]]; then
+    _needs_hooks=true
+  elif ! grep -q "api/session-start" "$HOME/.claude/settings.json" 2>/dev/null; then
+    _needs_hooks=true
+  fi
+  if [[ "$_needs_hooks" == "true" ]]; then
+    source "$SCRIPT_DIR/install-hooks.sh"
+    install_beta_hooks 2>/dev/null || true
+  fi
+  unset _needs_hooks
+fi
+
+# ─────────────────────────────────────────────────────────
 # Keychain service auto-detection
 # ─────────────────────────────────────────────────────────
 
