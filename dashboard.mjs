@@ -2589,7 +2589,7 @@ async function refreshAccountToken(accountName) {
 
 // ── Background refresh timer ──
 
-setInterval(async () => {
+async function refreshSweep(label = 'refresh-bg') {
   const accounts = loadAllAccountTokens();
   for (const acct of accounts) {
     if (shouldRefreshToken(acct.expiresAt, REFRESH_BUFFER_MS)) {
@@ -2598,16 +2598,31 @@ setInterval(async () => {
         // Non-retriable failure (e.g. 400/401) — skip until user re-authenticates
         continue;
       }
-      log('refresh-bg', `${acct.label || acct.name}: token near expiry, refreshing...`);
+      log(label, `${acct.label || acct.name}: token near expiry, refreshing...`);
       try {
         await refreshAccountToken(acct.name);
       } catch (e) {
-        log('refresh-bg', `${acct.label || acct.name}: background refresh error: ${e.message}`);
+        log(label, `${acct.label || acct.name}: background refresh error: ${e.message}`);
         refreshFailures.set(acct.name, { error: e.message, retriable: true, ts: Date.now() });
         logActivity('refresh-failed', { account: acct.label || acct.name, error: e.message, retriable: true });
       }
     }
   }
+}
+
+// Run immediately on startup (handles expired tokens after sleep/restart)
+refreshSweep('refresh-startup').catch(() => {});
+
+// Detect system wake: if the timer fires much later than expected, the system slept
+let lastRefreshTick = Date.now();
+setInterval(async () => {
+  const now = Date.now();
+  const drift = now - lastRefreshTick - REFRESH_CHECK_INTERVAL;
+  lastRefreshTick = now;
+  if (drift > 30_000) {
+    log('refresh-wake', `System wake detected (drift ${Math.round(drift / 1000)}s), refreshing all tokens...`);
+  }
+  await refreshSweep();
 }, REFRESH_CHECK_INTERVAL);
 
 // ── Startup: clean orphaned .tmp files ──
@@ -2767,6 +2782,34 @@ async function handleProxyRequest(clientReq, clientRes) {
     clientRes.writeHead(502, { 'Content-Type': 'application/json' });
     clientRes.end(JSON.stringify({ error: 'No active token available — check keychain access' }));
     return;
+  }
+
+  // Pre-flight refresh: if the selected token is already expired, refresh it
+  // before forwarding to avoid a wasted 401 round-trip (e.g. after laptop sleep)
+  {
+    const preAcct = allAccounts.find(a => a.token === token);
+    if (preAcct && preAcct.expiresAt && preAcct.expiresAt < Date.now()) {
+      log('refresh-preflight', `${preAcct.label || preAcct.name}: token expired, refreshing before forwarding...`);
+      try {
+        const result = await refreshAccountToken(preAcct.name);
+        if (result.ok && !result.skipped) {
+          invalidateAccountsCache();
+          const refreshed = loadAllAccountTokens().find(a => a.name === preAcct.name);
+          if (refreshed) {
+            token = refreshed.token;
+            try {
+              await withSwitchLock(() => {
+                writeKeychain(refreshed.creds);
+                invalidateTokenCache();
+              });
+            } catch {}
+            log('refresh-preflight', `${preAcct.label || preAcct.name}: refreshed OK, proceeding with new token`);
+          }
+        }
+      } catch (e) {
+        log('refresh-preflight', `${preAcct.label || preAcct.name}: preflight refresh failed: ${e.message}`);
+      }
+    }
   }
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
