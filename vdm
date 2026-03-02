@@ -786,6 +786,8 @@ cmd_upgrade() {
     echo -e "  ${RED}Failed to fetch from $REPO_URL${NC}"
     return 1
   fi
+  # Shallow clone may miss tags — fetch them explicitly
+  git -C "$tmpdir" fetch --tags --quiet 2>/dev/null || true
 
   # Compare versions (prefer semver tag, fall back to commit hash)
   local current_hash=""
