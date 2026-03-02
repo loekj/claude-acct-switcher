@@ -2788,6 +2788,7 @@ server.listen(PORT, () => {
 
 const PROXY_PORT = parseInt(process.env.CSW_PROXY_PORT || '3334', 10);
 const PROXY_TIMEOUT = 5 * 60 * 1000; // 5 min per upstream request
+const REQUEST_DEADLINE_MS = 45_000;   // hard cap on total handleProxyRequest time
 const MAX_EVENT_LOG = 50;
 
 // ── Structured logger ──
@@ -3715,6 +3716,8 @@ async function handleProxyRequest(clientReq, clientRes) {
     throw e;
   }
   const body = Buffer.concat(bodyChunks);
+  const deadline = Date.now() + REQUEST_DEADLINE_MS;
+  const isDeadlineExceeded = () => Date.now() > deadline;
 
   // Check if keychain has a token we haven't saved yet (e.g. user just did /login)
   await autoDiscoverAccount().catch(() => {});
@@ -3790,11 +3793,18 @@ async function handleProxyRequest(clientReq, clientRes) {
   // before forwarding to avoid a wasted 401 round-trip (e.g. after laptop sleep)
   {
     const preAcct = allAccounts.find(a => a.token === token);
-    if (preAcct && preAcct.expiresAt && preAcct.expiresAt < Date.now()) {
+    if (preAcct && preAcct.expiresAt && preAcct.expiresAt < Date.now() && !isDeadlineExceeded()) {
       log('refresh-preflight', `${preAcct.label || preAcct.name}: token expired, refreshing before forwarding...`);
+      const preAcctName = preAcct.label || preAcct.name;
       try {
         const result = await refreshAccountToken(preAcct.name);
-        if (result.ok && !result.skipped) {
+        if (result.ok && result.skipped) {
+          // Another process refreshed the on-disk token but our in-memory copy
+          // is stale — do NOT seed refreshAttempted so the 401 handler can retry
+          // with force: true to pick up the new token.
+          log('refresh-preflight', `${preAcctName}: skipped (another process refreshed), will allow 401 retry`);
+        } else if (result.ok) {
+          refreshAttempted.add(preAcctName);
           invalidateAccountsCache();
           const refreshed = loadAllAccountTokens().find(a => a.name === preAcct.name);
           if (refreshed) {
@@ -3805,16 +3815,35 @@ async function handleProxyRequest(clientReq, clientRes) {
                 invalidateTokenCache();
               });
             } catch {}
-            log('refresh-preflight', `${preAcct.label || preAcct.name}: refreshed OK, proceeding with new token`);
+            log('refresh-preflight', `${preAcctName}: refreshed OK, proceeding with new token`);
           }
+        } else {
+          // Refresh failed — seed refreshAttempted to avoid retrying the same
+          // account in the 401 handler (it would just fail again after ~37s)
+          refreshAttempted.add(preAcctName);
         }
       } catch (e) {
-        log('refresh-preflight', `${preAcct.label || preAcct.name}: preflight refresh failed: ${e.message}`);
+        refreshAttempted.add(preAcctName);
+        log('refresh-preflight', `${preAcctName}: preflight refresh failed: ${e.message}`);
       }
     }
   }
 
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
+    // Deadline guard: on retries, bail early if we've run out of time
+    if (attempt > 0 && isDeadlineExceeded()) {
+      log('deadline', `Request deadline exceeded after ${attempt} attempts (${REQUEST_DEADLINE_MS}ms) — returning 504`);
+      clientRes.writeHead(504, { 'Content-Type': 'application/json' });
+      clientRes.end(JSON.stringify({
+        type: 'error',
+        error: {
+          type: 'timeout_error',
+          message: `Proxy request deadline exceeded (${REQUEST_DEADLINE_MS / 1000}s). All token refreshes may have timed out.`,
+        },
+      }));
+      return;
+    }
+
     triedTokens.add(token);
     const acct = allAccounts.find(a => a.token === token);
     const acctName = acct?.label || acct?.name || 'unknown';
@@ -3939,7 +3968,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       await drainResponse(proxyRes);
 
       // Try to refresh the token (once per account per request)
-      if (acct && !refreshAttempted.has(acctName)) {
+      if (acct && !refreshAttempted.has(acctName) && !isDeadlineExceeded()) {
         refreshAttempted.add(acctName);
         log('refresh', `${acctName}: attempting token refresh after 401...`);
         try {
@@ -4059,16 +4088,17 @@ async function handleProxyRequest(clientReq, clientRes) {
       logEvent('bad-request-400', { account: acctName, errorType, consecutive: _consecutive400s });
 
       // ── Strategy 1: Force-refresh ALL tokens if we're in a repeated-failure loop ──
-      if (_consecutive400s >= 3 && !_bulkRefreshAttempted) {
+      if (_consecutive400s >= 3 && !_bulkRefreshAttempted && !isDeadlineExceeded()) {
         _bulkRefreshAttempted = true;
-        log('error', `${_consecutive400s} consecutive 400s — force-refreshing ALL account tokens`);
-        for (const a of allAccounts) {
-          if (refreshAttempted.has(a.label || a.name)) continue;
-          refreshAttempted.add(a.label || a.name);
-          try {
-            await refreshAccountToken(a.name, { force: true });
-          } catch (e) {
-            log('refresh', `${a.name}: bulk refresh failed: ${e.message}`);
+        log('error', `${_consecutive400s} consecutive 400s — force-refreshing ALL account tokens (parallel)`);
+        const toRefresh = allAccounts.filter(a => !refreshAttempted.has(a.label || a.name));
+        for (const a of toRefresh) refreshAttempted.add(a.label || a.name);
+        const results = await Promise.allSettled(
+          toRefresh.map(a => refreshAccountToken(a.name, { force: true }))
+        );
+        for (let i = 0; i < results.length; i++) {
+          if (results[i].status === 'rejected') {
+            log('refresh', `${toRefresh[i].name}: bulk refresh failed: ${results[i].reason?.message}`);
           }
         }
         invalidateAccountsCache();
@@ -4082,7 +4112,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       }
 
       // ── Strategy 2: Refresh this specific account's token ──
-      if (acct && !refreshAttempted.has(acctName)) {
+      if (acct && !refreshAttempted.has(acctName) && !isDeadlineExceeded()) {
         refreshAttempted.add(acctName);
         log('refresh', `${acctName}: attempting token refresh after 400...`);
         try {
