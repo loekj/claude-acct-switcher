@@ -252,6 +252,19 @@ async function autoDiscoverAccount() {
       const saved = JSON.parse(raw);
       if (getFingerprint(saved) === fp) return; // exact same token already saved
 
+      // Same refresh token = same underlying account, even when email fetch failed
+      const savedRefresh = saved.claudeAiOauth?.refreshToken;
+      const currentRefresh = creds.claudeAiOauth.refreshToken;
+      if (savedRefresh && currentRefresh && savedRefresh === currentRefresh) {
+        writeFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(creds, null, 2));
+        const oldFp = getFingerprint(saved);
+        migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
+        console.log(`[auto-discover] Updated "${savedName}" with refreshed token (same refreshToken)`);
+        if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
+        invalidateTokenCache();
+        return;
+      }
+
       // Same email = same account with a refreshed token  - update in place
       if (email) {
         let savedEmail = '';
@@ -561,11 +574,18 @@ async function loadProfiles() {
         rateLimits = await getRateLimitsForToken(oauth.accessToken, fp, { allowProbe });
       }
 
-      // Clear stale refresh failures if token is now valid (e.g. user ran `claude login`)
+      // Clear stale refresh failures only if the token fingerprint has actually
+      // changed since the failure was recorded (meaning a real refresh happened,
+      // e.g. user ran `claude login`). Previously this cleared on expiresAt > now,
+      // which hid failures when tokens had future expiry but were already rejected.
       const expiresAt = oauth.expiresAt || 0;
-      if (refreshFailures.has(name) && expiresAt > Date.now()) {
+      const failureEntry = refreshFailures.get(name);
+      if (failureEntry && failureEntry.fp && failureEntry.fp !== fp) {
         refreshFailures.delete(name);
       }
+
+      // Check if the proxy has marked this account as expired (e.g. via 401)
+      const proxyExpired = !!(accountState.get(oauth.accessToken)?.expired);
 
       profiles.push({
         name,
@@ -577,11 +597,48 @@ async function loadProfiles() {
         fingerprint: fp,
         rateLimits,
         dormant,
+        expired: proxyExpired,
         refreshFailed: refreshFailures.get(name) || null,
       });
     } catch {
       // skip corrupt files
     }
+  }
+
+  // Dedup pass: if two profiles resolved to the same email, keep the one with
+  // the newest expiresAt and remove the other from disk. This handles duplicates
+  // created when autoDiscover ran while email fetch was failing.
+  const seen = new Map(); // email → profile index
+  const toRemove = [];
+  for (let i = 0; i < profiles.length; i++) {
+    const p = profiles[i];
+    // Only dedup by real email labels (skip bare account names like "auto-1")
+    if (!p.label || p.label === p.name) continue;
+    const prev = seen.get(p.label);
+    if (prev !== undefined) {
+      const prevP = profiles[prev];
+      // Keep the one with the newer expiresAt; on tie, keep the active one
+      const keepNew = (p.expiresAt > prevP.expiresAt) || (p.expiresAt === prevP.expiresAt && p.isActive);
+      const loserIdx = keepNew ? prev : i;
+      const loser = profiles[loserIdx];
+      toRemove.push(loserIdx);
+      try {
+        unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.json`));
+        try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.label`)); } catch {}
+        log('dedup', `Removed duplicate account "${loser.name}" (same email as "${keepNew ? p.name : prevP.name}")`);
+      } catch (e) {
+        log('warn', `Failed to remove duplicate account file "${loser.name}": ${e.message}`);
+      }
+      if (keepNew) seen.set(p.label, i);
+    } else {
+      seen.set(p.label, i);
+    }
+  }
+  if (toRemove.length > 0) {
+    invalidateAccountsCache();
+    // Return profiles with duplicates removed
+    const removeSet = new Set(toRemove);
+    return profiles.filter((_, i) => !removeSet.has(i));
   }
 
   return profiles;
@@ -774,18 +831,26 @@ async function handleAPI(req, res) {
         json(res, { ok: false, error: 'session_id and cwd required' }, 400);
         return true;
       }
-      // Resolve git context from cwd
-      let repo = cwd, branch = '(no git)', commitHash = '';
-      try {
-        repo = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-        branch = execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-        commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-      } catch { /* not a git repo */ }
-      pendingSessions.set(sessionId, { repo, branch, commitHash, startedAt: Date.now() });
-      // Prune stale sessions (>30 min)
-      const staleThreshold = Date.now() - 30 * 60 * 1000;
+      // Only register new sessions — don't overwrite startedAt on subsequent
+      // UserPromptSubmit hooks (otherwise we'd lose usage from earlier prompts)
+      if (!pendingSessions.has(sessionId)) {
+        let repo = cwd, branch = '(no git)', commitHash = '';
+        try {
+          repo = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+          branch = execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+          commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+        } catch { /* not a git repo */ }
+        pendingSessions.set(sessionId, { repo, branch, commitHash, startedAt: Date.now() });
+        log('tokens', `Session started: ${sessionId.slice(0, 8)}… (${basename(repo)}/${branch})`);
+      }
+      // Prune stale sessions (>24h — sessions can be long-lived)
+      const staleThreshold = Date.now() - 24 * 60 * 60 * 1000;
       for (const [id, s] of pendingSessions) {
-        if (s.startedAt < staleThreshold) pendingSessions.delete(id);
+        if (s.startedAt < staleThreshold) {
+          // Auto-persist before pruning so data isn't lost
+          _autoClaimSession(id, s);
+          pendingSessions.delete(id);
+        }
       }
       json(res, { ok: true });
     } catch (e) {
@@ -805,6 +870,7 @@ async function handleAPI(req, res) {
       }
       const session = pendingSessions.get(sessionId);
       if (!session) {
+        log('tokens', `Session stop: ${sessionId.slice(0, 8)}… (not found — may have been auto-claimed)`);
         json(res, { ok: true, claimed: 0 });
         return true;
       }
@@ -823,6 +889,7 @@ async function handleAPI(req, res) {
         });
       }
       pendingSessions.delete(sessionId);
+      log('tokens', `Session stopped: ${sessionId.slice(0, 8)}… (claimed ${claimed.length} entries)`);
       json(res, { ok: true, claimed: claimed.length });
     } catch (e) {
       json(res, { ok: false, error: e.message }, 500);
@@ -2122,7 +2189,7 @@ function renderAccounts(profiles, animate) {
     }
 
     const animStyle = animate ? ' style="animation-delay:' + (i*0.05) + 's"' : ' style="animation:none"';
-    const isStale = !active && p.expiresAt && p.expiresAt < Date.now();
+    const isStale = !active && (p.expired || p.refreshFailed || (p.expiresAt && p.expiresAt < Date.now()));
     var staleMsg = '';
     if (isStale) {
       if (p.refreshFailed && !p.refreshFailed.retriable) {
@@ -3103,7 +3170,7 @@ function migrateAccountState(oldToken, newToken, oldFp, newFp, name) {
  * Main refresh orchestrator for a single account.
  * Wrapped in per-account lock to prevent concurrent refreshes.
  */
-async function refreshAccountToken(accountName) {
+async function refreshAccountToken(accountName, { force = false } = {}) {
   return refreshLock.withLock(accountName, async () => {
     // 1. Re-read credentials from disk (may have been refreshed by concurrent request)
     let rawCreds;
@@ -3124,7 +3191,9 @@ async function refreshAccountToken(accountName) {
     try { accountLabel = readFileSync(join(ACCOUNTS_DIR, `${accountName}.label`), 'utf8').trim() || accountName; } catch {}
 
     // 2. Check if still needs refresh (double-check after lock)
-    if (!shouldRefreshToken(oauth.expiresAt, REFRESH_BUFFER_MS)) {
+    //    Skip this check when force=true (e.g. 401/400 from API means token is invalid
+    //    regardless of what the stored expiresAt says)
+    if (!force && !shouldRefreshToken(oauth.expiresAt, REFRESH_BUFFER_MS)) {
       log('refresh', `${accountName}: token still valid, skipping refresh`);
       return { ok: true, skipped: true };
     }
@@ -3152,7 +3221,7 @@ async function refreshAccountToken(accountName) {
 
     if (!result.ok) {
       log('refresh', `${accountName}: refresh failed after retries: ${result.error}`);
-      refreshFailures.set(accountName, { error: result.error, retriable: !!result.retriable, ts: Date.now() });
+      refreshFailures.set(accountName, { error: result.error, retriable: !!result.retriable, ts: Date.now(), fp: oldFp });
       logActivity('refresh-failed', { account: accountLabel, error: result.error, retriable: !!result.retriable });
       return { ok: false, error: result.error };
     }
@@ -3215,7 +3284,8 @@ async function refreshSweep(label = 'refresh-bg') {
         await refreshAccountToken(acct.name);
       } catch (e) {
         log(label, `${acct.label || acct.name}: background refresh error: ${e.message}`);
-        refreshFailures.set(acct.name, { error: e.message, retriable: true, ts: Date.now() });
+        const failFp = getFingerprintFromToken(acct.token);
+        refreshFailures.set(acct.name, { error: e.message, retriable: true, ts: Date.now(), fp: failFp });
         logActivity('refresh-failed', { account: acct.label || acct.name, error: e.message, retriable: true });
       }
     }
@@ -3399,7 +3469,7 @@ function createUsageExtractor() {
 // ─────────────────────────────────────────────────
 
 const recentUsage = []; // { ts, inputTokens, outputTokens, model, account, claimed }
-const RECENT_USAGE_MAX = 100;
+const RECENT_USAGE_MAX = 2000;
 
 function recordUsage(usage, account) {
   if (!usage || (!usage.inputTokens && !usage.outputTokens)) return;
@@ -3430,6 +3500,71 @@ function claimUsageInRange(startTs, endTs) {
 // ─────────────────────────────────────────────────
 
 const pendingSessions = new Map(); // session_id → { repo, branch, commitHash, startedAt }
+
+// Claim and persist usage for a session (used by auto-claim and stale pruning)
+function _autoClaimSession(sessionId, session) {
+  const claimed = claimUsageInRange(session.startedAt, Date.now());
+  for (const entry of claimed) {
+    appendTokenUsage({
+      ts: entry.ts,
+      repo: session.repo,
+      branch: session.branch,
+      commitHash: session.commitHash,
+      model: entry.model,
+      inputTokens: entry.inputTokens,
+      outputTokens: entry.outputTokens,
+      account: entry.account,
+    });
+  }
+  if (claimed.length > 0) {
+    log('tokens', `Auto-claimed ${claimed.length} entries for session ${sessionId.slice(0, 8)}…`);
+  }
+}
+
+// Periodically auto-persist unclaimed usage so the Tokens tab shows data
+// even for long-running sessions that haven't called session-stop yet.
+const TOKEN_AUTO_PERSIST_INTERVAL = 2 * 60 * 1000; // every 2 minutes
+setInterval(() => {
+  // For each active session, claim any unclaimed entries and persist them.
+  // Update startedAt so we don't double-count on next interval.
+  for (const [id, session] of pendingSessions) {
+    const now = Date.now();
+    const claimed = claimUsageInRange(session.startedAt, now);
+    for (const entry of claimed) {
+      appendTokenUsage({
+        ts: entry.ts,
+        repo: session.repo,
+        branch: session.branch,
+        commitHash: session.commitHash,
+        model: entry.model,
+        inputTokens: entry.inputTokens,
+        outputTokens: entry.outputTokens,
+        account: entry.account,
+      });
+    }
+    if (claimed.length > 0) {
+      session.startedAt = now; // advance so we don't re-claim
+      log('tokens', `Periodic persist: ${claimed.length} entries for session ${id.slice(0, 8)}…`);
+    }
+  }
+  // Also persist any unclaimed orphan entries (from before any session registered,
+  // or from sessions that were pruned). These get generic attribution.
+  const orphanAge = Date.now() - 3 * 60 * 1000; // older than 3 min
+  for (const entry of recentUsage) {
+    if (!entry.claimed && entry.ts < orphanAge) {
+      entry.claimed = true;
+      appendTokenUsage({
+        ts: entry.ts,
+        repo: '(unknown)',
+        branch: '(unknown)',
+        model: entry.model,
+        inputTokens: entry.inputTokens,
+        outputTokens: entry.outputTokens,
+        account: entry.account,
+      });
+    }
+  }
+}, TOKEN_AUTO_PERSIST_INTERVAL);
 
 // ─────────────────────────────────────────────────
 // [BETA] Token Usage Storage (token-usage.json)
@@ -3817,7 +3952,7 @@ async function handleProxyRequest(clientReq, clientRes) {
         refreshAttempted.add(acctName);
         log('refresh', `${acctName}: attempting token refresh after 401...`);
         try {
-          const refreshResult = await refreshAccountToken(acct.name);
+          const refreshResult = await refreshAccountToken(acct.name, { force: true });
           if (refreshResult.ok && !refreshResult.skipped) {
             log('refresh', `${acctName}: refresh succeeded, retrying request`);
             // Re-read the account to get new token
@@ -3940,7 +4075,7 @@ async function handleProxyRequest(clientReq, clientRes) {
           if (refreshAttempted.has(a.label || a.name)) continue;
           refreshAttempted.add(a.label || a.name);
           try {
-            await refreshAccountToken(a.name);
+            await refreshAccountToken(a.name, { force: true });
           } catch (e) {
             log('refresh', `${a.name}: bulk refresh failed: ${e.message}`);
           }
@@ -3960,7 +4095,7 @@ async function handleProxyRequest(clientReq, clientRes) {
         refreshAttempted.add(acctName);
         log('refresh', `${acctName}: attempting token refresh after 400...`);
         try {
-          const refreshResult = await refreshAccountToken(acct.name);
+          const refreshResult = await refreshAccountToken(acct.name, { force: true });
           if (refreshResult.ok && !refreshResult.skipped) {
             log('refresh', `${acctName}: refresh succeeded, retrying request`);
             invalidateAccountsCache();
