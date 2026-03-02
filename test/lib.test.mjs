@@ -299,6 +299,14 @@ describe('parseRefreshResponse', () => {
     assert.equal(result.retriable, false);
   });
 
+  it('stringifies object error fields instead of [object Object]', () => {
+    const body = JSON.stringify({ error: { type: 'invalid_grant', message: 'token revoked' } });
+    const result = parseRefreshResponse(400, body);
+    assert.equal(result.ok, false);
+    assert.ok(!result.error.includes('[object Object]'), `error should not contain [object Object]: ${result.error}`);
+    assert.ok(result.error.includes('invalid_grant'), `error should contain the error type: ${result.error}`);
+  });
+
   it('handles null refreshToken in response', () => {
     const body = JSON.stringify({ access_token: 'new-at', expires_in: 3600 });
     const result = parseRefreshResponse(200, body);

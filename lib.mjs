@@ -501,7 +501,8 @@ export function parseRefreshResponse(statusCode, bodyStr) {
   let error = `HTTP ${statusCode}`;
   try {
     const data = JSON.parse(bodyStr);
-    error = data.error_description || data.error || data.message || error;
+    const raw = data.error_description || data.error || data.message || error;
+    error = typeof raw === 'string' ? raw : JSON.stringify(raw);
   } catch {}
   return { ok: false, error, retriable };
 }
