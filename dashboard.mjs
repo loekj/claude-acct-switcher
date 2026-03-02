@@ -2670,31 +2670,36 @@ function renderRepoBranchBreakdown(data) {
   var allModels = {};
   for (var i = 0; i < data.length; i++) {
     var key = (data[i].repo || 'unknown') + '::' + (data[i].branch || 'unknown');
-    if (!map[key]) map[key] = { repo: data[i].repo || 'unknown', branch: data[i].branch || 'unknown', total: 0, models: {} };
-    var total = (data[i].inputTokens || 0) + (data[i].outputTokens || 0);
-    map[key].total += total;
+    if (!map[key]) map[key] = { repo: data[i].repo || 'unknown', branch: data[i].branch || 'unknown', totalIn: 0, totalOut: 0, models: {} };
+    var inTok = data[i].inputTokens || 0;
+    var outTok = data[i].outputTokens || 0;
+    map[key].totalIn += inTok;
+    map[key].totalOut += outTok;
     var m = data[i].model || 'unknown';
     allModels[m] = 1;
-    map[key].models[m] = (map[key].models[m] || 0) + total;
+    if (!map[key].models[m]) map[key].models[m] = { input: 0, output: 0 };
+    map[key].models[m].input += inTok;
+    map[key].models[m].output += outTok;
   }
-  var sorted = Object.values(map).sort(function(a,b) { return b.total - a.total; });
+  var sorted = Object.values(map).sort(function(a,b) { return (b.totalIn + b.totalOut) - (a.totalIn + a.totalOut); });
   var grandTotal = 0;
-  for (var j = 0; j < sorted.length; j++) grandTotal += sorted[j].total;
+  for (var j = 0; j < sorted.length; j++) grandTotal += sorted[j].totalIn + sorted[j].totalOut;
   if (!grandTotal) grandTotal = 1;
   var sortedAllModels = Object.keys(allModels).sort();
   var html = '';
   for (var k = 0; k < sorted.length; k++) {
     var item = sorted[k];
-    var pct = Math.round((item.total / grandTotal) * 100);
+    var itemTotal = item.totalIn + item.totalOut;
+    var pct = Math.round((itemTotal / grandTotal) * 100);
     var repoName = item.repo.split('/').pop();
-    var modelEntries = Object.entries(item.models).sort(function(a,b) { return b[1] - a[1]; });
+    var modelEntries = Object.entries(item.models).sort(function(a,b) { return (b[1].input + b[1].output) - (a[1].input + a[1].output); });
     var modelDetail = modelEntries.map(function(e) {
-      return '<span style="color:'+getModelColor(e[0], sortedAllModels)+'">'+escHtml(shortModel(e[0]))+'</span> '+formatNum(e[1]);
+      return '<span style="color:'+getModelColor(e[0], sortedAllModels)+'">'+escHtml(shortModel(e[0]))+'</span> '+formatNum(e[1].input)+' / '+formatNum(e[1].output);
     }).join(' \\u00b7 ');
     html += '<div class="tok-branch-row">' +
       '<div class="tok-branch-name">' + escHtml(repoName) + ' <span class="tok-branch-badge">' + escHtml(item.branch) + '</span></div>' +
       '<div class="tok-branch-stats">' +
-        '<span class="tok-branch-total">' + formatNum(item.total) + '</span>' +
+        '<span class="tok-branch-total">' + formatNum(item.totalIn) + ' / ' + formatNum(item.totalOut) + '</span>' +
         '<span class="tok-branch-pct">' + pct + '%</span>' +
       '</div>' +
       '<div class="tok-branch-detail">' + modelDetail + '</div>' +
