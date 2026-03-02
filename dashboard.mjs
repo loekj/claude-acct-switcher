@@ -3552,21 +3552,38 @@ setInterval(() => {
       log('tokens', `Periodic persist: ${claimed.length} entries for session ${id.slice(0, 8)}…`);
     }
   }
-  // Also persist any unclaimed orphan entries (from before any session registered,
-  // or from sessions that were pruned). These get generic attribution.
-  const orphanAge = Date.now() - 3 * 60 * 1000; // older than 3 min
-  for (const entry of recentUsage) {
-    if (!entry.claimed && entry.ts < orphanAge) {
-      entry.claimed = true;
-      appendTokenUsage({
-        ts: entry.ts,
-        repo: '(unknown)',
-        branch: '(unknown)',
-        model: entry.model,
-        inputTokens: entry.inputTokens,
-        outputTokens: entry.outputTokens,
-        account: entry.account,
-      });
+  // Attribute remaining unclaimed entries to the best-matching active session
+  // (by timestamp overlap), or skip if no sessions exist yet. Only fall back to
+  // (unknown) for entries that are very old and clearly orphaned.
+  if (pendingSessions.size > 0) {
+    for (const entry of recentUsage) {
+      if (entry.claimed) continue;
+      // Find the session whose startedAt is closest to (but before) this entry
+      let bestSession = null;
+      for (const [, s] of pendingSessions) {
+        if (entry.ts >= s.startedAt) {
+          if (!bestSession || s.startedAt > bestSession.startedAt) bestSession = s;
+        }
+      }
+      if (!bestSession) {
+        // Entry is older than all sessions — attribute to the oldest session
+        for (const [, s] of pendingSessions) {
+          if (!bestSession || s.startedAt < bestSession.startedAt) bestSession = s;
+        }
+      }
+      if (bestSession) {
+        entry.claimed = true;
+        appendTokenUsage({
+          ts: entry.ts,
+          repo: bestSession.repo,
+          branch: bestSession.branch,
+          commitHash: bestSession.commitHash,
+          model: entry.model,
+          inputTokens: entry.inputTokens,
+          outputTokens: entry.outputTokens,
+          account: entry.account,
+        });
+      }
     }
   }
 }, TOKEN_AUTO_PERSIST_INTERVAL);
