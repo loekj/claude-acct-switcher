@@ -3552,40 +3552,9 @@ setInterval(() => {
       log('tokens', `Periodic persist: ${claimed.length} entries for session ${id.slice(0, 8)}…`);
     }
   }
-  // Attribute remaining unclaimed entries to the best-matching active session
-  // (by timestamp overlap), or skip if no sessions exist yet. Only fall back to
-  // (unknown) for entries that are very old and clearly orphaned.
-  if (pendingSessions.size > 0) {
-    for (const entry of recentUsage) {
-      if (entry.claimed) continue;
-      // Find the session whose startedAt is closest to (but before) this entry
-      let bestSession = null;
-      for (const [, s] of pendingSessions) {
-        if (entry.ts >= s.startedAt) {
-          if (!bestSession || s.startedAt > bestSession.startedAt) bestSession = s;
-        }
-      }
-      if (!bestSession) {
-        // Entry is older than all sessions — attribute to the oldest session
-        for (const [, s] of pendingSessions) {
-          if (!bestSession || s.startedAt < bestSession.startedAt) bestSession = s;
-        }
-      }
-      if (bestSession) {
-        entry.claimed = true;
-        appendTokenUsage({
-          ts: entry.ts,
-          repo: bestSession.repo,
-          branch: bestSession.branch,
-          commitHash: bestSession.commitHash,
-          model: entry.model,
-          inputTokens: entry.inputTokens,
-          outputTokens: entry.outputTokens,
-          account: entry.account,
-        });
-      }
-    }
-  }
+  // Unclaimed entries outside any session's time range are left in the ring
+  // buffer — they'll be claimed by session-stop, or age out naturally.
+  // No (unknown) attribution: better to lose data than misattribute it.
 }, TOKEN_AUTO_PERSIST_INTERVAL);
 
 // ─────────────────────────────────────────────────
