@@ -201,24 +201,31 @@ describe('createAccountStateManager', () => {
 // ─────────────────────────────────────────────────
 
 describe('buildRefreshRequestBody', () => {
-  it('builds URL-encoded body with grant_type and refresh_token', () => {
+  it('builds JSON body with grant_type and refresh_token', () => {
     const body = buildRefreshRequestBody('rt-abc123');
-    const params = new URLSearchParams(body);
-    assert.equal(params.get('grant_type'), 'refresh_token');
-    assert.equal(params.get('refresh_token'), 'rt-abc123');
-    assert.equal(params.get('client_id'), null);
+    const parsed = JSON.parse(body);
+    assert.equal(parsed.grant_type, 'refresh_token');
+    assert.equal(parsed.refresh_token, 'rt-abc123');
+    assert.equal(parsed.client_id, undefined);
+    assert.equal(parsed.scope, undefined);
   });
 
   it('includes client_id when provided', () => {
     const body = buildRefreshRequestBody('rt-abc123', 'my-client');
-    const params = new URLSearchParams(body);
-    assert.equal(params.get('client_id'), 'my-client');
+    const parsed = JSON.parse(body);
+    assert.equal(parsed.client_id, 'my-client');
+  });
+
+  it('includes scope when provided', () => {
+    const body = buildRefreshRequestBody('rt-abc123', 'my-client', 'user:profile user:inference');
+    const parsed = JSON.parse(body);
+    assert.equal(parsed.scope, 'user:profile user:inference');
   });
 
   it('handles special characters in refresh token', () => {
     const body = buildRefreshRequestBody('rt-abc+123/foo=bar');
-    const params = new URLSearchParams(body);
-    assert.equal(params.get('refresh_token'), 'rt-abc+123/foo=bar');
+    const parsed = JSON.parse(body);
+    assert.equal(parsed.refresh_token, 'rt-abc+123/foo=bar');
   });
 });
 
