@@ -466,14 +466,13 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval =
 // ─────────────────────────────────────────────────
 
 /**
- * Build URL-encoded POST body for the OAuth token refresh endpoint.
+ * Build JSON POST body for the OAuth token refresh endpoint.
  */
-export function buildRefreshRequestBody(refreshToken, clientId) {
-  const params = new URLSearchParams();
-  params.set('grant_type', 'refresh_token');
-  params.set('refresh_token', refreshToken);
-  if (clientId) params.set('client_id', clientId);
-  return params.toString();
+export function buildRefreshRequestBody(refreshToken, clientId, scope) {
+  const body = { grant_type: 'refresh_token', refresh_token: refreshToken };
+  if (clientId) body.client_id = clientId;
+  if (scope) body.scope = scope;
+  return JSON.stringify(body);
 }
 
 /**

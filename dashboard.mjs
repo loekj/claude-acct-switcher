@@ -3096,7 +3096,9 @@ function withSwitchLock(fn) {
 // OAuth Token Refresh
 // ─────────────────────────────────────────────────
 
-const OAUTH_TOKEN_URL = process.env.OAUTH_TOKEN_URL || 'https://console.anthropic.com/v1/oauth/token';
+const OAUTH_TOKEN_URL = process.env.OAUTH_TOKEN_URL || 'https://platform.claude.com/v1/oauth/token';
+const OAUTH_CLIENT_ID = process.env.OAUTH_CLIENT_ID || '9d1c250a-e61b-44d9-88ed-5944d1962f5e';
+const OAUTH_DEFAULT_SCOPES = 'user:profile user:inference user:sessions:claude_code user:mcp_servers';
 const REFRESH_BUFFER_MS = 60 * 60 * 1000; // 1 hour
 const REFRESH_CHECK_INTERVAL = 5 * 60 * 1000; // 5 minutes
 const REFRESH_MAX_RETRIES = 3;
@@ -3121,9 +3123,12 @@ async function atomicWriteAccountFile(name, creds) {
 /**
  * Call the OAuth refresh endpoint. Returns parsed result via parseRefreshResponse.
  */
-function callRefreshEndpoint(refreshToken) {
+function callRefreshEndpoint(refreshToken, scopes) {
   return new Promise((resolve) => {
-    const body = buildRefreshRequestBody(refreshToken);
+    const scope = scopes
+      ? scopes.replace(/,/g, ' ')   // credential files store comma-separated
+      : OAUTH_DEFAULT_SCOPES;
+    const body = buildRefreshRequestBody(refreshToken, OAUTH_CLIENT_ID, scope);
     const parsed = new URL(OAUTH_TOKEN_URL);
     const isHttp = parsed.protocol === 'http:';
     const mod = isHttp ? http : https;
@@ -3135,7 +3140,7 @@ function callRefreshEndpoint(refreshToken) {
       path: parsed.pathname + parsed.search,
       method: 'POST',
       headers: {
-        'Content-Type': 'application/x-www-form-urlencoded',
+        'Content-Type': 'application/json',
         'Content-Length': Buffer.byteLength(body),
       },
       timeout: 10000,
@@ -3249,7 +3254,7 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
     // 4. Call OAuth endpoint with retry + exponential backoff
     let result;
     for (let attempt = 0; attempt < REFRESH_MAX_RETRIES; attempt++) {
-      result = await callRefreshEndpoint(oauth.refreshToken);
+      result = await callRefreshEndpoint(oauth.refreshToken, oauth.scopes);
       if (result.ok) break;
       if (!result.retriable) break;
       // Exponential backoff: 1s, 2s, 4s
