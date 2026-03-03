@@ -825,7 +825,22 @@ async function handleAPI(req, res) {
     const body = await readBody(req);
     const patch = JSON.parse(body);
     if (typeof patch.autoSwitch === 'boolean') settings.autoSwitch = patch.autoSwitch;
-    if (typeof patch.proxyEnabled === 'boolean') settings.proxyEnabled = patch.proxyEnabled;
+    if (typeof patch.proxyEnabled === 'boolean') {
+      const wasEnabled = settings.proxyEnabled;
+      settings.proxyEnabled = patch.proxyEnabled;
+      if (wasEnabled !== patch.proxyEnabled) {
+        // Reset error state on proxy toggle for a clean slate
+        _consecutive400s = 0;
+        _consecutive400sAt = 0;
+        _circuitOpen = false;
+        _consecutiveExhausted = 0;
+        if (patch.proxyEnabled) {
+          log('info', 'Proxy re-enabled — clean state');
+        } else {
+          log('info', 'Proxy disabled — error state reset');
+        }
+      }
+    }
     if (typeof patch.notifications === 'boolean') settings.notifications = patch.notifications;
     if (typeof patch.rotationStrategy === 'string' && ROTATION_STRATEGIES[patch.rotationStrategy]) {
       settings.rotationStrategy = patch.rotationStrategy;
@@ -1759,6 +1774,7 @@ function renderHTML() {
     <button class="tab" onclick="switchTab('activity')">Activity</button>
     <button class="tab" onclick="switchTab('usage')">Usage</button>
     <button class="tab" onclick="switchTab('config')">Config</button>
+    <button class="tab" onclick="switchTab('logs')">Logs</button>
   </div>
 
   <div id="tab-accounts" class="tab-content active">
@@ -1913,6 +1929,14 @@ function renderHTML() {
     </div>
   </div>
 
+  <div id="tab-logs" class="tab-content">
+    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
+      <div style="font-size:0.8125rem;color:var(--muted)" id="log-status">Disconnected</div>
+      <button onclick="clearLogs()" style="background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:0.25rem 0.75rem;border-radius:6px;cursor:pointer;font-size:0.75rem">Clear</button>
+    </div>
+    <div id="log-container" style="background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:0.75rem;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:0.75rem;line-height:1.5;height:calc(100vh - 220px);overflow-y:auto;color:#c9d1d9"></div>
+  </div>
+
 </div>
 
 <div id="toast" class="toast"></div>
@@ -1924,6 +1948,7 @@ function switchTab(id) {
   document.getElementById('tab-' + id).classList.add('active');
   document.querySelector('.tab[onclick*="' + id + '"]').classList.add('active');
   if (id === 'usage') refreshTokens();
+  if (id === 'logs') connectLogStream();
 }
 
 function formatNum(n) {
@@ -2822,6 +2847,50 @@ refresh();
 loadSettingsUI();
 setInterval(refresh, 5000);
 setInterval(tickCountdowns, 1000);
+
+// ── Log stream ──
+let _logES = null;
+const LOG_MAX_LINES = 500;
+const LOG_TAG_COLORS = {
+  error: '#f85149', warn: '#f85149',
+  switch: '#d29922', proactive: '#d29922',
+  refresh: '#58a6ff', circuit: '#58a6ff', fallback: '#58a6ff',
+  info: '#8b949e', system: '#8b949e',
+};
+
+function connectLogStream() {
+  if (_logES) return; // already connected
+  const container = document.getElementById('log-container');
+  const status = document.getElementById('log-status');
+  status.textContent = 'Connecting...';
+  _logES = new EventSource('/api/logs/stream');
+  _logES.onopen = () => { status.textContent = 'Connected'; status.style.color = '#3fb950'; };
+  _logES.onerror = () => { status.textContent = 'Reconnecting...'; status.style.color = '#f85149'; };
+  _logES.onmessage = (ev) => {
+    try {
+      const data = JSON.parse(ev.data);
+      const line = document.createElement('div');
+      const tag = (data.tag || 'info').toLowerCase();
+      const color = LOG_TAG_COLORS[tag] || '#8b949e';
+      line.innerHTML = '<span style="color:' + color + ';font-weight:600">[' + tag.toUpperCase() + ']</span> ' + escapeHtml(data.msg || data.line || '');
+      container.appendChild(line);
+      // Prune oldest lines
+      while (container.childElementCount > LOG_MAX_LINES) container.removeChild(container.firstChild);
+      // Auto-scroll unless user scrolled up
+      const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 60;
+      if (atBottom) container.scrollTop = container.scrollHeight;
+    } catch {}
+  };
+}
+
+function clearLogs() {
+  const container = document.getElementById('log-container');
+  container.innerHTML = '';
+}
+
+function escapeHtml(s) {
+  return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
 </script>
 <footer style="text-align:center;padding:2rem 0 1rem;font-size:0.75rem;color:#9ca3af;line-height:1.8">
   <div>🤙 Vibe coded with love by LJ</div>
@@ -3144,6 +3213,67 @@ function drainResponse(res) {
   });
 }
 
+// ── Empty-body 400 detection ──
+// The Anthropic API returns "400 with no body" when OAuth tokens are
+// null/expired.  Legitimate 400s always include a JSON error body.
+function isEmptyBody400(statusCode, bodyBuffer) {
+  return statusCode === 400 && (!bodyBuffer || bodyBuffer.length === 0);
+}
+
+// ── Smart passthrough ──
+// Shared logic for proxy-disabled and circuit-breaker passthrough modes.
+// 1. Forward to Anthropic with provided auth
+// 2. If 400-empty-body → read fresh token from keychain (bypass cache), retry
+// 3. If still 400-empty-body → return 401 to trigger Claude Code re-auth
+// 4. Otherwise → forward response as-is
+async function _smartPassthrough(clientReq, clientRes, body, fwd, label) {
+  const res = await forwardToAnthropic(clientReq.method, clientReq.url, fwd, body, PROXY_TIMEOUT);
+  // Drain body to inspect for empty-body 400
+  const resBuf = await drainResponse(res);
+  if (isEmptyBody400(res.statusCode, resBuf)) {
+    log('fallback', `${label}: 400-empty-body detected — trying fresh keychain token`);
+    // Bypass cache: read directly from keychain
+    invalidateTokenCache();
+    const freshCreds = readKeychain();
+    const freshToken = freshCreds?.claudeAiOauth?.accessToken;
+    if (freshToken && freshToken !== fwd['authorization']?.replace(/^Bearer\s+/i, '')) {
+      const retryFwd = { ...fwd, authorization: `Bearer ${freshToken}` };
+      retryFwd['content-length'] = String(body.length);
+      try {
+        const retryRes = await forwardToAnthropic(clientReq.method, clientReq.url, retryFwd, body, 15_000);
+        const retryBuf = await drainResponse(retryRes);
+        if (!isEmptyBody400(retryRes.statusCode, retryBuf)) {
+          // Fresh token worked — forward the response
+          if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) return;
+          const hdrs = { ...retryRes.headers };
+          if (retryBuf.length) hdrs['content-length'] = String(retryBuf.length);
+          clientRes.writeHead(retryRes.statusCode, hdrs);
+          clientRes.end(retryBuf);
+          return;
+        }
+        log('fallback', `${label}: fresh token also got 400-empty-body`);
+      } catch (e) {
+        log('error', `${label}: fresh-token retry failed: ${e.message}`);
+      }
+    }
+    // All tokens stale → convert to 401 so Claude Code re-authenticates
+    log('fallback', `${label}: converting 400-empty-body → 401 to trigger re-auth`);
+    if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) return;
+    clientRes.writeHead(401, { 'Content-Type': 'application/json' });
+    clientRes.end(JSON.stringify({
+      type: 'error',
+      error: { type: 'authentication_error', message: 'Token expired (proxy: empty-body 400 converted to 401)' },
+    }));
+    return;
+  }
+  // Normal response (non-empty or non-400) — forward as-is
+  if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) return;
+  const hdrs = { ...res.headers };
+  if (resBuf.length) hdrs['content-length'] = String(resBuf.length);
+  clientRes.writeHead(res.statusCode, hdrs);
+  clientRes.end(resBuf);
+}
+
 // ── Passthrough fallback ──
 // When all proxy recovery strategies fail, forward the request with the
 // ORIGINAL client authorization header.  This lets Claude Code reach the
@@ -3167,17 +3297,54 @@ async function _passthroughFallback(clientReq, clientRes, body, reason) {
     log('fallback', `Proxy recovery exhausted (${reason}) — passthrough with original auth`);
     // Short timeout: we've already spent time on recovery, don't stall further
     const res = await forwardToAnthropic(clientReq.method, clientReq.url, fwd, body, 15_000);
+    // Drain body to check for empty-body 400
+    const resBuf = await drainResponse(res);
+    if (isEmptyBody400(res.statusCode, resBuf)) {
+      log('fallback', `Passthrough (${reason}): 400-empty-body — trying fresh keychain token`);
+      invalidateTokenCache();
+      const freshCreds = readKeychain();
+      const freshToken = freshCreds?.claudeAiOauth?.accessToken;
+      if (freshToken && freshToken !== fwd['authorization']?.replace(/^Bearer\s+/i, '')) {
+        const retryFwd = { ...fwd, authorization: `Bearer ${freshToken}` };
+        retryFwd['content-length'] = String(body.length);
+        try {
+          const retryRes = await forwardToAnthropic(clientReq.method, clientReq.url, retryFwd, body, 15_000);
+          const retryBuf = await drainResponse(retryRes);
+          if (!isEmptyBody400(retryRes.statusCode, retryBuf)) {
+            if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) return false;
+            const hdrs = { ...retryRes.headers };
+            if (retryBuf.length) hdrs['content-length'] = String(retryBuf.length);
+            clientRes.writeHead(retryRes.statusCode, hdrs);
+            clientRes.end(retryBuf);
+            _consecutiveExhausted = 0;
+            if (retryRes.statusCode < 400) _consecutive400s = 0;
+            return true;
+          }
+        } catch (e) {
+          log('error', `Passthrough fresh-token retry failed (${reason}): ${e.message}`);
+        }
+      }
+      // Convert to 401 so Claude Code re-authenticates
+      log('fallback', `Passthrough (${reason}): converting 400-empty-body → 401 to trigger re-auth`);
+      if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) return false;
+      clientRes.writeHead(401, { 'Content-Type': 'application/json' });
+      clientRes.end(JSON.stringify({
+        type: 'error',
+        error: { type: 'authentication_error', message: 'Token expired (proxy: empty-body 400 converted to 401)' },
+      }));
+      _consecutiveExhausted = 0;
+      return true; // we delivered a response (401)
+    }
     // Forward whatever the upstream returns — even errors.
     // A standard 401 from the real API lets Claude Code re-authenticate,
     // which is far better than a proxy 502 that kills the session.
     if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) {
-      res.destroy();
       return false;
     }
-    clientRes.writeHead(res.statusCode, res.headers);
-    res.on('error', () => { try { clientRes.end(); } catch {} });
-    clientRes.on('close', () => { res.destroy(); });
-    await pipeAndWait(res, clientRes);
+    const hdrs = { ...res.headers };
+    if (resBuf.length) hdrs['content-length'] = String(resBuf.length);
+    clientRes.writeHead(res.statusCode, hdrs);
+    clientRes.end(resBuf);
     // Passthrough delivered a response — reset failure counters
     _consecutiveExhausted = 0;
     if (res.statusCode < 400) _consecutive400s = 0;
@@ -3873,34 +4040,26 @@ async function handleProxyRequest(clientReq, clientRes) {
     return;
   }
 
-  // ── Proxy disabled: pure passthrough ──
+  // ── Proxy disabled: smart passthrough ──
+  // Buffers the body so we can detect 400-empty-body and retry with a fresh
+  // keychain token or convert to 401 for Claude Code re-auth.
   if (!settings.proxyEnabled) {
+    const bodyChunks = [];
+    await new Promise((resolve, reject) => {
+      clientReq.on('data', c => bodyChunks.push(c));
+      clientReq.on('end', resolve);
+      clientReq.on('error', reject);
+    });
+    const body = Buffer.concat(bodyChunks);
     const fwd = stripHopByHopHeaders(clientReq.headers);
     fwd['host'] = 'api.anthropic.com';
-    // Restore content-length: passthrough pipes the body as-is (not re-buffered),
-    // so the original framing must be preserved to avoid an implicit chunked switch.
-    if (clientReq.headers['content-length']) {
-      fwd['content-length'] = clientReq.headers['content-length'];
-    }
+    fwd['content-length'] = String(body.length);
     // Ensure OAuth beta flag is present (required for OAuth tokens)
     const betas = (fwd['anthropic-beta'] || '').split(',').map(s => s.trim()).filter(Boolean);
     if (!betas.includes('oauth-2025-04-20')) betas.push('oauth-2025-04-20');
     fwd['anthropic-beta'] = betas.join(',');
     try {
-      const proxyRes = await new Promise((resolve, reject) => {
-        const req = https.request({
-          hostname: 'api.anthropic.com', port: 443,
-          path: clientReq.url, method: clientReq.method,
-          headers: fwd, timeout: PROXY_TIMEOUT,
-        }, resolve);
-        req.on('error', reject);
-        req.on('timeout', () => req.destroy(new Error('upstream timeout')));
-        clientReq.pipe(req);
-      });
-      clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
-      clientReq.on('close', () => { proxyRes.destroy(); });
-      await pipeAndWait(proxyRes, clientRes);
+      await _smartPassthrough(clientReq, clientRes, body, fwd, 'proxy-disabled');
     } catch (err) {
       if (!clientRes.headersSent) {
         clientRes.writeHead(502, { 'Content-Type': 'application/json' });
@@ -3914,31 +4073,23 @@ async function handleProxyRequest(clientReq, clientRes) {
   // When open, skip all proxy logic and forward directly to Anthropic.
   // This lets Claude Code's own auth / re-auth work normally.
   if (_isCircuitOpen()) {
-    log('circuit', 'Circuit breaker open — passthrough');
+    log('circuit', 'Circuit breaker open — smart passthrough');
+    const bodyChunks = [];
+    await new Promise((resolve, reject) => {
+      clientReq.on('data', c => bodyChunks.push(c));
+      clientReq.on('end', resolve);
+      clientReq.on('error', reject);
+    });
+    const body = Buffer.concat(bodyChunks);
     const fwd = stripHopByHopHeaders(clientReq.headers);
     fwd['host'] = 'api.anthropic.com';
-    if (clientReq.headers['content-length']) {
-      fwd['content-length'] = clientReq.headers['content-length'];
-    }
+    fwd['content-length'] = String(body.length);
     // Ensure OAuth beta flag is present (required for OAuth tokens)
     const betas = (fwd['anthropic-beta'] || '').split(',').map(s => s.trim()).filter(Boolean);
     if (!betas.includes('oauth-2025-04-20')) betas.push('oauth-2025-04-20');
     fwd['anthropic-beta'] = betas.join(',');
     try {
-      const proxyRes = await new Promise((resolve, reject) => {
-        const req = https.request({
-          hostname: 'api.anthropic.com', port: 443,
-          path: clientReq.url, method: clientReq.method,
-          headers: fwd, timeout: PROXY_TIMEOUT,
-        }, resolve);
-        req.on('error', reject);
-        req.on('timeout', () => req.destroy(new Error('upstream timeout')));
-        clientReq.pipe(req);
-      });
-      clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
-      proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
-      clientReq.on('close', () => { proxyRes.destroy(); });
-      await pipeAndWait(proxyRes, clientRes);
+      await _smartPassthrough(clientReq, clientRes, body, fwd, 'circuit-breaker');
     } catch (err) {
       if (!clientRes.headersSent) {
         clientRes.writeHead(502, { 'Content-Type': 'application/json' });
@@ -4471,12 +4622,14 @@ async function handleProxyRequest(clientReq, clientRes) {
         clientRes.writeHead(400, proxyRes.headers);
         clientRes.end(bodyBuf);
       } else {
-        clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+        // Empty body = auth failure — return 401 to trigger Claude Code re-auth
+        log('fallback', 'Final fallback: converting empty-body 400 → 401 to trigger re-auth');
+        clientRes.writeHead(401, { 'Content-Type': 'application/json' });
         clientRes.end(JSON.stringify({
           type: 'error',
           error: {
-            type: 'proxy_error',
-            message: `Upstream returned 400 on all accounts after all recovery strategies. Check proxy logs.`,
+            type: 'authentication_error',
+            message: 'Token expired (proxy: empty-body 400 converted to 401 after all recovery strategies)',
           },
         }));
       }
