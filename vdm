@@ -557,12 +557,29 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
   echo ""
   echo -e "  ${BOLD}Settings${NC}"
   echo -e "  ────────────────────────────────"
-  echo -e "  Proxy:         ${proxy_on:+${GREEN}ON${NC}}${proxy_on:-${DIM}OFF${NC}}"
-  echo -e "  Auto-switch:   ${auto_on:+${GREEN}ON${NC}}${auto_on:-${DIM}OFF${NC}}"
-  echo -e "  Notifications: ${notifs:+${GREEN}ON${NC}}${notifs:-${DIM}OFF${NC}}"
+  if [[ "$proxy_on" == "True" ]]; then
+    echo -e "  Proxy:         ${GREEN}ON${NC}"
+  else
+    echo -e "  Proxy:         ${DIM}OFF${NC}"
+  fi
+  if [[ "$auto_on" == "True" ]]; then
+    echo -e "  Auto-switch:   ${GREEN}ON${NC}"
+  else
+    echo -e "  Auto-switch:   ${DIM}OFF${NC}"
+  fi
+  if [[ "$notifs" == "True" ]]; then
+    echo -e "  Notifications: ${GREEN}ON${NC}"
+  else
+    echo -e "  Notifications: ${DIM}OFF${NC}"
+  fi
   echo -e "  Rotation:      ${CYAN}${strategy:-sticky}${NC}"
   if [[ "${strategy:-sticky}" == "round-robin" ]]; then
     echo -e "  Interval:      ${interval:-60} min"
+  fi
+
+  # Version
+  if [[ -f "$SCRIPT_DIR/.version" ]]; then
+    echo -e "  Version:       ${DIM}$(cat "$SCRIPT_DIR/.version")${NC}"
   fi
   echo ""
 }

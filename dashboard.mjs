@@ -14,6 +14,11 @@ import { Transform } from 'node:stream';
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
 
+// Prevent EIO/EPIPE on stdout/stderr from crashing the process when
+// running as a background daemon (terminal closed, pipe broken).
+process.stdout?.on?.('error', () => {});
+process.stderr?.on?.('error', () => {});
+
 const PORT = parseInt(process.env.CSW_PORT || '3333', 10);
 const ACCOUNTS_DIR = join(__dirname, 'accounts');
 const STATS_CACHE = join(process.env.HOME, '.claude', 'stats-cache.json');
@@ -2979,9 +2984,9 @@ const _logSubscribers = new Set();
 function log(tag, msg, extra = '') {
   const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
   const line = `[${ts}] [${tag}] ${msg}${extra ? ' ' + extra : ''}`;
-  console.log(line);
-  // Push to all SSE subscribers
-  for (const res of _logSubscribers) {
+  try { console.log(line); } catch { /* stdout broken (EIO/EPIPE) — ignore */ }
+  // Push to all SSE subscribers (these still work even when stdout is dead)
+  for (const res of [..._logSubscribers]) {
     try { res.write(`data: ${JSON.stringify({ ts, tag, msg: msg + (extra ? ' ' + extra : ''), line })}\n\n`); }
     catch { _logSubscribers.delete(res); }
   }
@@ -4747,13 +4752,19 @@ function shutdown(signal) {
 }
 process.on('SIGTERM', () => shutdown('SIGTERM'));
 process.on('SIGINT', () => shutdown('SIGINT'));
+let _inExceptionHandler = false;
 process.on('uncaughtException', (err) => {
-  log('fatal', `Uncaught exception: ${err.message}`);
-  log('fatal', err.stack);
+  if (_inExceptionHandler) return;        // break recursive EIO death spiral
+  _inExceptionHandler = true;
+  try {
+    log('fatal', `Uncaught exception: ${err.message}`);
+    log('fatal', err.stack);
+  } catch { /* if even log() fails, swallow — keeping process alive is paramount */ }
+  _inExceptionHandler = false;
   // Keep running  - the proxy is more useful alive with a logged error
 });
 process.on('unhandledRejection', (reason) => {
-  log('fatal', `Unhandled rejection: ${reason}`);
+  try { log('fatal', `Unhandled rejection: ${reason}`); } catch { /* swallow */ }
 });
 
 proxyServer.listen(PROXY_PORT, () => {
