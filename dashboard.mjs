@@ -915,6 +915,7 @@ async function handleAPI(req, res) {
           commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
         } catch { /* not a git repo */ }
         pendingSessions.set(sessionId, { repo, branch, commitHash, cwd, startedAt: Date.now() });
+        ensureLocalCommitHook(cwd);
         log('tokens', `Session started: ${sessionId.slice(0, 8)}… (${basename(repo)}/${branch})`);
       } else {
         // Re-read branch on subsequent prompts (handles worktree branch switches)
@@ -3816,6 +3817,68 @@ function createUsageExtractor() {
   });
 
   return extractor;
+}
+
+// ─────────────────────────────────────────────────
+// [BETA] Ensure prepare-commit-msg hook in repos with local core.hooksPath
+// ─────────────────────────────────────────────────
+
+const _hookedRepoPaths = new Set(); // avoid re-checking the same repo
+
+function ensureLocalCommitHook(cwd) {
+  try {
+    if (!settings.commitTokenUsage) return;
+    // Check for local core.hooksPath override
+    let localHooksPath;
+    try {
+      localHooksPath = execSync(`git -C "${cwd}" config --local core.hooksPath 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+    } catch { return; } // no local override
+    if (!localHooksPath) return;
+
+    // Resolve relative paths
+    let repoRoot;
+    try {
+      repoRoot = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+    } catch { return; }
+
+    const resolvedLocal = localHooksPath.startsWith('/') ? localHooksPath : join(repoRoot, localHooksPath);
+
+    // Skip if already checked this repo
+    if (_hookedRepoPaths.has(resolvedLocal)) return;
+    _hookedRepoPaths.add(resolvedLocal);
+
+    // Check for global hooks path
+    let globalHooksPath;
+    try {
+      globalHooksPath = execSync('git config --global core.hooksPath 2>/dev/null', { encoding: 'utf8', timeout: 3000 }).trim();
+    } catch { return; }
+    if (!globalHooksPath) return;
+    globalHooksPath = globalHooksPath.replace(/^~/, process.env.HOME || '');
+
+    // If local == global, no problem
+    if (resolvedLocal === globalHooksPath) return;
+
+    // Read the global hook content
+    const globalHookFile = join(globalHooksPath, 'prepare-commit-msg');
+    if (!existsSync(globalHookFile)) return;
+    const globalHookContent = readFileSync(globalHookFile, 'utf8');
+    if (!globalHookContent.includes('vdm-token-usage')) return;
+
+    // Check if local hook already has our marker
+    const localHookFile = join(resolvedLocal, 'prepare-commit-msg');
+    if (existsSync(localHookFile)) {
+      const existing = readFileSync(localHookFile, 'utf8');
+      if (existing.includes('vdm-token-usage')) return; // already installed
+      // Back up existing hook
+      try { renameSync(localHookFile, localHookFile + '.vdm-original'); } catch {}
+    }
+
+    // Copy global hook to local hooks dir
+    mkdirSync(resolvedLocal, { recursive: true });
+    writeFileSync(localHookFile, globalHookContent);
+    try { execSync(`chmod +x "${localHookFile}"`, { timeout: 2000 }); } catch {}
+    log('tokens', `Installed commit hook in ${resolvedLocal} (local hooksPath override detected)`);
+  } catch { /* silent — best effort */ }
 }
 
 // ─────────────────────────────────────────────────
