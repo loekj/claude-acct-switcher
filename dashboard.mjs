@@ -3125,9 +3125,9 @@ async function atomicWriteAccountFile(name, creds) {
  */
 function callRefreshEndpoint(refreshToken, scopes) {
   return new Promise((resolve) => {
-    const scope = scopes
-      ? scopes.replace(/,/g, ' ')   // credential files store comma-separated
-      : OAUTH_DEFAULT_SCOPES;
+    const scope = Array.isArray(scopes)
+      ? scopes.join(' ')
+      : (typeof scopes === 'string' ? scopes.replace(/,/g, ' ') : OAUTH_DEFAULT_SCOPES);
     const body = buildRefreshRequestBody(refreshToken, OAUTH_CLIENT_ID, scope);
     const parsed = new URL(OAUTH_TOKEN_URL);
     const isHttp = parsed.protocol === 'http:';
