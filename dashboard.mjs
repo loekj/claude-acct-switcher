@@ -39,6 +39,15 @@ function detectClaudeCodeVersion() {
 }
 const CLAUDE_CODE_VERSION = detectClaudeCodeVersion();
 
+// Project version — derived from the latest git tag at startup
+function detectProjectVersion() {
+  try {
+    return execSync('git describe --tags --abbrev=0 2>/dev/null', { encoding: 'utf8', timeout: 3000 }).trim();
+  } catch {}
+  return 'dev';
+}
+const PROJECT_VERSION = detectProjectVersion();
+
 // Auto-detect keychain service name for robustness against Claude Code updates.
 // Falls back to the known default if detection fails.
 function detectKeychainService() {
@@ -1920,7 +1929,7 @@ function renderHTML() {
         <div class="config-section-title">Commit Tokens</div>
         <div class="config-row">
           <div class="config-info">
-            <div class="config-label">Token-Usage commit trailer</div>
+            <div class="config-label">Token-Usage commit trailer <span style="font-size:0.625rem;background:var(--primary);color:#fff;padding:0.1rem 0.35rem;border-radius:4px;vertical-align:middle;font-weight:600;letter-spacing:0.03em">BETA</span></div>
             <div class="config-desc">Append a Token-Usage trailer to commit messages showing tokens consumed since the last commit</div>
           </div>
           <input type="checkbox" class="sw" id="toggle-commit-tokens" onchange="toggleSetting('commitTokenUsage', this.checked)">
@@ -1949,6 +1958,9 @@ function switchTab(id) {
   document.querySelector('.tab[onclick*="' + id + '"]').classList.add('active');
   if (id === 'usage') refreshTokens();
   if (id === 'logs') connectLogStream();
+  const url = new URL(location);
+  url.searchParams.set('tab', id);
+  history.replaceState(null, '', url);
 }
 
 function formatNum(n) {
@@ -2847,6 +2859,9 @@ refresh();
 loadSettingsUI();
 setInterval(refresh, 5000);
 setInterval(tickCountdowns, 1000);
+// Restore tab from URL query param
+const _initTab = new URLSearchParams(location.search).get('tab');
+if (_initTab && document.getElementById('tab-' + _initTab)) switchTab(_initTab);
 
 // ── Log stream ──
 let _logES = null;
@@ -2893,7 +2908,7 @@ function escapeHtml(s) {
 }
 </script>
 <footer style="text-align:center;padding:2rem 0 1rem;font-size:0.75rem;color:#9ca3af;line-height:1.8">
-  <div>🤙 Vibe coded with love by LJ</div>
+  <div>🤙 Vibe coded with love by LJ &middot; ${PROJECT_VERSION}</div>
   <a href="https://github.com/loekj/claude-acct-switcher" target="_blank" rel="noopener" style="color:#9ca3af;text-decoration:none">github.com/loekj/claude-acct-switcher</a>
 </footer>
 </body>
