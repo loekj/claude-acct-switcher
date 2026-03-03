@@ -1936,10 +1936,10 @@ function renderHTML() {
       </div>
 
       <div class="config-section">
-        <div class="config-section-title">Commit Tokens</div>
+        <div class="config-section-title">Commit Tokens <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
         <div class="config-row">
           <div class="config-info">
-            <div class="config-label">Token-Usage commit trailer <span style="font-size:0.625rem;background:var(--primary);color:#fff;padding:0.1rem 0.35rem;border-radius:4px;vertical-align:middle;font-weight:600;letter-spacing:0.03em">BETA</span></div>
+            <div class="config-label">Token-Usage commit trailer</div>
             <div class="config-desc">Append a Token-Usage trailer to commit messages showing tokens consumed since the last commit</div>
           </div>
           <input type="checkbox" class="sw" id="toggle-commit-tokens" onchange="toggleSetting('commitTokenUsage', this.checked)">
