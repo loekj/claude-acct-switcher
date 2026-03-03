@@ -96,6 +96,37 @@ function saveSettings(settings) {
 let settings = loadSettings();
 let lastRotationTime = 0; // tracks when proactive rotation last happened
 let _consecutive400s = 0;  // global: consecutive 400 errors across requests (reset on success)
+let _consecutive400sAt = 0;  // timestamp of last 400 (for time-based decay)
+
+// ── Circuit breaker ──
+// When the proxy fails repeatedly (all recovery strategies exhausted), it
+// auto-disables into passthrough mode so Claude Code can still reach the API
+// with its own token / trigger re-auth.  Resets after a cooldown.
+let _circuitOpen = false;
+let _circuitOpenAt = 0;
+let _consecutiveExhausted = 0; // count of requests where ALL recovery strategies failed
+const CIRCUIT_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
+const CIRCUIT_OPEN_THRESHOLD = 3;           // open after N consecutive exhausted requests
+
+function _isCircuitOpen() {
+  if (!_circuitOpen) return false;
+  if (Date.now() - _circuitOpenAt > CIRCUIT_COOLDOWN_MS) {
+    _circuitOpen = false;
+    _consecutiveExhausted = 0;
+    _consecutive400s = 0;
+    log('circuit', 'Circuit breaker closed — retrying proxy mode');
+    return false;
+  }
+  return true;
+}
+
+function _openCircuit(reason) {
+  if (_circuitOpen) return;
+  _circuitOpen = true;
+  _circuitOpenAt = Date.now();
+  log('circuit', `Circuit breaker OPEN (${reason}) — passthrough for ${CIRCUIT_COOLDOWN_MS / 1000}s`);
+  notify('Proxy Bypassed', `${reason} — passthrough mode for ${CIRCUIT_COOLDOWN_MS / 60000}min`);
+}
 
 // ─────────────────────────────────────────────────
 // Keychain helpers
@@ -837,12 +868,31 @@ async function handleAPI(req, res) {
       if (!pendingSessions.has(sessionId)) {
         let repo = cwd, branch = '(no git)', commitHash = '';
         try {
-          repo = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+          // Use --git-common-dir to resolve to main repo root (not worktree directory)
+          // so worktree sessions group with the parent repo in the dashboard.
+          try {
+            repo = execSync(`git -C "${cwd}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim().replace(/\/\.git\/?$/, '');
+          } catch {
+            repo = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+          }
           branch = execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
           commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
         } catch { /* not a git repo */ }
-        pendingSessions.set(sessionId, { repo, branch, commitHash, startedAt: Date.now() });
+        pendingSessions.set(sessionId, { repo, branch, commitHash, cwd, startedAt: Date.now() });
         log('tokens', `Session started: ${sessionId.slice(0, 8)}… (${basename(repo)}/${branch})`);
+      } else {
+        // Re-read branch on subsequent prompts (handles worktree branch switches)
+        const session = pendingSessions.get(sessionId);
+        // Keep cwd up to date so periodic persist and auto-claim use the latest directory
+        if (cwd && cwd !== session.cwd) session.cwd = cwd;
+        try {
+          const newBranch = execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+          if (newBranch && newBranch !== session.branch) {
+            log('tokens', `Session ${sessionId.slice(0, 8)}… branch updated: ${session.branch} → ${newBranch}`);
+            session.branch = newBranch;
+            session.commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+          }
+        } catch { /* ignore */ }
       }
       // Prune stale sessions (>24h — sessions can be long-lived)
       const staleThreshold = Date.now() - 24 * 60 * 60 * 1000;
@@ -3081,6 +3131,54 @@ function drainResponse(res) {
   });
 }
 
+// ── Passthrough fallback ──
+// When all proxy recovery strategies fail, forward the request with the
+// ORIGINAL client authorization header.  This lets Claude Code reach the
+// real API and trigger its own re-auth flow instead of the proxy returning
+// an opaque error that makes sessions permanently stale.
+
+async function _passthroughFallback(clientReq, clientRes, body, reason) {
+  // Guard: client already disconnected — nothing to deliver
+  if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) {
+    log('fallback', `Passthrough skipped (${reason}) — client already disconnected or headers sent`);
+    return false;
+  }
+  try {
+    const fwd = stripHopByHopHeaders(clientReq.headers);
+    fwd['host'] = 'api.anthropic.com';
+    fwd['content-length'] = String(body.length);
+    // Ensure OAuth beta flag is present (required for OAuth tokens)
+    const betas = (fwd['anthropic-beta'] || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (!betas.includes('oauth-2025-04-20')) betas.push('oauth-2025-04-20');
+    fwd['anthropic-beta'] = betas.join(',');
+    log('fallback', `Proxy recovery exhausted (${reason}) — passthrough with original auth`);
+    // Short timeout: we've already spent time on recovery, don't stall further
+    const res = await forwardToAnthropic(clientReq.method, clientReq.url, fwd, body, 15_000);
+    // Forward whatever the upstream returns — even errors.
+    // A standard 401 from the real API lets Claude Code re-authenticate,
+    // which is far better than a proxy 502 that kills the session.
+    if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) {
+      res.destroy();
+      return false;
+    }
+    clientRes.writeHead(res.statusCode, res.headers);
+    res.on('error', () => { try { clientRes.end(); } catch {} });
+    clientRes.on('close', () => { res.destroy(); });
+    await pipeAndWait(res, clientRes);
+    // Passthrough delivered a response — reset failure counters
+    _consecutiveExhausted = 0;
+    if (res.statusCode < 400) _consecutive400s = 0;
+    return true;
+  } catch (e) {
+    log('error', `Passthrough fallback failed (${reason}): ${e.message}`);
+    _consecutiveExhausted++;
+    if (_consecutiveExhausted >= CIRCUIT_OPEN_THRESHOLD) {
+      _openCircuit(`${_consecutiveExhausted} consecutive failures`);
+    }
+    return false;
+  }
+}
+
 // ── Mutex for auto-switch (prevents interleaved keychain writes) ──
 
 let _switchLock = Promise.resolve();
@@ -3550,10 +3648,20 @@ function claimUsageInRange(startTs, endTs) {
 // [BETA] Session Tracking
 // ─────────────────────────────────────────────────
 
-const pendingSessions = new Map(); // session_id → { repo, branch, commitHash, startedAt }
+const pendingSessions = new Map(); // session_id → { repo, branch, commitHash, cwd, startedAt }
 
 // Claim and persist usage for a session (used by auto-claim and stale pruning)
 function _autoClaimSession(sessionId, session) {
+  // Re-read branch before persisting (handles worktree branch switches)
+  if (session.cwd) {
+    try {
+      const cur = execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+      if (cur && cur !== session.branch) {
+        session.branch = cur;
+        session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+      }
+    } catch { /* ignore */ }
+  }
   const claimed = claimUsageInRange(session.startedAt, Date.now());
   for (const entry of claimed) {
     appendTokenUsage({
@@ -3580,6 +3688,17 @@ setInterval(() => {
   // Update startedAt so we don't double-count on next interval.
   for (const [id, session] of pendingSessions) {
     const now = Date.now();
+    // Re-read branch before persisting (handles worktree branch switches)
+    if (session.cwd) {
+      try {
+        const cur = execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+        if (cur && cur !== session.branch) {
+          log('tokens', `Periodic: session ${id.slice(0, 8)}… branch updated: ${session.branch} → ${cur}`);
+          session.branch = cur;
+          session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+        }
+      } catch { /* ignore */ }
+    }
     const claimed = claimUsageInRange(session.startedAt, now);
     for (const entry of claimed) {
       appendTokenUsage({
@@ -3666,7 +3785,7 @@ const proxyServer = createServer((clientReq, clientRes) => {
       log('error', `Unhandled proxy error: ${err.message}\n${err.stack}`);
       if (!clientRes.headersSent) {
         clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-        clientRes.end(JSON.stringify({ error: `Proxy error: ${err.message}` }));
+        clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Proxy error: ${err.message}` } }));
       }
     });
     return;
@@ -3677,14 +3796,14 @@ const proxyServer = createServer((clientReq, clientRes) => {
       log('warn', 'Request timed out in serialization queue');
       if (!clientRes.headersSent) {
         clientRes.writeHead(504, { 'Content-Type': 'application/json' });
-        clientRes.end(JSON.stringify({ error: 'Request queued too long (serialization timeout)' }));
+        clientRes.end(JSON.stringify({ type: 'error', error: { type: 'timeout_error', message: 'Request queued too long (serialization timeout)' } }));
       }
       return;
     }
     log('error', `Unhandled proxy error: ${err.message}\n${err.stack}`);
     if (!clientRes.headersSent) {
       clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({ error: `Proxy error: ${err.message}` }));
+      clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Proxy error: ${err.message}` } }));
     }
   });
 });
@@ -3694,9 +3813,11 @@ async function handleProxyRequest(clientReq, clientRes) {
   if (clientReq.method === 'GET' && clientReq.url === '/health') {
     clientRes.writeHead(200, { 'Content-Type': 'application/json' });
     clientRes.end(JSON.stringify({
-      status: 'ok',
+      status: _circuitOpen ? 'passthrough' : 'ok',
       accounts: loadAllAccountTokens().length,
       activeToken: getActiveToken() ? 'present' : 'missing',
+      circuitBreaker: _circuitOpen ? 'open' : 'closed',
+      consecutiveExhausted: _consecutiveExhausted,
     }));
     return;
   }
@@ -3710,6 +3831,10 @@ async function handleProxyRequest(clientReq, clientRes) {
     if (clientReq.headers['content-length']) {
       fwd['content-length'] = clientReq.headers['content-length'];
     }
+    // Ensure OAuth beta flag is present (required for OAuth tokens)
+    const betas = (fwd['anthropic-beta'] || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (!betas.includes('oauth-2025-04-20')) betas.push('oauth-2025-04-20');
+    fwd['anthropic-beta'] = betas.join(',');
     try {
       const proxyRes = await new Promise((resolve, reject) => {
         const req = https.request({
@@ -3728,7 +3853,45 @@ async function handleProxyRequest(clientReq, clientRes) {
     } catch (err) {
       if (!clientRes.headersSent) {
         clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-        clientRes.end(JSON.stringify({ error: `Passthrough error: ${err.message}` }));
+        clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Passthrough error: ${err.message}` } }));
+      }
+    }
+    return;
+  }
+
+  // ── Circuit breaker: auto-passthrough after repeated proxy failures ──
+  // When open, skip all proxy logic and forward directly to Anthropic.
+  // This lets Claude Code's own auth / re-auth work normally.
+  if (_isCircuitOpen()) {
+    log('circuit', 'Circuit breaker open — passthrough');
+    const fwd = stripHopByHopHeaders(clientReq.headers);
+    fwd['host'] = 'api.anthropic.com';
+    if (clientReq.headers['content-length']) {
+      fwd['content-length'] = clientReq.headers['content-length'];
+    }
+    // Ensure OAuth beta flag is present (required for OAuth tokens)
+    const betas = (fwd['anthropic-beta'] || '').split(',').map(s => s.trim()).filter(Boolean);
+    if (!betas.includes('oauth-2025-04-20')) betas.push('oauth-2025-04-20');
+    fwd['anthropic-beta'] = betas.join(',');
+    try {
+      const proxyRes = await new Promise((resolve, reject) => {
+        const req = https.request({
+          hostname: 'api.anthropic.com', port: 443,
+          path: clientReq.url, method: clientReq.method,
+          headers: fwd, timeout: PROXY_TIMEOUT,
+        }, resolve);
+        req.on('error', reject);
+        req.on('timeout', () => req.destroy(new Error('upstream timeout')));
+        clientReq.pipe(req);
+      });
+      clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
+      proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
+      clientReq.on('close', () => { proxyRes.destroy(); });
+      await pipeAndWait(proxyRes, clientRes);
+    } catch (err) {
+      if (!clientRes.headersSent) {
+        clientRes.writeHead(502, { 'Content-Type': 'application/json' });
+        clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Passthrough error: ${err.message}` } }));
       }
     }
     return;
@@ -3769,8 +3932,10 @@ async function handleProxyRequest(clientReq, clientRes) {
 
   const allAccounts = loadAllAccountTokens();
   if (!allAccounts.length) {
+    log('error', 'No accounts configured — trying passthrough');
+    if (await _passthroughFallback(clientReq, clientRes, body, 'no-accounts')) return;
     clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-    clientRes.end(JSON.stringify({ error: 'No accounts configured. Run: vdm add <name>' }));
+    clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'No accounts configured. Run: vdm add <name>' } }));
     return;
   }
 
@@ -3820,17 +3985,20 @@ async function handleProxyRequest(clientReq, clientRes) {
         }
       }
     } else if (!token) {
+      log('error', 'No active account in keychain — trying passthrough');
+      if (await _passthroughFallback(clientReq, clientRes, body, 'no-active-account')) return;
       clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({ error: 'No active account in keychain' }));
+      clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'No active account in keychain' } }));
       return;
     }
   }
 
   // Guard: never forward a null/empty token (causes 400 with no body)
   if (!token) {
-    log('error', 'No active token available (keychain read may have failed)');
+    log('error', 'No active token available — trying passthrough with original auth');
+    if (await _passthroughFallback(clientReq, clientRes, body, 'no-active-token')) return;
     clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-    clientRes.end(JSON.stringify({ error: 'No active token available — check keychain access' }));
+    clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'No active token available — check keychain access' } }));
     return;
   }
 
@@ -3877,7 +4045,8 @@ async function handleProxyRequest(clientReq, clientRes) {
   for (let attempt = 0; attempt < maxAttempts; attempt++) {
     // Deadline guard: on retries, bail early if we've run out of time
     if (attempt > 0 && isDeadlineExceeded()) {
-      log('deadline', `Request deadline exceeded after ${attempt} attempts (${REQUEST_DEADLINE_MS}ms) — returning 504`);
+      log('deadline', `Request deadline exceeded after ${attempt} attempts (${REQUEST_DEADLINE_MS}ms) — trying passthrough`);
+      if (await _passthroughFallback(clientReq, clientRes, body, 'deadline-exceeded')) return;
       clientRes.writeHead(504, { 'Content-Type': 'application/json' });
       clientRes.end(JSON.stringify({
         type: 'error',
@@ -3938,9 +4107,10 @@ async function handleProxyRequest(clientReq, clientRes) {
           continue;
         }
       }
-      // All accounts tried or autoSwitch off  - return the upstream error
+      // All accounts tried or autoSwitch off — try passthrough fallback
+      if (await _passthroughFallback(clientReq, clientRes, body, 'network-error-all-exhausted')) return;
       clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-      clientRes.end(JSON.stringify({ error: `Upstream unreachable: ${lastNetworkError.message}` }));
+      clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Upstream unreachable: ${lastNetworkError.message}` } }));
       return;
     }
 
@@ -4042,7 +4212,8 @@ async function handleProxyRequest(clientReq, clientRes) {
       logEvent('auth-expired', { account: acctName });
 
       if (!settings.autoSwitch) {
-        log('switch', '  → auto-switch OFF, returning 401 as-is');
+        log('switch', '  → auto-switch OFF — trying passthrough');
+        if (await _passthroughFallback(clientReq, clientRes, body, '401-autoswitch-off')) return;
         clientRes.writeHead(401, { 'Content-Type': 'application/json' });
         clientRes.end(JSON.stringify({
           type: 'error',
@@ -4068,9 +4239,10 @@ async function handleProxyRequest(clientReq, clientRes) {
         continue;
       }
 
-      // No valid accounts left
-      log('switch', '  → no valid accounts remain');
-      notify('All Tokens Expired', 'No valid accounts remain. Run: vdm add <name>');
+      // No valid accounts left — try passthrough so Claude Code can re-auth
+      log('switch', '  → no valid accounts remain — trying passthrough fallback');
+      notify('All Tokens Expired', 'No valid accounts remain — trying passthrough');
+      if (await _passthroughFallback(clientReq, clientRes, body, 'all-401-expired')) return;
       clientRes.writeHead(401, { 'Content-Type': 'application/json' });
       clientRes.end(JSON.stringify({
         type: 'error',
@@ -4093,8 +4265,14 @@ async function handleProxyRequest(clientReq, clientRes) {
       const bodyBuf = await drainResponse(proxyRes);
       const bodyStr = bodyBuf.toString('utf8').trim();
 
-      // Track this 400 for the global consecutive-failure counter
+      // Track this 400 for the global consecutive-failure counter.
+      // Time-decay: reset if last 400 was >30s ago (prevents stale counter
+      // from a past episode affecting unrelated future requests).
+      if (_consecutive400s > 0 && Date.now() - _consecutive400sAt > 30_000) {
+        _consecutive400s = 0;
+      }
       _consecutive400s++;
+      _consecutive400sAt = Date.now();
 
       // Parse error type from response body
       let errorType = null;
@@ -4233,8 +4411,11 @@ async function handleProxyRequest(clientReq, clientRes) {
         }
       }
 
-      // All strategies exhausted — return the best error we have
-      log('error', `All 400 recovery strategies exhausted for this request`);
+      // All strategies exhausted — try passthrough with original auth header
+      // so Claude Code can reach the real API / trigger its own re-auth flow.
+      log('error', `All 400 recovery strategies exhausted — trying passthrough fallback`);
+      if (await _passthroughFallback(clientReq, clientRes, body, 'all-400-strategies-exhausted')) return;
+      // Passthrough also failed — return the best error we have
       if (bodyStr) {
         clientRes.writeHead(400, proxyRes.headers);
         clientRes.end(bodyBuf);
@@ -4263,6 +4444,7 @@ async function handleProxyRequest(clientReq, clientRes) {
 
     // ── Any other response: success or client error → pipe through ──
     _consecutive400s = 0; // reset on any non-400 response
+    _consecutiveExhausted = 0;
     updateAccountState(token, acctName, proxyRes.headers, getFingerprintFromToken(token));
 
     // Check if utilization is critically high and log a warning
@@ -4295,10 +4477,11 @@ async function handleProxyRequest(clientReq, clientRes) {
   }
 
   // Should not reach here, but safety net
-  log('error', 'Exhausted all retry attempts without resolution');
+  log('error', 'Exhausted all retry attempts without resolution — trying passthrough');
   if (!clientRes.headersSent) {
+    if (await _passthroughFallback(clientReq, clientRes, body, 'all-retries-exhausted')) return;
     clientRes.writeHead(502, { 'Content-Type': 'application/json' });
-    clientRes.end(JSON.stringify({ error: 'All accounts tried, none succeeded' }));
+    clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'All accounts tried, none succeeded' } }));
   }
 }
 
