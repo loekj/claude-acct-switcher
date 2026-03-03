@@ -757,7 +757,8 @@ async function handleAPI(req, res) {
       return true;
     }
     try {
-      const result = await refreshAccountToken(name);
+      refreshFailures.delete(name);
+      const result = await refreshAccountToken(name, { force: true });
       json(res, result, result.ok ? 200 : 500);
     } catch (e) {
       json(res, { ok: false, error: e.message }, 500);
@@ -1331,6 +1332,24 @@ function renderHTML() {
     background: #dc2626;
     color: #fff;
     border-color: #dc2626;
+  }
+
+  .refresh-btn {
+    padding: 0.375rem 0.75rem;
+    border-radius: var(--radius-sm);
+    border: 1px solid var(--border);
+    background: transparent;
+    color: var(--primary);
+    font-size: 0.75rem;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+    font-family: inherit;
+  }
+  .refresh-btn:hover {
+    background: var(--primary);
+    color: #fff;
+    border-color: var(--primary);
   }
 
   .card.switching { opacity: 0.5; pointer-events: none; }
@@ -1955,6 +1974,20 @@ async function doRemove(name, e) {
   } catch(e) { showToast('Failed to remove'); }
 }
 
+async function doRefresh(name, e) {
+  if (e) e.stopPropagation();
+  try {
+    const resp = await fetch('/api/refresh', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ name })
+    });
+    const data = await resp.json();
+    if (data.ok) { showToast('Refreshed ' + name); setTimeout(refresh, 300); }
+    else showToast('Refresh failed: ' + data.error);
+  } catch(e) { showToast('Failed to refresh'); }
+}
+
 function renderProbeStats(ps) {
   const el = document.getElementById('probe-stats');
   if (!ps || !ps.probeCount7d) { el.textContent = ''; return; }
@@ -2193,7 +2226,7 @@ function renderAccounts(profiles, animate) {
     var staleMsg = '';
     if (isStale) {
       if (p.refreshFailed && !p.refreshFailed.retriable) {
-        staleMsg = '<div class="stale-msg">Token expired. Run <code>claude login</code> to reactivate.</div>';
+        staleMsg = '<div class="stale-msg">Token expired. Click Refresh or run <code>claude login</code> to reactivate.</div>';
       } else {
         staleMsg = '<div class="stale-msg">Token expired. Auto-refresh will retry shortly.</div>';
       }
@@ -2203,7 +2236,7 @@ function renderAccounts(profiles, animate) {
     if (!active) {
       buttonsHtml = '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center">' +
         '<button class="remove-btn" onclick="doRemove(\\''+eName+'\\',event)">Remove</button>' +
-        (isStale ? '' : '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayName.replace(/'/g, "\\\\'")+'\\''+',event)">Switch to this account</button>') +
+        (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\''+eName+'\\',event)">Refresh</button>' : '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayName.replace(/'/g, "\\\\'")+'\\''+',event)">Switch to this account</button>') +
       '</div>';
     }
     return '<div class="' + cardClass + '"' + animStyle + '>' +
@@ -3276,14 +3309,17 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
 
 // ── Background refresh timer ──
 
+const REFRESH_FAILURE_TTL = 2 * 60 * 60 * 1000; // 2 hours
+
 async function refreshSweep(label = 'refresh-bg') {
   const accounts = loadAllAccountTokens();
   for (const acct of accounts) {
     if (shouldRefreshToken(acct.expiresAt, REFRESH_BUFFER_MS)) {
       const prior = refreshFailures.get(acct.name);
       if (prior && !prior.retriable) {
-        // Non-retriable failure (e.g. 400/401) — skip until user re-authenticates
-        continue;
+        if (Date.now() - prior.ts < REFRESH_FAILURE_TTL) continue;
+        // TTL expired — retry
+        log(label, `${acct.label || acct.name}: retrying after non-retriable failure (${Math.round((Date.now() - prior.ts) / 60000)}m ago)`);
       }
       log(label, `${acct.label || acct.name}: token near expiry, refreshing...`);
       try {
@@ -3309,6 +3345,10 @@ setInterval(async () => {
   lastRefreshTick = now;
   if (drift > 30_000) {
     log('refresh-wake', `System wake detected (drift ${Math.round(drift / 1000)}s), refreshing all tokens...`);
+    // Clear non-retriable failures so all accounts get a fresh chance after sleep
+    for (const [name, entry] of refreshFailures) {
+      if (!entry.retriable) refreshFailures.delete(name);
+    }
   }
   await refreshSweep();
 }, REFRESH_CHECK_INTERVAL);
