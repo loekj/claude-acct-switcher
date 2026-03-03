@@ -78,6 +78,7 @@ const DEFAULT_SETTINGS = {
   notifications: true,
   serializeRequests: false,
   serializeDelayMs: 200,
+  commitTokenUsage: false,
 };
 
 function loadSettings() {
@@ -842,6 +843,7 @@ async function handleAPI(req, res) {
     if (typeof patch.serializeDelayMs === 'number' && patch.serializeDelayMs >= 0 && patch.serializeDelayMs <= 2000) {
       settings.serializeDelayMs = patch.serializeDelayMs;
     }
+    if (typeof patch.commitTokenUsage === 'boolean') settings.commitTokenUsage = patch.commitTokenUsage;
     saveSettings(settings);
     logActivity('settings-changed', {
       autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
@@ -1871,6 +1873,17 @@ function renderHTML() {
         </div>
         <div id="queue-stats" style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem;display:none"></div>
       </div>
+
+      <div class="config-section">
+        <div class="config-section-title">Commit Tokens</div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Token-Usage commit trailer</div>
+            <div class="config-desc">Append a Token-Usage trailer to commit messages showing tokens consumed since the last commit</div>
+          </div>
+          <input type="checkbox" class="sw" id="toggle-commit-tokens" onchange="toggleSetting('commitTokenUsage', this.checked)">
+        </div>
+      </div>
     </div>
   </div>
 
@@ -2428,6 +2441,8 @@ async function loadSettingsUI() {
     document.getElementById('toggle-serialize').checked = !!s.serializeRequests;
     document.getElementById('sel-serialize-delay').value = s.serializeDelayMs || 200;
     document.getElementById('serialize-delay-ctrl').style.display = s.serializeRequests ? '' : 'none';
+    // Commit token usage
+    document.getElementById('toggle-commit-tokens').checked = !!s.commitTokenUsage;
   } catch {}
 }
 
@@ -2463,6 +2478,7 @@ async function toggleSetting(key, value) {
       autoSwitch: value ? 'Auto-switch enabled' : 'Auto-switch disabled',
       notifications: value ? 'Notifications enabled' : 'Notifications disabled',
       serializeRequests: value ? 'Request serialization enabled' : 'Request serialization disabled',
+      commitTokenUsage: value ? 'Commit token trailer enabled' : 'Commit token trailer disabled',
     };
     showToast(msgs[key] || (key + ' = ' + value));
     // Show/hide serialize delay control

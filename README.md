@@ -84,6 +84,26 @@ Per-session token usage tracking with breakdowns by model, repo, branch, and tim
 
 Token usage is tracked via Claude Code hooks and attributed to the correct git repo and branch — including worktrees.
 
+#### Commit Token Trailers
+
+When enabled, a `prepare-commit-msg` git hook appends a `Token-Usage:` trailer to each commit message showing the tokens consumed since the previous commit. This is **disabled by default**.
+
+To enable:
+
+```bash
+vdm config commit-tokens on
+```
+
+Example commit message:
+
+```
+Fix login validation bug
+
+Token-Usage: 12,345 tokens (claude-sonnet-4-20250514)
+```
+
+The hook queries the dashboard for usage data and silently skips the trailer if the dashboard is unreachable or the setting is off. Merge, squash, and amend commits are always skipped. After changing this setting, run `vdm hooks` to reinstall the hook.
+
 ### Settings
 
 ```bash
@@ -93,6 +113,7 @@ vdm config rotation <strategy>    # sticky|conserve|round-robin|spread|drain-fir
 vdm config interval <minutes>     # Round-robin timer
 vdm config serialize on|off       # Serialize proxy requests
 vdm config serialize-delay <ms>   # Serialization delay
+vdm config commit-tokens on|off  # Token-Usage trailer in commits
 ```
 
 ### Rotation Strategies

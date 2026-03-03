@@ -606,6 +606,12 @@ cmd_config() {
     fi
     local delay=$(get_config_string "serializeDelayMs")
     echo -e "  serializeDelayMs:   ${delay:-200}  ${DIM}[BETA]${NC}"
+    local commit_tokens=$(get_config_value "commitTokenUsage")
+    if [[ "$commit_tokens" == "True" ]]; then
+      echo -e "  commitTokenUsage:   ${GREEN}on${NC}"
+    else
+      echo -e "  commitTokenUsage:   ${DIM}off${NC}"
+    fi
     echo ""
     echo -e "  ${DIM}Usage: vdm config <key> <value>${NC}"
     echo -e "  ${DIM}  vdm config proxy on${NC}"
@@ -615,6 +621,7 @@ cmd_config() {
     echo -e "  ${DIM}  vdm config interval 15|30|60|120${NC}"
     echo -e "  ${DIM}  vdm config serialize on|off${NC}  ${DIM}[BETA]${NC}"
     echo -e "  ${DIM}  vdm config serialize-delay 0|100|200|500|1000${NC}  ${DIM}[BETA]${NC}"
+    echo -e "  ${DIM}  vdm config commit-tokens on|off${NC}"
     return 0
   fi
 
@@ -628,9 +635,10 @@ cmd_config() {
     interval|rotationIntervalMin)         key="rotationIntervalMin"; is_bool=false ;;
     serialize|serializeRequests|serialize-requests) key="serializeRequests" ;;
     serialize-delay|serializeDelayMs|serialize-delay-ms) key="serializeDelayMs"; is_bool=false ;;
+    commit-tokens|commitTokenUsage|commit-token-usage) key="commitTokenUsage" ;;
     *)
       echo -e "${RED}Unknown setting: $key${NC}"
-      echo "  Available: proxy, autoswitch, notifications, rotation, interval, serialize, serialize-delay"
+      echo "  Available: proxy, autoswitch, notifications, rotation, interval, serialize, serialize-delay, commit-tokens"
       return 1
       ;;
   esac

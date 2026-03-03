@@ -200,10 +200,18 @@ LOCAL_HOOK="$(git rev-parse --git-dir 2>/dev/null)/hooks/prepare-commit-msg"
 # Skip merge/squash/amend
 [[ "$2" == "merge" || "$2" == "squash" || "$2" == "commit" ]] && exit 0
 
+# Check if commitTokenUsage is enabled (disabled by default; silent fail = skip)
+VDM_PORT="${CSW_PORT:-3333}"
+SETTINGS=$(curl -s --max-time 2 "http://localhost:${VDM_PORT}/api/settings" 2>/dev/null) || true
+if echo "$SETTINGS" | python3 -c "import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get('commitTokenUsage',False) else 1)" 2>/dev/null; then
+  : # enabled, continue
+else
+  exit 0
+fi
+
 # Query proxy for token usage since last commit (2s timeout, silent fail)
 REPO=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 LAST_TS=$(( $(git log -1 --format=%ct 2>/dev/null || echo 0) * 1000 ))
-VDM_PORT="${CSW_PORT:-3333}"
 USAGE=$(curl -s --max-time 2 "http://localhost:${VDM_PORT}/api/token-usage?repo=${REPO}&since=${LAST_TS}" 2>/dev/null) || exit 0
 
 # Parse JSON and append trailer if tokens > 0
