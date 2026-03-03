@@ -539,9 +539,12 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
   echo ""
   echo -e "${BOLD}  Active Account${NC}"
   echo -e "  ────────────────────────────────"
-  echo -e "  Profile:  ${BOLD}$active_name${NC}"
   if [[ -n "$email" ]]; then
     echo -e "  Email:    ${CYAN}$email${NC}"
+  fi
+  # Only show profile name if it's a meaningful user-given name (not auto-generated)
+  if [[ ! "$active_name" =~ ^auto-[0-9]+$ && "$active_name" != "(not saved)" ]]; then
+    echo -e "  Profile:  ${BOLD}$active_name${NC}"
   fi
   echo -e "  Plan:     $(format_sub_type "$sub_type")"
   echo -e "  Tier:     $tier"
