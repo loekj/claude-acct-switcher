@@ -1914,13 +1914,14 @@ function renderHTML() {
     display: flex;
     align-items: flex-end;
     justify-content: center;
+    width: 100%;
   }
   .tok-chart-bar-group {
     flex: 1;
     display: flex;
     flex-direction: column;
     align-items: center;
-    min-width: 0;
+    min-width: 4px;
   }
   .tok-chart-stack {
     width: 100%;
