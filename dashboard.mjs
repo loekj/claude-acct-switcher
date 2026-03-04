@@ -1847,10 +1847,15 @@ function renderHTML() {
   }
   .tok-export-btn:hover { background: var(--bg); }
   .tok-chart-wrap {
-    height: 140px;
     display: flex;
     align-items: flex-end;
     gap: 2px;
+  }
+  .tok-chart-bar-area {
+    height: 120px;
+    display: flex;
+    align-items: flex-end;
+    justify-content: center;
   }
   .tok-chart-bar-group {
     flex: 1;
@@ -1858,8 +1863,6 @@ function renderHTML() {
     flex-direction: column;
     align-items: center;
     min-width: 0;
-    height: 100%;
-    justify-content: flex-end;
   }
   .tok-chart-stack {
     width: 100%;
@@ -3037,14 +3040,14 @@ function renderDailyChart(data) {
     var bucket = buckets[k];
     var stackH = Math.round((bucket.total / maxTotal) * 120);
     bars += '<div class="tok-chart-bar-group">';
-    bars += '<div class="tok-chart-stack" style="height:' + stackH + 'px">';
+    bars += '<div class="tok-chart-bar-area"><div class="tok-chart-stack" style="height:' + stackH + 'px">';
     for (var si = 0; si < sortedModels.length; si++) {
       var segVal = bucket[sortedModels[si]] || 0;
       if (segVal <= 0) continue;
       var segH = Math.max(1, Math.round((segVal / bucket.total) * stackH));
       bars += '<div class="tok-chart-seg" style="height:' + segH + 'px;background:' + getModelColor(sortedModels[si], sortedModels) + '" data-tooltip="' + escHtml(shortModel(sortedModels[si])) + ': ' + formatNum(segVal) + '"></div>';
     }
-    bars += '</div>';
+    bars += '</div></div>';
     if (showLabel) {
       bars += '<div class="tok-chart-label">' + labelFn(k) + '</div>';
     }
