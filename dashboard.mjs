@@ -127,6 +127,7 @@ let _circuitOpenAt = 0;
 let _consecutiveExhausted = 0; // count of requests where ALL recovery strategies failed
 const CIRCUIT_COOLDOWN_MS = 2 * 60 * 1000; // 2 minutes
 const CIRCUIT_OPEN_THRESHOLD = 3;           // open after N consecutive exhausted requests
+const CIRCUIT_400_THRESHOLD = 10;           // open circuit after N consecutive 400s across requests
 
 function _isCircuitOpen() {
   if (!_circuitOpen) return false;
@@ -337,6 +338,14 @@ async function autoDiscoverAccount() {
   // Truly new account  - save it
   let idx = 1;
   while (existsSync(join(ACCOUNTS_DIR, `auto-${idx}.json`))) idx++;
+
+  // Cap auto-discovered accounts to prevent runaway creation during error spirals
+  const MAX_AUTO_ACCOUNTS = 5;
+  if (idx > MAX_AUTO_ACCOUNTS) {
+    console.log(`[auto-discover] Skipping — already ${idx - 1} auto accounts (max ${MAX_AUTO_ACCOUNTS})`);
+    return;
+  }
+
   const name = `auto-${idx}`;
 
   try { mkdirSync(ACCOUNTS_DIR, { recursive: true }); } catch {}
@@ -415,8 +424,14 @@ loadHistoryFromDisk();
 
 // ── macOS desktop notifications ──
 
+let _lastNotifyAt = 0;
+const NOTIFY_THROTTLE_MS = 10_000; // max 1 notification per 10 seconds
+
 function notify(title, message) {
   if (!settings.notifications) return;
+  const now = Date.now();
+  if (now - _lastNotifyAt < NOTIFY_THROTTLE_MS) return; // throttle notification spam
+  _lastNotifyAt = now;
   try {
     const escaped = (s) => s.replace(/"/g, '\\"');
     execFile('osascript', ['-e',
@@ -4157,9 +4172,12 @@ async function handleProxyRequest(clientReq, clientRes) {
   const isDeadlineExceeded = () => Date.now() > deadline;
 
   // Check if keychain has a token we haven't saved yet (e.g. user just did /login)
-  await autoDiscoverAccount().catch(() => {});
+  // Skip during error spirals to avoid creating bogus auto-accounts from stale keychain tokens
+  if (_consecutive400s < 3) {
+    await autoDiscoverAccount().catch(() => {});
+  }
 
-  const allAccounts = loadAllAccountTokens();
+  let allAccounts = loadAllAccountTokens();
   if (!allAccounts.length) {
     log('error', 'No accounts configured — trying passthrough');
     if (await _passthroughFallback(clientReq, clientRes, body, 'no-accounts')) return;
@@ -4503,6 +4521,17 @@ async function handleProxyRequest(clientReq, clientRes) {
       _consecutive400s++;
       _consecutive400sAt = Date.now();
 
+      // ── Circuit breaker: stop the death spiral ──
+      // If we've hit too many consecutive 400s across requests, all accounts
+      // are likely dead (billing, expired, etc).  Open the circuit breaker
+      // and fall through to passthrough mode instead of keep switching.
+      if (_consecutive400s >= CIRCUIT_400_THRESHOLD) {
+        _openCircuit(`${_consecutive400s} consecutive 400 errors`);
+        clientRes.writeHead(400, proxyRes.headers);
+        clientRes.end(bodyBuf);
+        return;
+      }
+
       // Parse error type from response body
       let errorType = null;
       let parsedError = null;
@@ -4524,23 +4553,41 @@ async function handleProxyRequest(clientReq, clientRes) {
         errorType === 'permission_error' ||           // permission issue
         /status code|no body|invalid.*token|unauthorized/i.test(bodyStr);  // heuristic
 
+      // Billing errors (credit balance too low) are never fixable by token
+      // refresh — skip straight to account switching (Strategy 3).
+      const errorMessage = parsedError?.error?.message || '';
+      const isBillingError = /credit balance|billing.*issue|payment.*required/i.test(errorMessage);
+
+      // Billing errors: mark this account as temporarily unavailable so
+      // pickBestAccount / pickByStrategy won't keep selecting it.
+      // This is THE key fix for the death spiral: without this, the account
+      // looks "available" (not expired, not rate-limited) and gets re-selected
+      // on every subsequent request, causing an infinite cycle.
+      if (isBillingError && token) {
+        const BILLING_COOLDOWN_SEC = 300; // 5 min cooldown
+        accountState.markLimited(token, acctName, BILLING_COOLDOWN_SEC);
+        log('billing', `${acctName}: marked unavailable for ${BILLING_COOLDOWN_SEC}s (billing error)`);
+      }
+
       // Only pass through immediately if it's clearly a request validation
       // error AND we haven't seen a suspicious pattern of repeated 400s
-      if (errorType === 'invalid_request_error' && _consecutive400s < 3) {
+      if (errorType === 'invalid_request_error' && _consecutive400s < 3 && !isBillingError) {
         log('info', `${acctName} → 400 invalid_request_error (passing through): ${bodyStr.slice(0, 200)}`);
         clientRes.writeHead(400, proxyRes.headers);
         clientRes.end(bodyBuf);
         return;
       }
 
-      const reason = looksLikeAuthIssue ? 'auth/token issue' :
+      const reason = isBillingError ? `billing error (${errorMessage.slice(0, 80)})` :
+        looksLikeAuthIssue ? 'auth/token issue' :
         _consecutive400s >= 3 ? `repeated 400s (${_consecutive400s} consecutive)` :
         `unknown (type: ${errorType || 'none'})`;
       log('error', `${acctName} → 400 (${reason}, body: ${bodyStr.slice(0, 300) || '(empty)'})`);
       logEvent('bad-request-400', { account: acctName, errorType, consecutive: _consecutive400s });
 
       // ── Strategy 1: Force-refresh ALL tokens if we're in a repeated-failure loop ──
-      if (_consecutive400s >= 3 && !_bulkRefreshAttempted && !isDeadlineExceeded()) {
+      // (Skip for billing errors — refreshing tokens won't restore credits)
+      if (_consecutive400s >= 3 && !_bulkRefreshAttempted && !isDeadlineExceeded() && !isBillingError) {
         _bulkRefreshAttempted = true;
         log('error', `${_consecutive400s} consecutive 400s — force-refreshing ALL account tokens (parallel)`);
         const toRefresh = allAccounts.filter(a => !refreshAttempted.has(a.label || a.name));
@@ -4554,8 +4601,8 @@ async function handleProxyRequest(clientReq, clientRes) {
           }
         }
         invalidateAccountsCache();
-        const refreshedAccounts = loadAllAccountTokens();
-        const refreshedAcct = refreshedAccounts.find(a => a.name === (acct?.name));
+        allAccounts = loadAllAccountTokens(); // refresh stale allAccounts so account lookups work
+        const refreshedAcct = allAccounts.find(a => a.name === (acct?.name));
         if (refreshedAcct && refreshedAcct.token !== token) {
           token = refreshedAcct.token;
           triedTokens.clear(); // all tokens changed — retry everything
@@ -4564,7 +4611,8 @@ async function handleProxyRequest(clientReq, clientRes) {
       }
 
       // ── Strategy 2: Refresh this specific account's token ──
-      if (acct && !refreshAttempted.has(acctName) && !isDeadlineExceeded()) {
+      // (Skip for billing errors — refreshing tokens won't restore credits)
+      if (acct && !refreshAttempted.has(acctName) && !isDeadlineExceeded() && !isBillingError) {
         refreshAttempted.add(acctName);
         log('refresh', `${acctName}: attempting token refresh after 400...`);
         try {
