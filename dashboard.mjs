@@ -117,6 +117,7 @@ let settings = loadSettings();
 let lastRotationTime = 0; // tracks when proactive rotation last happened
 let _consecutive400s = 0;  // global: consecutive 400 errors across requests (reset on success)
 let _consecutive400sAt = 0;  // timestamp of last 400 (for time-based decay)
+const _lastWarnPct = new Map(); // acctName → last logged percentage (dedup 90%+ warnings)
 
 // ── Circuit breaker ──
 // When the proxy fails repeatedly (all recovery strategies exhausted), it
@@ -5257,10 +5258,15 @@ async function handleProxyRequest(clientReq, clientRes) {
     _consecutiveExhausted = 0;
     updateAccountState(token, acctName, proxyRes.headers, getFingerprintFromToken(token));
 
-    // Check if utilization is critically high and log a warning
+    // Check if utilization is critically high and log a warning (only at 90%, 95%, 100%)
     const u5h = parseFloat(proxyRes.headers['anthropic-ratelimit-unified-5h-utilization'] || '0');
     if (u5h >= 0.9) {
-      log('warn', `${acctName} at ${Math.round(u5h * 100)}% of 5h limit`);
+      const tier = u5h >= 1.0 ? 100 : u5h >= 0.95 ? 95 : 90;
+      const lastTier = _lastWarnPct.get(acctName);
+      if (lastTier !== tier) {
+        _lastWarnPct.set(acctName, tier);
+        log('warn', `${acctName} at ${tier}% of 5h limit`);
+      }
     }
 
     clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
