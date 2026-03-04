@@ -1004,6 +1004,44 @@ async function handleAPI(req, res) {
     return true;
   }
 
+  if (url.pathname === '/api/token-usage/flush' && req.method === 'POST') {
+    // Force all active sessions to claim and persist unclaimed usage now.
+    // Same logic as the periodic timer, but triggered on demand (used by commit hooks).
+    try {
+      let flushed = 0;
+      for (const [id, session] of pendingSessions) {
+        const now = Date.now();
+        if (session.cwd) {
+          try {
+            const cur = _resolveWorktreeBranch(session.cwd, execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
+            if (cur && cur !== session.branch) {
+              session.branch = cur;
+              session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
+            }
+          } catch { /* ignore */ }
+        }
+        const claimed = claimUsageInRange(session.startedAt, now);
+        for (const entry of claimed) {
+          appendTokenUsage({
+            ts: entry.ts, repo: session.repo, branch: session.branch,
+            commitHash: session.commitHash, model: entry.model,
+            inputTokens: entry.inputTokens, outputTokens: entry.outputTokens,
+            account: entry.account,
+          });
+        }
+        if (claimed.length > 0) {
+          session.startedAt = now;
+          flushed += claimed.length;
+        }
+      }
+      if (flushed > 0) log('tokens', `Flush: persisted ${flushed} entries on demand`);
+      json(res, { ok: true, flushed });
+    } catch (e) {
+      json(res, { ok: false, error: e.message }, 500);
+    }
+    return true;
+  }
+
   if (url.pathname === '/api/token-usage' && req.method === 'GET') {
     try {
       const usage = loadTokenUsage();
