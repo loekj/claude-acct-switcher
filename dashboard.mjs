@@ -1530,6 +1530,7 @@ function renderHTML() {
     flex-direction: column;
     align-items: center;
     min-width: 0;
+    max-width: 40px;
   }
   .chart-bars {
     display: flex;
@@ -2424,6 +2425,13 @@ function formatChartDate(iso) {
   return parseInt(p[2],10) + ' ' + MONTHS[parseInt(p[1],10)-1];
 }
 
+function formatChartHour(key) {
+  var parts = key.split(' ');
+  var dateParts = parts[0].split('-');
+  var hour = parseInt(parts[1], 10);
+  return parseInt(dateParts[2],10) + ' ' + MONTHS[parseInt(dateParts[1],10)-1] + ' ' + hour + 'h';
+}
+
 function renderStats(stats) {
   document.getElementById('stats-section').style.display = '';
   const grid = document.getElementById('stats-grid');
@@ -2720,6 +2728,13 @@ function tokDateKey(ts) {
   return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
 }
 
+function tokHourKey(ts) {
+  if (!ts || isNaN(ts)) return null;
+  var d = new Date(ts);
+  if (isNaN(d.getTime())) return null;
+  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0') + ' ' + String(d.getHours()).padStart(2,'0');
+}
+
 function renderTokenChart(data) {
   var el = document.getElementById('tok-chart');
   if (!el) return;
@@ -2736,13 +2751,32 @@ function renderTokenChart(data) {
   }
   var sortedModels = Object.keys(allModels).sort();
   var days = Object.keys(dayMap).sort();
-  // Cap chart columns: show last N days to avoid cramped display
-  if (days.length > TOK_MAX_CHART_COLS) days = days.slice(days.length - TOK_MAX_CHART_COLS);
-  if (!days.length) { el.innerHTML = ''; return; }
+  var useHourly = days.length <= 2;
+  var bucketMap = dayMap;
+  var buckets;
+  var formatLabel = formatChartDate;
+  if (useHourly) {
+    bucketMap = {};
+    for (var hi = 0; hi < data.length; hi++) {
+      var hkey = tokHourKey(data[hi].ts);
+      if (!hkey) continue;
+      if (!bucketMap[hkey]) bucketMap[hkey] = {};
+      var hmodel = data[hi].model || 'unknown';
+      bucketMap[hkey][hmodel] = (bucketMap[hkey][hmodel] || 0) + (data[hi].inputTokens || 0) + (data[hi].outputTokens || 0);
+    }
+    buckets = Object.keys(bucketMap).sort();
+    if (buckets.length > TOK_MAX_CHART_COLS * 2) buckets = buckets.slice(buckets.length - TOK_MAX_CHART_COLS * 2);
+    formatLabel = formatChartHour;
+  } else {
+    // Cap chart columns: show last N days to avoid cramped display
+    if (days.length > TOK_MAX_CHART_COLS) days = days.slice(days.length - TOK_MAX_CHART_COLS);
+    buckets = days;
+  }
+  if (!buckets.length) { el.innerHTML = ''; return; }
   var maxTotal = 1;
-  for (var di = 0; di < days.length; di++) {
+  for (var di = 0; di < buckets.length; di++) {
     var dayTotal = 0;
-    for (var mi = 0; mi < sortedModels.length; mi++) dayTotal += dayMap[days[di]][sortedModels[mi]] || 0;
+    for (var mi = 0; mi < sortedModels.length; mi++) dayTotal += bucketMap[buckets[di]][sortedModels[mi]] || 0;
     if (dayTotal > maxTotal) maxTotal = dayTotal;
   }
   var H = 125;
@@ -2752,11 +2786,11 @@ function renderTokenChart(data) {
   }
   legend += '</div>';
   var bars = '<div class="chart-container">';
-  for (var bi = 0; bi < days.length; bi++) {
-    var lbl = formatChartDate(days[bi]);
+  for (var bi = 0; bi < buckets.length; bi++) {
+    var lbl = formatLabel(buckets[bi]);
     bars += '<div class="chart-day"><div class="chart-bars" style="flex-direction:column-reverse;align-items:stretch;gap:1px">';
     for (var si = 0; si < sortedModels.length; si++) {
-      var val = dayMap[days[bi]][sortedModels[si]] || 0;
+      var val = bucketMap[buckets[bi]][sortedModels[si]] || 0;
       if (val === 0) continue;
       var h = Math.max(2, (val / maxTotal) * H);
       var color = getModelColor(sortedModels[si], sortedModels);
@@ -3930,7 +3964,7 @@ function _resolveWorktreeBranch(cwd, detectedBranch) {
   try {
     const candidates = execSync(`git -C "${cwd}" branch --points-at HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 })
       .trim().split('\n')
-      .map(b => b.replace(/^\*?\s+/, '').trim())
+      .map(b => b.replace(/^[*+]?\s+/, '').trim())
       .filter(b => b && !b.startsWith('worktree-'));
     if (candidates.length === 1) return candidates[0];
     if (candidates.length > 1) return candidates.find(b => b.includes('/')) || candidates[0];
