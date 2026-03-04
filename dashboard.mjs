@@ -1836,10 +1836,6 @@ function renderHTML() {
     <div id="tok-content" style="display:none">
       <div id="tok-stats" class="stat-grid" style="margin-bottom:1.25rem"></div>
       <div class="usage-card" style="margin-bottom:1rem">
-        <div class="usage-title">Daily Usage</div>
-        <div id="tok-chart"></div>
-      </div>
-      <div class="usage-card" style="margin-bottom:1rem">
         <div class="usage-title">Model Breakdown</div>
         <div id="tok-models"></div>
       </div>
@@ -2570,7 +2566,6 @@ async function changeInterval(value) {
 // ── Tokens tab ──
 
 var TOK_COLORS = ['var(--primary)', 'var(--purple)', 'var(--cyan)', 'var(--green)', 'var(--yellow)', 'var(--red)'];
-var TOK_MAX_CHART_COLS = 30;
 
 function escHtml(s) {
   if (!s) return '';
@@ -2647,7 +2642,6 @@ function applyTokenModelFilter() {
   }
   populateTokenFilters(_tokensRawData);
   renderTokenStats(data);
-  renderTokenChart(data);
   renderModelBreakdown(data);
   renderRepoBranchBreakdown(data);
 }
@@ -2711,61 +2705,6 @@ function renderTokenStats(data) {
     { v: formatNum(totalOut), l: 'Output' },
     { v: formatNum(requests), l: 'Requests' },
   ].map(function(s) { return '<div class="stat-item"><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div></div>'; }).join('');
-}
-
-function tokDateKey(ts) {
-  if (!ts || isNaN(ts)) return null;
-  var d = new Date(ts);
-  if (isNaN(d.getTime())) return null;
-  return d.getFullYear() + '-' + String(d.getMonth()+1).padStart(2,'0') + '-' + String(d.getDate()).padStart(2,'0');
-}
-
-function renderTokenChart(data) {
-  var el = document.getElementById('tok-chart');
-  if (!el) return;
-  if (!data.length) { el.innerHTML = ''; return; }
-  var dayMap = {};
-  var allModels = {};
-  for (var i = 0; i < data.length; i++) {
-    var key = tokDateKey(data[i].ts);
-    if (!key) continue;
-    if (!dayMap[key]) dayMap[key] = {};
-    var model = data[i].model || 'unknown';
-    allModels[model] = 1;
-    dayMap[key][model] = (dayMap[key][model] || 0) + (data[i].inputTokens || 0) + (data[i].outputTokens || 0);
-  }
-  var sortedModels = Object.keys(allModels).sort();
-  var days = Object.keys(dayMap).sort();
-  // Cap chart columns: show last N days to avoid cramped display
-  if (days.length > TOK_MAX_CHART_COLS) days = days.slice(days.length - TOK_MAX_CHART_COLS);
-  if (!days.length) { el.innerHTML = ''; return; }
-  var maxTotal = 1;
-  for (var di = 0; di < days.length; di++) {
-    var dayTotal = 0;
-    for (var mi = 0; mi < sortedModels.length; mi++) dayTotal += dayMap[days[di]][sortedModels[mi]] || 0;
-    if (dayTotal > maxTotal) maxTotal = dayTotal;
-  }
-  var H = 125;
-  var legend = '<div class="chart-legend">';
-  for (var li = 0; li < sortedModels.length; li++) {
-    legend += '<div class="chart-legend-item"><span class="chart-legend-dot" style="background:' + getModelColor(sortedModels[li], sortedModels) + '"></span> ' + escHtml(shortModel(sortedModels[li])) + '</div>';
-  }
-  legend += '</div>';
-  var bars = '<div class="chart-container">';
-  for (var bi = 0; bi < days.length; bi++) {
-    var lbl = formatChartDate(days[bi]);
-    bars += '<div class="chart-day"><div class="chart-bars" style="flex-direction:column-reverse;align-items:stretch;gap:1px">';
-    for (var si = 0; si < sortedModels.length; si++) {
-      var val = dayMap[days[bi]][sortedModels[si]] || 0;
-      if (val === 0) continue;
-      var h = Math.max(2, (val / maxTotal) * H);
-      var color = getModelColor(sortedModels[si], sortedModels);
-      bars += '<div class="chart-bar" style="height:'+h+'px;background:'+color+';max-width:none;border-radius:2px" data-tooltip="'+escHtml(lbl+': '+shortModel(sortedModels[si]))+' \\u2014 '+formatNum(val)+' tokens"></div>';
-    }
-    bars += '</div><div class="chart-label">'+escHtml(lbl)+'</div></div>';
-  }
-  bars += '</div>';
-  el.innerHTML = legend + bars;
 }
 
 function renderModelBreakdown(data) {
@@ -3930,7 +3869,7 @@ function _resolveWorktreeBranch(cwd, detectedBranch) {
   try {
     const candidates = execSync(`git -C "${cwd}" branch --points-at HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 })
       .trim().split('\n')
-      .map(b => b.replace(/^\*?\s+/, '').trim())
+      .map(b => b.replace(/^[*+]?\s+/, '').trim())
       .filter(b => b && !b.startsWith('worktree-'));
     if (candidates.length === 1) return candidates[0];
     if (candidates.length > 1) return candidates.find(b => b.includes('/')) || candidates[0];
