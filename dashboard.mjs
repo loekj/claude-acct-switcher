@@ -845,6 +845,10 @@ async function handleAPI(req, res) {
       'Connection': 'keep-alive',
     });
     res.write(`data: ${JSON.stringify({ tag: 'system', msg: 'Connected to log stream', line: '--- Connected to Van Damme-o-Matic log stream ---' })}\n\n`);
+    // Replay buffered history so new clients see recent logs immediately
+    for (const entry of _logBuffer) {
+      res.write(`data: ${JSON.stringify(entry)}\n\n`);
+    }
     _logSubscribers.add(res);
     req.on('close', () => _logSubscribers.delete(res));
     return true;
@@ -1788,6 +1792,117 @@ function renderHTML() {
     margin-top: 0.25rem;
     line-height: 1.6;
   }
+  #tok-stats.stat-grid { grid-template-columns: repeat(5, 1fr); }
+  .tok-trend { font-size: 0.6875rem; font-weight: 500; margin-top: 0.125rem; }
+  .tok-trend.up { color: var(--red); }
+  .tok-trend.down { color: var(--green); }
+  .tok-repo-group { margin-bottom: 0.25rem; }
+  .tok-repo-header {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.625rem 0;
+    cursor: pointer;
+    user-select: none;
+  }
+  .tok-repo-header:hover { opacity: 0.8; }
+  .tok-repo-group + .tok-repo-group .tok-repo-header {
+    border-top: 1px solid var(--bg);
+  }
+  .tok-repo-chevron {
+    font-size: 0.625rem;
+    color: var(--muted);
+    transition: transform 0.15s;
+    flex-shrink: 0;
+    width: 1rem;
+    text-align: center;
+  }
+  .tok-repo-chevron.collapsed { transform: rotate(-90deg); }
+  .tok-repo-name { font-weight: 600; }
+  .tok-repo-inactive { opacity: 0.5; }
+  .tok-branch-inactive { opacity: 0.6; }
+  .tok-inactive-sep {
+    font-size: 0.6875rem;
+    color: var(--muted);
+    padding: 0.75rem 0 0.25rem;
+    border-top: 1px dashed var(--border);
+    margin-top: 0.5rem;
+  }
+  .tok-model-cost {
+    font-size: 0.8125rem;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+    min-width: 4rem;
+    text-align: right;
+  }
+  .tok-export-btn {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    color: var(--foreground);
+    font-size: 0.75rem;
+    padding: 0.375rem 0.75rem;
+    cursor: pointer;
+    white-space: nowrap;
+  }
+  .tok-export-btn:hover { background: var(--bg); }
+  .tok-chart-wrap {
+    height: 140px;
+    display: flex;
+    align-items: flex-end;
+    gap: 2px;
+  }
+  .tok-chart-bar-group {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    min-width: 0;
+    height: 100%;
+    justify-content: flex-end;
+  }
+  .tok-chart-stack {
+    width: 100%;
+    max-width: 28px;
+    display: flex;
+    flex-direction: column-reverse;
+  }
+  .tok-chart-seg {
+    width: 100%;
+    min-height: 0;
+    transition: height 0.3s;
+    position: relative;
+    cursor: default;
+  }
+  .tok-chart-seg:first-child { border-radius: 0 0 2px 2px; }
+  .tok-chart-seg:last-child { border-radius: 2px 2px 0 0; }
+  .tok-chart-seg:hover { opacity: 0.75; }
+  .tok-chart-seg:hover::after {
+    content: attr(data-tooltip);
+    position: absolute;
+    bottom: calc(100% + 6px);
+    left: 50%;
+    transform: translateX(-50%);
+    background: var(--foreground);
+    color: #fff;
+    padding: 0.25rem 0.5rem;
+    border-radius: 6px;
+    font-size: 0.6875rem;
+    white-space: nowrap;
+    z-index: 10;
+    pointer-events: none;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
+  }
+  .tok-chart-label {
+    font-size: 0.5625rem;
+    color: var(--muted);
+    margin-top: 0.25rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    max-width: 100%;
+    text-align: center;
+  }
 </style>
 </head>
 <body>
@@ -1840,19 +1955,26 @@ function renderHTML() {
       <select class="config-select" id="tok-repo" onchange="tokFilterChange('repo')"><option value="">All repos</option></select>
       <select class="config-select" id="tok-branch" onchange="tokFilterChange('branch')"><option value="">All branches</option></select>
       <select class="config-select" id="tok-model" onchange="tokFilterChange('model')"><option value="">All models</option></select>
+      <select class="config-select" id="tok-account" onchange="tokFilterChange('account')"><option value="">All accounts</option></select>
       <select class="config-select" id="tok-time" onchange="tokFilterChange('time')">
         <option value="1">1 day</option>
         <option value="7" selected>7 days</option>
         <option value="30">30 days</option>
         <option value="90">90 days</option>
       </select>
+      <button class="tok-export-btn" onclick="exportUsageCsv()">Export CSV</button>
     </div>
     <div id="tok-empty" class="empty-state" style="display:none">No token usage data yet.</div>
     <div id="tok-content" style="display:none">
+      <div id="tok-chart" class="usage-card" style="margin-bottom:1rem"></div>
       <div id="tok-stats" class="stat-grid" style="margin-bottom:1.25rem"></div>
       <div class="usage-card" style="margin-bottom:1rem">
         <div class="usage-title">Model Breakdown</div>
         <div id="tok-models"></div>
+      </div>
+      <div class="usage-card" style="margin-bottom:1rem">
+        <div class="usage-title">Account Breakdown</div>
+        <div id="tok-accounts"></div>
       </div>
       <div class="usage-card">
         <div class="usage-title">Repository &amp; Branch</div>
@@ -2169,6 +2291,17 @@ function renderSparkline(hist, key, windowMs, mode) {
   // Binary activity area: ON (utilization > 0) vs OFF, with shaded fill
   if (hist && hist.length >= 1) {
     var pts = hist.filter(function(h) { return h.ts >= windowStart && h.ts <= windowEnd; });
+    // Insert synthetic OFF points when gap between consecutive points > 10 min
+    // This prevents the step function from holding ON state across long idle periods
+    var GAP_THRESHOLD = 10 * 60 * 1000; // 10 minutes
+    var filled = [];
+    for (var gi = 0; gi < pts.length; gi++) {
+      filled.push(pts[gi]);
+      if (gi < pts.length - 1 && (pts[gi + 1].ts - pts[gi].ts) > GAP_THRESHOLD) {
+        filled.push({ ts: pts[gi].ts + GAP_THRESHOLD, u5h: 0, u7d: 0 });
+      }
+    }
+    pts = filled;
     if (pts.length) {
       var yOn = padT, yOff = padT + chartH;
       var d = 'M' + (padL + ((pts[0].ts - windowStart) / windowMs) * chartW).toFixed(1) + ',' + yOff;
@@ -2582,6 +2715,33 @@ async function changeInterval(value) {
 
 var TOK_COLORS = ['var(--primary)', 'var(--purple)', 'var(--cyan)', 'var(--green)', 'var(--yellow)', 'var(--red)'];
 
+var TOK_PRICING = {
+  'claude-opus-4-6': { input: 15, output: 75 },
+  'claude-sonnet-4-6': { input: 3, output: 15 },
+  'claude-haiku-4-5': { input: 0.80, output: 4 },
+};
+var TOK_PRICING_DEFAULT = { input: 3, output: 15 };
+var _tokPrevPeriodData = [];
+var _tokRepoCollapsed = {};
+
+function estimateCost(model, inTok, outTok) {
+  var key = Object.keys(TOK_PRICING).find(function(k) { return model && model.indexOf(k) === 0; });
+  var p = key ? TOK_PRICING[key] : TOK_PRICING_DEFAULT;
+  return (inTok / 1e6) * p.input + (outTok / 1e6) * p.output;
+}
+
+function formatCost(dollars) {
+  if (dollars === 0) return '$0.00';
+  if (dollars < 0.01) return '&lt;$0.01';
+  if (dollars < 100) return '$' + dollars.toFixed(2);
+  return '$' + Math.round(dollars).toLocaleString();
+}
+
+function toggleRepoCollapse(repoKey) {
+  _tokRepoCollapsed[repoKey] = !_tokRepoCollapsed[repoKey];
+  renderRepoBranchBreakdown(_tokFilteredData || []);
+}
+
 function escHtml(s) {
   if (!s) return '';
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
@@ -2603,6 +2763,7 @@ function getModelColor(model, sortedModels) {
 
 var _lastTokensHash = '';
 var _tokensRawData = [];
+var _tokFilteredData = [];
 var _tokFetching = false;
 var _tokNeedsRefresh = false;
 
@@ -2619,7 +2780,9 @@ async function refreshTokens() {
   _tokNeedsRefresh = false;
   try {
     var days = tokTimeRange();
-    var since = Date.now() - days * 24 * 60 * 60 * 1000;
+    var now = Date.now();
+    var currentCutoff = now - days * 24 * 60 * 60 * 1000;
+    var since = now - 2 * days * 24 * 60 * 60 * 1000;
     var url = '/api/token-usage?since=' + since;
     var repoSel = document.getElementById('tok-repo');
     var branchSel = document.getElementById('tok-branch');
@@ -2632,7 +2795,8 @@ async function refreshTokens() {
     var hash = quickHash(data);
     if (hash === _lastTokensHash) return;
     _lastTokensHash = hash;
-    _tokensRawData = data;
+    _tokensRawData = data.filter(function(e) { return (e.timestamp || e.ts || 0) >= currentCutoff; });
+    _tokPrevPeriodData = data.filter(function(e) { var t = e.timestamp || e.ts || 0; return t < currentCutoff; });
     applyTokenModelFilter();
   } catch (e) {
     console.error('Token fetch:', e);
@@ -2651,13 +2815,23 @@ async function refreshTokens() {
 
 function applyTokenModelFilter() {
   var data = _tokensRawData;
+  var prevData = _tokPrevPeriodData;
   var modelSel = document.getElementById('tok-model');
+  var accountSel = document.getElementById('tok-account');
   if (modelSel && modelSel.value) {
     data = data.filter(function(e) { return e.model === modelSel.value; });
+    prevData = prevData.filter(function(e) { return e.model === modelSel.value; });
   }
+  if (accountSel && accountSel.value) {
+    data = data.filter(function(e) { return e.account === accountSel.value; });
+    prevData = prevData.filter(function(e) { return e.account === accountSel.value; });
+  }
+  _tokFilteredData = data;
   populateTokenFilters(_tokensRawData);
-  renderTokenStats(data);
+  renderTokenStats(data, prevData);
+  renderDailyChart(data);
   renderModelBreakdown(data);
+  renderAccountBreakdown(data);
   renderRepoBranchBreakdown(data);
 }
 
@@ -2665,14 +2839,17 @@ function populateTokenFilters(data) {
   var repoSel = document.getElementById('tok-repo');
   var branchSel = document.getElementById('tok-branch');
   var modelSel = document.getElementById('tok-model');
+  var accountSel = document.getElementById('tok-account');
   if (!repoSel || !branchSel || !modelSel) return;
   var prevRepo = repoSel.value;
   var prevBranch = branchSel.value;
   var prevModel = modelSel.value;
-  var repoSet = {}, modelSet = {};
+  var prevAccount = accountSel ? accountSel.value : '';
+  var repoSet = {}, modelSet = {}, accountSet = {};
   for (var i = 0; i < data.length; i++) {
     if (data[i].repo) repoSet[data[i].repo] = 1;
     if (data[i].model) modelSet[data[i].model] = 1;
+    if (data[i].account) accountSet[data[i].account] = 1;
   }
   var repos = Object.keys(repoSet).sort();
   repoSel.innerHTML = '<option value="">All repos</option>' +
@@ -2694,9 +2871,16 @@ function populateTokenFilters(data) {
     models.map(function(m) {
       return '<option value="' + escHtml(m) + '"' + (m === prevModel ? ' selected' : '') + '>' + escHtml(shortModel(m)) + '</option>';
     }).join('');
+  if (accountSel) {
+    var accounts = Object.keys(accountSet).sort();
+    accountSel.innerHTML = '<option value="">All accounts</option>' +
+      accounts.map(function(a) {
+        return '<option value="' + escHtml(a) + '"' + (a === prevAccount ? ' selected' : '') + '>' + escHtml(a) + '</option>';
+      }).join('');
+  }
 }
 
-function renderTokenStats(data) {
+function renderTokenStats(data, prevData) {
   var content = document.getElementById('tok-content');
   var empty = document.getElementById('tok-empty');
   if (!content || !empty) return;
@@ -2707,19 +2891,37 @@ function renderTokenStats(data) {
   }
   content.style.display = '';
   empty.style.display = 'none';
-  var totalIn = 0, totalOut = 0, requests = 0;
+  var totalIn = 0, totalOut = 0, requests = 0, totalCost = 0;
   for (var i = 0; i < data.length; i++) {
-    totalIn += data[i].inputTokens || 0;
-    totalOut += data[i].outputTokens || 0;
+    var inT = data[i].inputTokens || 0;
+    var outT = data[i].outputTokens || 0;
+    totalIn += inT;
+    totalOut += outT;
+    totalCost += estimateCost(data[i].model, inT, outT);
     requests++;
+  }
+  var trendHtml = '';
+  if (prevData && prevData.length) {
+    var prevTotal = 0;
+    for (var p = 0; p < prevData.length; p++) prevTotal += (prevData[p].inputTokens || 0) + (prevData[p].outputTokens || 0);
+    if (prevTotal > 0) {
+      var curTotal = totalIn + totalOut;
+      var pctChange = Math.round(((curTotal - prevTotal) / prevTotal) * 100);
+      if (pctChange !== 0) {
+        var arrow = pctChange > 0 ? '\u2191' : '\u2193';
+        var cls = pctChange > 0 ? 'up' : 'down';
+        trendHtml = '<div class="tok-trend ' + cls + '">' + arrow + ' ' + Math.abs(pctChange) + '% vs prev period</div>';
+      }
+    }
   }
   var statsEl = document.getElementById('tok-stats');
   if (statsEl) statsEl.innerHTML = [
-    { v: formatNum(totalIn + totalOut), l: 'Total Tokens' },
+    { v: formatNum(totalIn + totalOut), l: 'Total Tokens', extra: trendHtml },
     { v: formatNum(totalIn), l: 'Input' },
     { v: formatNum(totalOut), l: 'Output' },
     { v: formatNum(requests), l: 'Requests' },
-  ].map(function(s) { return '<div class="stat-item"><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div></div>'; }).join('');
+    { v: formatCost(totalCost), l: 'Est. Cost' },
+  ].map(function(s) { return '<div class="stat-item"><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div>' + (s.extra || '') + '</div>'; }).join('');
 }
 
 function renderModelBreakdown(data) {
@@ -2749,12 +2951,148 @@ function renderModelBreakdown(data) {
   for (var r = 0; r < sortedModels.length; r++) {
     var md = modelMap[sortedModels[r]];
     var pctR = Math.round((md.total / grandTotal) * 100);
+    var mdCost = estimateCost(sortedModels[r], md.input, md.output);
     rows += '<div class="tok-model-row">' +
       '<div class="tok-model-dot" style="background:'+getModelColor(sortedModels[r], sortedModels)+'"></div>' +
       '<div class="tok-model-name">'+escHtml(shortModel(sortedModels[r]))+'</div>' +
       '<div class="tok-model-detail">'+formatNum(md.input)+' in / '+formatNum(md.output)+' out</div>' +
       '<div class="tok-model-total">'+formatNum(md.total)+'</div>' +
+      '<div class="tok-model-cost">'+formatCost(mdCost)+'</div>' +
       '<div class="tok-model-pct">'+pctR+'%</div>' +
+    '</div>';
+  }
+  el.innerHTML = propBar + rows;
+}
+
+function renderDailyChart(data) {
+  var el = document.getElementById('tok-chart');
+  if (!el) return;
+  if (!data.length) { el.innerHTML = ''; return; }
+  var days = tokTimeRange();
+  var now = Date.now();
+  var buckets, labelFn, bucketCount;
+  if (days === 1) {
+    bucketCount = 24;
+    labelFn = function(idx) { return idx + 'h'; };
+  } else if (days <= 30) {
+    bucketCount = days;
+    labelFn = function(idx) {
+      var d = new Date(now - (days - 1 - idx) * 86400000);
+      return (d.getMonth()+1) + '/' + d.getDate();
+    };
+  } else {
+    bucketCount = 13;
+    labelFn = function(idx) {
+      var d = new Date(now - (12 - idx) * 7 * 86400000);
+      return (d.getMonth()+1) + '/' + d.getDate();
+    };
+  }
+  // Collect all models
+  var allModels = {};
+  for (var i = 0; i < data.length; i++) allModels[data[i].model || 'unknown'] = 1;
+  var sortedModels = Object.keys(allModels).sort();
+  // Init buckets
+  buckets = [];
+  for (var b = 0; b < bucketCount; b++) {
+    var obj = { total: 0 };
+    for (var mi = 0; mi < sortedModels.length; mi++) obj[sortedModels[mi]] = 0;
+    buckets.push(obj);
+  }
+  // Fill buckets
+  var periodStart = days === 1
+    ? now - 24 * 3600000
+    : days <= 30
+      ? now - days * 86400000
+      : now - 13 * 7 * 86400000;
+  for (var j = 0; j < data.length; j++) {
+    var ts = data[j].timestamp || data[j].ts || 0;
+    var tok = (data[j].inputTokens || 0) + (data[j].outputTokens || 0);
+    var elapsed = ts - periodStart;
+    if (elapsed < 0) continue;
+    var idx;
+    if (days === 1) {
+      idx = Math.floor(elapsed / 3600000);
+    } else if (days <= 30) {
+      idx = Math.floor(elapsed / 86400000);
+    } else {
+      idx = Math.floor(elapsed / (7 * 86400000));
+    }
+    if (idx >= bucketCount) idx = bucketCount - 1;
+    if (idx < 0) idx = 0;
+    var model = data[j].model || 'unknown';
+    buckets[idx][model] = (buckets[idx][model] || 0) + tok;
+    buckets[idx].total += tok;
+  }
+  var maxTotal = Math.max.apply(null, buckets.map(function(b) { return b.total; })) || 1;
+  // Build legend
+  var legend = '<div class="chart-legend">';
+  for (var li = 0; li < sortedModels.length; li++) {
+    legend += '<div class="chart-legend-item"><span class="chart-legend-dot" style="background:' + getModelColor(sortedModels[li], sortedModels) + '"></span> ' + escHtml(shortModel(sortedModels[li])) + '</div>';
+  }
+  legend += '</div>';
+  // Build bars
+  var showLabel = bucketCount <= 31;
+  var bars = '<div class="tok-chart-wrap">';
+  for (var k = 0; k < bucketCount; k++) {
+    var bucket = buckets[k];
+    var stackH = Math.round((bucket.total / maxTotal) * 120);
+    bars += '<div class="tok-chart-bar-group">';
+    bars += '<div class="tok-chart-stack" style="height:' + stackH + 'px">';
+    for (var si = 0; si < sortedModels.length; si++) {
+      var segVal = bucket[sortedModels[si]] || 0;
+      if (segVal <= 0) continue;
+      var segH = Math.max(1, Math.round((segVal / bucket.total) * stackH));
+      bars += '<div class="tok-chart-seg" style="height:' + segH + 'px;background:' + getModelColor(sortedModels[si], sortedModels) + '" data-tooltip="' + escHtml(shortModel(sortedModels[si])) + ': ' + formatNum(segVal) + '"></div>';
+    }
+    bars += '</div>';
+    if (showLabel) {
+      bars += '<div class="tok-chart-label">' + labelFn(k) + '</div>';
+    }
+    bars += '</div>';
+  }
+  bars += '</div>';
+  var chartTitle = days === 1 ? 'Hourly Usage' : days <= 30 ? 'Daily Usage' : 'Weekly Usage';
+  el.innerHTML = '<div class="usage-title">' + chartTitle + '</div>' + legend + bars;
+}
+
+function renderAccountBreakdown(data) {
+  var el = document.getElementById('tok-accounts');
+  if (!el) return;
+  if (!data.length) { el.innerHTML = ''; return; }
+  var accountMap = {};
+  for (var i = 0; i < data.length; i++) {
+    var acct = data[i].account || 'unknown';
+    if (!accountMap[acct]) accountMap[acct] = { input: 0, output: 0, total: 0, cost: 0 };
+    var inT = data[i].inputTokens || 0;
+    var outT = data[i].outputTokens || 0;
+    accountMap[acct].input += inT;
+    accountMap[acct].output += outT;
+    accountMap[acct].total += inT + outT;
+    accountMap[acct].cost += estimateCost(data[i].model, inT, outT);
+  }
+  var sortedAccounts = Object.keys(accountMap).sort(function(a,b) { return accountMap[b].total - accountMap[a].total; });
+  if (!sortedAccounts.length) { el.innerHTML = ''; return; }
+  var grandTotal = 0;
+  for (var j = 0; j < sortedAccounts.length; j++) grandTotal += accountMap[sortedAccounts[j]].total;
+  if (!grandTotal) grandTotal = 1;
+  var propBar = '<div class="tok-proportion">';
+  for (var k = 0; k < sortedAccounts.length; k++) {
+    var pct = (accountMap[sortedAccounts[k]].total / grandTotal) * 100;
+    propBar += '<div class="tok-proportion-seg" style="width:' + pct + '%;background:' + TOK_COLORS[k % TOK_COLORS.length] + '"></div>';
+  }
+  propBar += '</div>';
+  var rows = '';
+  for (var r = 0; r < sortedAccounts.length; r++) {
+    var ad = accountMap[sortedAccounts[r]];
+    var pctR = Math.round((ad.total / grandTotal) * 100);
+    var cost = ad.cost;
+    rows += '<div class="tok-model-row">' +
+      '<div class="tok-model-dot" style="background:' + TOK_COLORS[r % TOK_COLORS.length] + '"></div>' +
+      '<div class="tok-model-name">' + escHtml(sortedAccounts[r]) + '</div>' +
+      '<div class="tok-model-detail">' + formatNum(ad.input) + ' in / ' + formatNum(ad.output) + ' out</div>' +
+      '<div class="tok-model-total">' + formatNum(ad.total) + '</div>' +
+      '<div class="tok-model-cost">' + formatCost(cost) + '</div>' +
+      '<div class="tok-model-pct">' + pctR + '%</div>' +
     '</div>';
   }
   el.innerHTML = propBar + rows;
@@ -2764,44 +3102,100 @@ function renderRepoBranchBreakdown(data) {
   var el = document.getElementById('tok-repos');
   if (!el) return;
   if (!data.length) { el.innerHTML = ''; return; }
-  var map = {};
+  var now = Date.now();
+  var inactiveThreshold = now - 3 * 86400000;
   var allModels = {};
+  // Group by repo, then by branch
+  var repoMap = {};
   for (var i = 0; i < data.length; i++) {
-    var key = (data[i].repo || 'unknown') + '::' + (data[i].branch || 'unknown');
-    if (!map[key]) map[key] = { repo: data[i].repo || 'unknown', branch: data[i].branch || 'unknown', totalIn: 0, totalOut: 0, models: {} };
+    var repo = data[i].repo || 'unknown';
+    var branch = data[i].branch || 'unknown';
     var inTok = data[i].inputTokens || 0;
     var outTok = data[i].outputTokens || 0;
-    map[key].totalIn += inTok;
-    map[key].totalOut += outTok;
     var m = data[i].model || 'unknown';
+    var ts = data[i].timestamp || data[i].ts || 0;
     allModels[m] = 1;
-    if (!map[key].models[m]) map[key].models[m] = { input: 0, output: 0 };
-    map[key].models[m].input += inTok;
-    map[key].models[m].output += outTok;
+    if (!repoMap[repo]) repoMap[repo] = { totalIn: 0, totalOut: 0, lastTs: 0, cost: 0, branches: {} };
+    repoMap[repo].totalIn += inTok;
+    repoMap[repo].totalOut += outTok;
+    repoMap[repo].cost += estimateCost(m, inTok, outTok);
+    if (ts > repoMap[repo].lastTs) repoMap[repo].lastTs = ts;
+    if (!repoMap[repo].branches[branch]) repoMap[repo].branches[branch] = { totalIn: 0, totalOut: 0, lastTs: 0, models: {} };
+    var br = repoMap[repo].branches[branch];
+    br.totalIn += inTok;
+    br.totalOut += outTok;
+    if (ts > br.lastTs) br.lastTs = ts;
+    if (!br.models[m]) br.models[m] = { input: 0, output: 0 };
+    br.models[m].input += inTok;
+    br.models[m].output += outTok;
   }
-  var sorted = Object.values(map).sort(function(a,b) { return (b.totalIn + b.totalOut) - (a.totalIn + a.totalOut); });
-  var grandTotal = 0;
-  for (var j = 0; j < sorted.length; j++) grandTotal += sorted[j].totalIn + sorted[j].totalOut;
-  if (!grandTotal) grandTotal = 1;
   var sortedAllModels = Object.keys(allModels).sort();
+  var grandTotal = 0;
+  var repoList = Object.keys(repoMap).map(function(r) {
+    var rd = repoMap[r];
+    var total = rd.totalIn + rd.totalOut;
+    grandTotal += total;
+    return { key: r, name: r.split('/').pop(), totalIn: rd.totalIn, totalOut: rd.totalOut, total: total, lastTs: rd.lastTs, cost: rd.cost, branches: rd.branches };
+  });
+  if (!grandTotal) grandTotal = 1;
+  // Split active/inactive
+  var active = repoList.filter(function(r) { return r.lastTs >= inactiveThreshold; });
+  var inactive = repoList.filter(function(r) { return r.lastTs < inactiveThreshold; });
+  active.sort(function(a,b) { return b.total - a.total; });
+  inactive.sort(function(a,b) { return b.total - a.total; });
+  // Default collapse: collapsed if more than 3 active repos
+  var defaultCollapsed = active.length > 3;
+  function renderRepoGroup(repo, isInactive) {
+    if (_tokRepoCollapsed[repo.key] === undefined) {
+      _tokRepoCollapsed[repo.key] = isInactive ? true : defaultCollapsed;
+    }
+    var collapsed = _tokRepoCollapsed[repo.key];
+    var pct = Math.round((repo.total / grandTotal) * 100);
+    var cost = repo.cost;
+    var cls = 'tok-repo-group' + (isInactive ? ' tok-repo-inactive' : '');
+    var chevCls = 'tok-repo-chevron' + (collapsed ? ' collapsed' : '');
+    var h = '<div class="' + cls + '">';
+    h += '<div class="tok-repo-header" onclick="toggleRepoCollapse(this.dataset.key)" data-key="' + escHtml(repo.key) + '">';
+    h += '<span class="' + chevCls + '">\u25BC</span>';
+    h += '<span class="tok-repo-name">' + escHtml(repo.name) + '</span>';
+    h += '<span class="tok-model-detail" style="flex:1">' + formatNum(repo.totalIn) + ' in / ' + formatNum(repo.totalOut) + ' out</span>';
+    h += '<span class="tok-model-cost">' + formatCost(cost) + '</span>';
+    h += '<span class="tok-model-pct">' + pct + '%</span>';
+    h += '</div>';
+    if (!collapsed) {
+      var branchKeys = Object.keys(repo.branches).sort(function(a,b) {
+        var ta = repo.branches[a].totalIn + repo.branches[a].totalOut;
+        var tb = repo.branches[b].totalIn + repo.branches[b].totalOut;
+        return tb - ta;
+      });
+      for (var bi = 0; bi < branchKeys.length; bi++) {
+        var br = repo.branches[branchKeys[bi]];
+        var brTotal = br.totalIn + br.totalOut;
+        var brPct = Math.round((brTotal / grandTotal) * 100);
+        var brInactive = br.lastTs < inactiveThreshold;
+        var brCls = 'tok-branch-row' + (brInactive ? ' tok-branch-inactive' : '');
+        var modelEntries = Object.entries(br.models).sort(function(a,b) { return (b[1].input + b[1].output) - (a[1].input + a[1].output); });
+        var modelDetail = modelEntries.map(function(e) {
+          return '<span style="color:'+getModelColor(e[0], sortedAllModels)+'">'+escHtml(shortModel(e[0]))+'</span> '+formatNum(e[1].input)+' / '+formatNum(e[1].output);
+        }).join(' \u00b7 ');
+        h += '<div class="' + brCls + '" style="padding-left:1.5rem">';
+        h += '<div class="tok-branch-name"><span class="tok-branch-badge">' + escHtml(branchKeys[bi]) + '</span></div>';
+        h += '<div class="tok-branch-stats">';
+        h += '<span class="tok-branch-total">' + formatNum(br.totalIn) + ' / ' + formatNum(br.totalOut) + '</span>';
+        h += '<span class="tok-branch-pct">' + brPct + '%</span>';
+        h += '</div>';
+        h += '<div class="tok-branch-detail">' + modelDetail + '</div>';
+        h += '</div>';
+      }
+    }
+    h += '</div>';
+    return h;
+  }
   var html = '';
-  for (var k = 0; k < sorted.length; k++) {
-    var item = sorted[k];
-    var itemTotal = item.totalIn + item.totalOut;
-    var pct = Math.round((itemTotal / grandTotal) * 100);
-    var repoName = item.repo.split('/').pop();
-    var modelEntries = Object.entries(item.models).sort(function(a,b) { return (b[1].input + b[1].output) - (a[1].input + a[1].output); });
-    var modelDetail = modelEntries.map(function(e) {
-      return '<span style="color:'+getModelColor(e[0], sortedAllModels)+'">'+escHtml(shortModel(e[0]))+'</span> '+formatNum(e[1].input)+' / '+formatNum(e[1].output);
-    }).join(' \\u00b7 ');
-    html += '<div class="tok-branch-row">' +
-      '<div class="tok-branch-name">' + escHtml(repoName) + ' <span class="tok-branch-badge">' + escHtml(item.branch) + '</span></div>' +
-      '<div class="tok-branch-stats">' +
-        '<span class="tok-branch-total">' + formatNum(item.totalIn) + ' / ' + formatNum(item.totalOut) + '</span>' +
-        '<span class="tok-branch-pct">' + pct + '%</span>' +
-      '</div>' +
-      '<div class="tok-branch-detail">' + modelDetail + '</div>' +
-    '</div>';
+  for (var a = 0; a < active.length; a++) html += renderRepoGroup(active[a], false);
+  if (inactive.length) {
+    html += '<div class="tok-inactive-sep">Inactive (no usage in last 3 days)</div>';
+    for (var n = 0; n < inactive.length; n++) html += renderRepoGroup(inactive[n], true);
   }
   el.innerHTML = html;
 }
@@ -2812,12 +3206,41 @@ function tokFilterChange(which) {
     if (branchEl) branchEl.value = '';
     _lastTokensHash = '';
     refreshTokens();
-  } else if (which === 'model') {
+  } else if (which === 'model' || which === 'account') {
     applyTokenModelFilter();
   } else {
     _lastTokensHash = '';
     refreshTokens();
   }
+}
+
+function exportUsageCsv() {
+  var data = _tokFilteredData || _tokensRawData;
+  if (!data.length) { showToast('No data to export'); return; }
+  var lines = ['timestamp,repo,branch,model,account,input_tokens,output_tokens'];
+  for (var i = 0; i < data.length; i++) {
+    var e = data[i];
+    var ts = e.timestamp || e.ts || '';
+    if (ts) ts = new Date(ts).toISOString();
+    lines.push([
+      ts,
+      '"' + (e.repo || '').replace(/"/g, '""') + '"',
+      '"' + (e.branch || '').replace(/"/g, '""') + '"',
+      '"' + (e.model || '').replace(/"/g, '""') + '"',
+      '"' + (e.account || '').replace(/"/g, '""') + '"',
+      e.inputTokens || 0,
+      e.outputTokens || 0
+    ].join(','));
+  }
+  var blob = new Blob([lines.join('\\n')], { type: 'text/csv' });
+  var url = URL.createObjectURL(blob);
+  var a = document.createElement('a');
+  a.href = url;
+  a.download = 'usage-export-' + new Date().toISOString().slice(0,10) + '.csv';
+  document.body.appendChild(a);
+  a.click();
+  document.body.removeChild(a);
+  URL.revokeObjectURL(url);
 }
 
 refresh();
@@ -2830,7 +3253,7 @@ if (_initTab && document.getElementById('tab-' + _initTab)) switchTab(_initTab);
 
 // ── Log stream ──
 let _logES = null;
-const LOG_MAX_LINES = 500;
+const LOG_MAX_LINES = 5000;
 const LOG_TAG_COLORS = {
   error: '#f85149', warn: '#f85149',
   switch: '#d29922', proactive: '#d29922',
@@ -2853,11 +3276,21 @@ function connectLogStream() {
       const tag = (data.tag || 'info').toLowerCase();
       const color = LOG_TAG_COLORS[tag] || '#8b949e';
       line.innerHTML = '<span style="color:' + color + ';font-weight:600">[' + tag.toUpperCase() + ']</span> ' + escapeHtml(data.msg || data.line || '');
-      container.appendChild(line);
-      // Prune oldest lines
-      while (container.childElementCount > LOG_MAX_LINES) container.removeChild(container.firstChild);
-      // Auto-scroll unless user scrolled up
+      // Check scroll position before DOM changes
       const atBottom = container.scrollHeight - container.scrollTop - container.clientHeight < 60;
+      container.appendChild(line);
+      // Prune oldest lines, preserving scroll position if user scrolled up
+      var pruneCount = container.childElementCount - LOG_MAX_LINES;
+      if (pruneCount > 0 && !atBottom) {
+        var removedHeight = 0;
+        while (pruneCount-- > 0) {
+          removedHeight += container.firstChild.offsetHeight;
+          container.removeChild(container.firstChild);
+        }
+        container.scrollTop -= removedHeight;
+      } else {
+        while (container.childElementCount > LOG_MAX_LINES) container.removeChild(container.firstChild);
+      }
       if (atBottom) container.scrollTop = container.scrollHeight;
     } catch {}
   };
@@ -2940,14 +3373,20 @@ const MAX_EVENT_LOG = 50;
 
 // ── Live log streaming (SSE subscribers for `vdm logs`) ──
 const _logSubscribers = new Set();
+const _logBuffer = [];
+const LOG_BUFFER_MAX = 2000;
 
 function log(tag, msg, extra = '') {
   const ts = new Date().toLocaleTimeString('en-GB', { hour12: false });
   const line = `[${ts}] [${tag}] ${msg}${extra ? ' ' + extra : ''}`;
   try { console.log(line); } catch { /* stdout broken (EIO/EPIPE) — ignore */ }
+  const entry = { ts, tag, msg: msg + (extra ? ' ' + extra : ''), line };
+  // Buffer for replay to new SSE clients
+  _logBuffer.push(entry);
+  if (_logBuffer.length > LOG_BUFFER_MAX) _logBuffer.shift();
   // Push to all SSE subscribers (these still work even when stdout is dead)
   for (const res of [..._logSubscribers]) {
-    try { res.write(`data: ${JSON.stringify({ ts, tag, msg: msg + (extra ? ' ' + extra : ''), line })}\n\n`); }
+    try { res.write(`data: ${JSON.stringify(entry)}\n\n`); }
     catch { _logSubscribers.delete(res); }
   }
 }

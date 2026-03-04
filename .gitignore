@@ -8,6 +8,7 @@ activity-log.json
 account-state.json
 utilization-history.json
 probe-log.json
+token-usage.json
 .dashboard.pid
 
 # Logs
