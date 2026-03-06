@@ -291,7 +291,7 @@ const SESSION_FILES_MAX = 100;                 // max filesModified per session
 const SESSION_BODY_MAX = 2 * 1024 * 1024;      // 2 MB — skip parsing larger bodies
 const HAIKU_TIMEOUT = 5000;                    // 5s timeout on Haiku calls
 const HAIKU_BACKOFF_MS = 2 * 60 * 1000;        // 2 min backoff after 3 consecutive failures
-const SESSION_AWAITING_THRESHOLD = 15000;      // 15s idle → "awaiting input"
+const SESSION_AWAITING_THRESHOLD = 120000;     // 2 min idle → "awaiting input"
 
 const monitoredSessions = new Map();           // sessionId → session object
 let _summarizerOverhead = { inputTokens: 0, outputTokens: 0 };
@@ -1592,9 +1592,29 @@ function renderHTML() {
     font-size: 0.8125rem;
     color: var(--muted);
     margin-bottom: 0.5rem;
-    flex-wrap: wrap;
+    cursor: pointer;
+    user-select: none;
   }
+  .session-card.collapsed .session-header { margin-bottom: 0; }
   .session-header b { color: var(--foreground); font-weight: 600; }
+  .session-header-left { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .session-header-right { flex-shrink: 0; white-space: nowrap; display: flex; align-items: center; gap: 0.5rem; margin-left: 0.5rem; }
+  .session-collapse-indicator { font-size: 0.625rem; color: var(--muted); transition: transform 0.15s; }
+  .session-card.collapsed .session-collapse-indicator { transform: rotate(-90deg); }
+  .session-card.collapsed .session-timeline,
+  .session-card.collapsed .session-meta,
+  .session-card.collapsed .session-copy-btn { display: none; }
+  .session-collapsed-activity {
+    display: none;
+    font-size: 0.75rem;
+    color: var(--muted);
+    font-style: italic;
+    margin-top: 0.375rem;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .session-card.collapsed .session-collapsed-activity { display: block; }
   .session-awaiting {
     display: inline-flex;
     align-items: center;
@@ -1612,6 +1632,8 @@ function renderHTML() {
     font-size: 0.8125rem;
     line-height: 1.6;
     margin: 0.375rem 0;
+    max-height: 500px;
+    overflow-y: auto;
   }
   .tl-input {
     color: var(--foreground);
@@ -1647,7 +1669,7 @@ function renderHTML() {
   }
   .session-copy-btn {
     position: absolute;
-    top: 0.5rem;
+    bottom: 0.5rem;
     right: 0.5rem;
     background: none;
     border: 1px solid var(--border);
@@ -3944,6 +3966,13 @@ function sessionEstCost(inTok, outTok, model) {
 }
 
 var _lastBadgeRefresh = 0;
+var _collapsedSessions = new Set();
+function toggleSessionCollapse(id) {
+  if (_collapsedSessions.has(id)) _collapsedSessions.delete(id);
+  else _collapsedSessions.add(id);
+  var card = document.querySelector('.session-card[data-sid="' + id + '"]');
+  if (card) card.classList.toggle('collapsed');
+}
 function refreshSessionsBadgeOnly() {
   // Throttle badge-only fetches to once per 10s
   var now = Date.now();
@@ -3999,16 +4028,24 @@ function renderSessions(data) {
       var state = idleMs < ${SESSION_AWAITING_THRESHOLD} ? 'processing' : 'awaiting';
       var dur = sessionDuration(Date.now() - s.startedAt);
       var idle = state === 'awaiting' ? sessionDuration(idleMs) : '';
-      var proj = s.repo ? (s.repo + (s.branch ? '/' + s.branch : '')) : (s.cwd || 'unknown');
-      html += '<div class="session-card ' + state + '">';
+      var proj = sessionProj(s);
+      var collapsed = _collapsedSessions.has(s.id) ? ' collapsed' : '';
+      html += '<div class="session-card ' + state + collapsed + '" data-sid="' + s.id + '">';
       html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
-      html += '<div class="session-header">';
-      html += '<b>' + escapeHtml(s.account) + '</b> \\u00b7 ' + escapeHtml(s.model || '?') + ' \\u00b7 ' + escapeHtml(proj);
-      html += ' <span style="margin-left:auto">' + dur + '</span>';
+      html += '<div class="session-header" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
+      html += '<span class="session-collapse-indicator">\\u25BC</span>';
+      html += '<span class="session-header-left"><b>' + escapeHtml(s.account) + '</b> \\u00b7 ' + escapeHtml(proj) + '</span>';
+      html += '<span class="session-header-right"><span>' + dur + '</span>';
       if (state === 'awaiting') {
-        html += ' <span class="session-awaiting">\\u23F8 input ' + idle + '</span>';
+        html += '<span class="session-awaiting">\\u23F8 input ' + idle + '</span>';
       }
+      html += '</span>';
       html += '</div>';
+      // Collapsed activity summary (visible only when collapsed)
+      if (s.currentActivity) {
+        var brailleC = state === 'processing' ? 'braille-spin' : 'braille-static';
+        html += '<div class="session-collapsed-activity"><span class="' + brailleC + '"></span>' + escapeHtml(s.currentActivity) + '</div>';
+      }
       // Timeline
       html += '<div class="session-timeline">';
       s.timeline.forEach(function(e) {
@@ -4037,12 +4074,14 @@ function renderSessions(data) {
       var ago = sessionTimeAgo(s.completedAt || s.startedAt);
       var dur = sessionDuration(s.duration || 0);
       var cost = sessionEstCost(s.totalInputTokens || 0, s.totalOutputTokens || 0, s.model);
-      var proj = s.repo ? (s.repo + (s.branch ? '/' + s.branch : '')) : (s.cwd || 'unknown');
-      html += '<div class="session-card completed">';
+      var proj = sessionProj(s);
+      var collapsed = _collapsedSessions.has(s.id) ? ' collapsed' : '';
+      html += '<div class="session-card completed' + collapsed + '" data-sid="' + s.id + '">';
       html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
-      html += '<div class="session-header">';
-      html += '<span>' + ago + '</span> \\u00b7 <b>' + escapeHtml(s.account) + '</b> \\u00b7 ' + escapeHtml(s.model || '?');
-      html += ' <span style="margin-left:auto">' + dur + ' \\u00b7 ~$' + cost + '</span>';
+      html += '<div class="session-header" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
+      html += '<span class="session-collapse-indicator">\\u25BC</span>';
+      html += '<span class="session-header-left"><span>' + ago + '</span> \\u00b7 <b>' + escapeHtml(s.account) + '</b> \\u00b7 ' + escapeHtml(proj) + '</span>';
+      html += '<span class="session-header-right"><span>' + dur + ' \\u00b7 ~$' + cost + '</span></span>';
       html += '</div>';
       html += '<div class="session-timeline">';
       (s.timeline || []).forEach(function(e) {
@@ -4080,13 +4119,21 @@ function updateSessionsBadge(count) {
   }
 }
 
+function sessionProj(s) {
+  if (s.branch) {
+    if (s.branch === 'main' || s.branch === 'master') return (s.repo || '') + '/' + s.branch;
+    var parts = s.branch.split('/');
+    return parts[parts.length - 1];
+  }
+  return s.repo || s.cwd || 'unknown';
+}
 function copyTimeline(sessionId) {
   // Find session data from last render
   fetch('/api/sessions').then(function(r) { return r.json(); }).then(function(data) {
     var s = (data.active || []).find(function(a) { return a.id === sessionId; })
          || (data.recent || []).find(function(a) { return a.id === sessionId; });
     if (!s) { showToast('Session not found'); return; }
-    var proj = s.repo ? (s.repo + (s.branch ? '/' + s.branch : '')) : (s.cwd || 'session');
+    var proj = sessionProj(s);
     var dur = sessionDuration(s.duration || (Date.now() - s.startedAt));
     var tok = formatNum((s.totalInputTokens || 0) + (s.totalOutputTokens || 0));
     var md = '## Session: ' + proj + ' (' + dur + ', ' + tok + ' tokens)\\n';
@@ -5143,16 +5190,16 @@ async function callHaikuSummary(userText, assistantContext, toolUses) {
     return arg ? `${name} ${arg}` : name;
   }).slice(0, 10).join(', ');
 
-  const prompt = `Tersely summarize this Claude Code turn for a dev dashboard.
-1-3 lines max. Fold decisions into action lines.
+  const prompt = `Summarize this Claude Code turn for a developer monitoring dashboard.
+Focus on DECISIONS made and FINDINGS discovered. Be terse — no bullets, no markdown.
 
-USER: ${userText.slice(0, 500)}
-${assistantContext ? `CONTEXT: ${assistantContext.slice(0, 300)}` : ''}
-TOOLS: ${toolList || 'none'}
+USER REQUEST: ${userText.slice(0, 500)}
+${assistantContext ? `CLAUDE FOUND: ${assistantContext.slice(0, 300)}` : ''}
+TOOLS USED: ${toolList || 'none'}
 
-Format:
-input: <imperative, max 60 chars, if plan referenced include gist>
-did: <1-3 lines, max 80 chars each>`;
+Reply format (plain text, no markdown):
+TASK: what user asked, imperative, max 60 chars
+1-3 lines: key decisions, findings, or outcomes, max 80 chars each`;
 
   let token;
   try { token = getActiveToken(); } catch { return null; }
@@ -5190,14 +5237,22 @@ did: <1-3 lines, max 80 chars each>`;
       _summarizerOverhead.outputTokens += data.usage.output_tokens || 0;
     }
 
-    // Parse response
+    // Parse response — strip markdown noise and template placeholders
     const text = data.content?.[0]?.text || '';
-    const inputMatch = text.match(/input:\s*(.+)/i);
-    const didMatch = text.match(/did:\s*([\s\S]+)/i);
-    const input = inputMatch ? inputMatch[1].trim().slice(0, 60) : null;
-    const actions = didMatch
-      ? didMatch[1].trim().split('\n').map(l => l.replace(/^[-*]\s*/, '').trim()).filter(Boolean).slice(0, 3)
-      : [];
+    const lines = text.split('\n').map(l => l.replace(/^[\s*\-•>]+/, '').trim()).filter(Boolean);
+    // Skip lines that look like template instructions (contain <placeholder>)
+    const cleaned = lines.filter(l => !/^<.*>$/.test(l) && !(/^</.test(l) && />$/.test(l)));
+    let input = null;
+    const actions = [];
+    for (const line of cleaned) {
+      const taskMatch = line.match(/^TASK:\s*(.+)/i);
+      if (taskMatch) {
+        input = taskMatch[1].slice(0, 100);
+      } else {
+        actions.push(line.slice(0, 100));
+      }
+    }
+    if (actions.length > 3) actions.length = 3;
 
     if (input || actions.length) {
       return { input, actions };
