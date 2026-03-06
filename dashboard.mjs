@@ -5193,7 +5193,7 @@ async function callHaikuSummary(userText, assistantContext, toolUses) {
     return arg ? `${name} ${arg}` : name;
   }).slice(0, 10).join(', ');
 
-  const prompt = `Write a 2-3 sentence plain-text summary of this Claude Code turn. No labels, no bullets, no markdown. First sentence: what the user asked (imperative). Next 1-2 sentences: what was done or found.
+  const prompt = `Write a 2-3 sentence plain-text summary. No labels, no bullets, no markdown. Focus on decisions made, findings discovered, and outcomes. Skip verification steps, syntax checks, and routine confirmations.
 
 ${userText.slice(0, 500)}
 ${assistantContext ? assistantContext.slice(0, 300) : ''}
@@ -5352,45 +5352,54 @@ function updateSessionTimeline(bodyObj, acctName, usage, token) {
     }
   }
 
-  // Queue or call Haiku
-  if (session.pendingHaiku) {
-    session.queuedTurns.push(turn);
-    // Cap queued turns to prevent unbounded growth if Haiku is consistently slow
-    if (session.queuedTurns.length > 10) session.queuedTurns.splice(0, session.queuedTurns.length - 5);
-    return;
-  }
-
-  session.pendingHaiku = true;
-  callHaikuSummary(turn.userText, turn.assistantContext, turn.toolUses).then(result => {
-    const summary = result || formatTurnFallback(turn.userText, turn.toolUses);
-    if (summary.input) {
-      session.timeline.push({ type: 'input', text: summary.input });
-    }
-    for (const action of (summary.actions || [])) {
-      session.timeline.push({ type: 'action', text: action });
-    }
-    // Trim timeline
-    while (session.timeline.length > SESSION_TIMELINE_MAX) session.timeline.shift();
-
-    // Process queued turns (batch: just use the latest)
-    const queued = session.queuedTurns.splice(0);
-    session.pendingHaiku = false;
-    if (queued.length > 0) {
-      const latest = queued[queued.length - 1];
-      const fb = formatTurnFallback(latest.userText, latest.toolUses);
+  // Batch turns: accumulate for 10s, then summarise together
+  session.queuedTurns.push(turn);
+  if (session.queuedTurns.length > 10) session.queuedTurns.splice(0, session.queuedTurns.length - 5);
+  if (session._batchTimer || session.pendingHaiku) return;
+  session._batchTimer = setTimeout(() => {
+    session._batchTimer = null;
+    const batch = session.queuedTurns.splice(0);
+    if (!batch.length) return;
+    // Merge batch: combine user texts and tool uses, use latest assistant context
+    const mergedUser = batch.map(t => t.userText).join(' | ');
+    const mergedContext = batch[batch.length - 1].assistantContext;
+    const mergedTools = batch.flatMap(t => t.toolUses);
+    session.pendingHaiku = true;
+    callHaikuSummary(mergedUser, mergedContext, mergedTools).then(result => {
+      const summary = result || formatTurnFallback(mergedUser, mergedTools);
+      if (summary.input) {
+        session.timeline.push({ type: 'input', text: summary.input });
+      }
+      for (const action of (summary.actions || [])) {
+        session.timeline.push({ type: 'action', text: action });
+      }
+      while (session.timeline.length > SESSION_TIMELINE_MAX) session.timeline.shift();
+      session.pendingHaiku = false;
+      // If more turns arrived while we were waiting, kick off another batch
+      if (session.queuedTurns.length > 0) {
+        session._batchTimer = setTimeout(() => {
+          session._batchTimer = null;
+          // Re-trigger by pushing a synthetic empty turn check
+          const next = session.queuedTurns.splice(0);
+          if (!next.length) return;
+          const mu = next.map(t => t.userText).join(' | ');
+          const mc = next[next.length - 1].assistantContext;
+          const mt = next.flatMap(t => t.toolUses);
+          const fb = formatTurnFallback(mu, mt);
+          if (fb.input) session.timeline.push({ type: 'input', text: fb.input });
+          for (const a of fb.actions) session.timeline.push({ type: 'action', text: a });
+          while (session.timeline.length > SESSION_TIMELINE_MAX) session.timeline.shift();
+        }, 10000);
+      }
+    }).catch(() => {
+      const fb = formatTurnFallback(mergedUser, mergedTools);
       if (fb.input) session.timeline.push({ type: 'input', text: fb.input });
       for (const a of fb.actions) session.timeline.push({ type: 'action', text: a });
       while (session.timeline.length > SESSION_TIMELINE_MAX) session.timeline.shift();
-    }
-  }).catch(() => {
-    // Fallback on any error
-    const fb = formatTurnFallback(turn.userText, turn.toolUses);
-    if (fb.input) session.timeline.push({ type: 'input', text: fb.input });
-    for (const a of fb.actions) session.timeline.push({ type: 'action', text: a });
-    while (session.timeline.length > SESSION_TIMELINE_MAX) session.timeline.shift();
-    session.pendingHaiku = false;
-    session.queuedTurns.splice(0);
-  });
+      session.pendingHaiku = false;
+      session.queuedTurns.splice(0);
+    });
+  }, 10000);
 }
 
 function persistCompletedSession(session) {
