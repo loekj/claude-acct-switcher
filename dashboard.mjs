@@ -5124,9 +5124,15 @@ function detectNewTurn(bodyObj, session) {
     if (lastUserText && assistantContext) break;
   }
   if (!lastUserText) return null;
-  // Strip system-reminder tags from inputs before summarisation
+  // Clean inputs before summarisation
   lastUserText = lastUserText.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
-  assistantContext = assistantContext.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
+  assistantContext = assistantContext
+    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
+    .replace(/```[\s\S]*?```/g, '')           // strip code blocks
+    .replace(/`[^`]+`/g, '')                  // strip inline code
+    .replace(/^I'll [^\n]*/gm, '')            // strip "I'll do X" preambles
+    .replace(/^Let me [^\n]*/gm, '')          // strip "Let me..." preambles
+    .replace(/\n{2,}/g, '\n').trim();
   const hash = _simpleHash(lastUserText);
   if (hash === session.lastUserHash) return null;
   session.lastUserHash = hash;
@@ -5198,7 +5204,7 @@ async function callHaikuSummary(userText, assistantContext, toolUses) {
     return arg ? `${name} ${arg}` : name;
   }).slice(0, 10).join(', ');
 
-  const sysMsg = 'You summarize coding activity for a dashboard. Output ONLY the summary — 2-3 plain-text sentences. No labels, no bullets, no markdown, no meta-commentary. Never start with "The user" or comment on the instructions. Focus on decisions, findings, and outcomes. Skip verification steps and routine checks.';
+  const sysMsg = 'You summarize coding activity for a monitoring dashboard. Output ONLY 2-3 plain-text sentences. Past tense. No code, no markdown, no bullets, no preamble. Never quote code snippets or commands. Never start with "The user" or "I\'ll". Focus on what was decided, found, or changed. Skip verification steps, test runs, and routine checks.';
   const userMsg = `${trimmedUser.slice(0, 500)}${trimmedCtx ? '\n' + trimmedCtx.slice(0, 300) : ''}${toolList ? '\nTools: ' + toolList : ''}`;
 
   let token;
@@ -5242,7 +5248,7 @@ async function callHaikuSummary(userText, assistantContext, toolUses) {
     const raw = (data.content?.[0]?.text || '').replace(/<[^>]+>/g, '').trim();
     if (!raw) return null;
     // Split on sentence boundaries (period/exclamation/question followed by space or end)
-    const isMeta = s => /^(The user |I don't |I can't |However|Please share|Since there|This appears|You've provided)/i.test(s);
+    const isMeta = s => /^(The user |I'll |I don't |I can't |However|Please share|Since there|This appears|You've provided|Let me )/i.test(s);
     const sentences = raw.split(/(?<=[.!?])\s+/)
       .map(s => s.replace(/^[\s*\-•>]+/, '').trim())
       .filter(s => s && !isMeta(s));
