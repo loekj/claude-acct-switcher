@@ -2326,11 +2326,11 @@ function planBadge(subscriptionType, rateLimitTier) {
   const sub = (subscriptionType || 'free').toLowerCase();
   const tier = (rateLimitTier || '').toLowerCase();
   let label, cls;
-  if (sub === 'max') {
+  if (sub === 'max' || tier.indexOf('max') !== -1) {
     cls = 'badge-max';
-    const m = tier.match(/(\\d+)x/);
+    const m = tier.match(/(\d+)x/);
     label = m ? 'MAX ' + m[1] + 'x' : 'MAX';
-  } else if (sub === 'pro') {
+  } else if (sub === 'pro' || tier.indexOf('pro') !== -1) {
     cls = 'badge-pro';
     label = 'PRO';
   } else {
@@ -3267,6 +3267,7 @@ function renderDailyChart(data) {
 }
 
 var _chartCarouselIdx = 0;
+var _chartCarouselTimer = null;
 function chartCarouselGo(idx) {
   _chartCarouselIdx = idx;
   var slides = document.getElementById('chart-carousel-slides');
@@ -3278,12 +3279,23 @@ function chartCarouselGo(idx) {
       btns[i].classList.toggle('active', i === idx);
     }
   }
+  clearInterval(_chartCarouselTimer);
+  _chartCarouselTimer = setInterval(chartCarouselNext, 10000);
 }
+function chartCarouselNext() {
+  var dots = document.getElementById('chart-carousel-dots');
+  var count = dots ? dots.querySelectorAll('.chart-carousel-dot').length : 2;
+  chartCarouselGo((_chartCarouselIdx + 1) % count);
+}
+_chartCarouselTimer = setInterval(chartCarouselNext, 10000);
 
 function getPlanMonthlyCost(subscriptionType, rateLimitTier) {
   var sub = (subscriptionType || '').toLowerCase();
   var tier = (rateLimitTier || '').toLowerCase();
-  if (sub === 'max') {
+  // Infer subscription type from tier string when subscriptionType is missing/unknown
+  var isMax = sub === 'max' || tier.indexOf('max') !== -1;
+  var isPro = sub === 'pro' || tier.indexOf('pro') !== -1;
+  if (isMax) {
     var m = tier.match(/(\d+)x/);
     if (m) {
       var mult = parseInt(m[1], 10);
@@ -3292,7 +3304,7 @@ function getPlanMonthlyCost(subscriptionType, rateLimitTier) {
     }
     return 100;
   }
-  if (sub === 'pro') return 20;
+  if (isPro) return 20;
   return 0;
 }
 
