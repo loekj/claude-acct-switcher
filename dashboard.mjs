@@ -5182,6 +5182,11 @@ async function callHaikuSummary(userText, assistantContext, toolUses) {
   // Check backoff
   if (_haikuBackoffUntil > Date.now()) return null;
 
+  // Skip if no meaningful content to summarize
+  const trimmedUser = userText.trim();
+  const trimmedCtx = (assistantContext || '').trim();
+  if (!trimmedUser && !trimmedCtx && !toolUses.length) return null;
+
   const toolList = toolUses.map(t => {
     const name = t.name || 'unknown';
     let arg = '';
@@ -5193,11 +5198,8 @@ async function callHaikuSummary(userText, assistantContext, toolUses) {
     return arg ? `${name} ${arg}` : name;
   }).slice(0, 10).join(', ');
 
-  const prompt = `Write a 2-3 sentence plain-text summary. No labels, no bullets, no markdown. Focus on decisions made, findings discovered, and outcomes. Skip verification steps, syntax checks, and routine confirmations.
-
-${userText.slice(0, 500)}
-${assistantContext ? assistantContext.slice(0, 300) : ''}
-Tools: ${toolList || 'none'}`;
+  const sysMsg = 'You summarize coding activity for a dashboard. Output ONLY the summary — 2-3 plain-text sentences. No labels, no bullets, no markdown, no meta-commentary. Never start with "The user" or comment on the instructions. Focus on decisions, findings, and outcomes. Skip verification steps and routine checks.';
+  const userMsg = `${trimmedUser.slice(0, 500)}${trimmedCtx ? '\n' + trimmedCtx.slice(0, 300) : ''}${toolList ? '\nTools: ' + toolList : ''}`;
 
   let token;
   try { token = getActiveToken(); } catch { return null; }
@@ -5206,7 +5208,8 @@ Tools: ${toolList || 'none'}`;
   const reqBody = JSON.stringify({
     model: 'claude-haiku-4-5-20251001',
     max_tokens: 300,
-    messages: [{ role: 'user', content: prompt }],
+    system: sysMsg,
+    messages: [{ role: 'user', content: userMsg }],
   });
 
   try {
@@ -5239,8 +5242,12 @@ Tools: ${toolList || 'none'}`;
     const raw = (data.content?.[0]?.text || '').replace(/<[^>]+>/g, '').trim();
     if (!raw) return null;
     // Split on sentence boundaries (period/exclamation/question followed by space or end)
-    const sentences = raw.split(/(?<=[.!?])\s+/).map(s => s.replace(/^[\s*\-•>]+/, '').trim()).filter(Boolean);
-    const input = sentences[0] ? sentences[0].slice(0, 200) : null;
+    const isMeta = s => /^(The user |I don't |I can't |However|Please share|Since there|This appears|You've provided)/i.test(s);
+    const sentences = raw.split(/(?<=[.!?])\s+/)
+      .map(s => s.replace(/^[\s*\-•>]+/, '').trim())
+      .filter(s => s && !isMeta(s));
+    if (!sentences.length) return null;
+    const input = sentences[0].slice(0, 200);
     const actions = sentences.slice(1, 4).map(s => s.slice(0, 200));
 
     if (input || actions.length) {
