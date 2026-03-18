@@ -637,6 +637,8 @@ async function loadProfiles() {
         try { email = (await readFile(join(ACCOUNTS_DIR, `${name}.label`), 'utf8')).trim(); } catch {}
       }
 
+      const isActive = fp === activeFp;
+
       // Rate limit fetching strategy:
       // - Active account: always get fresh data (from probe cache or proxy state)
       // - Has persisted state with usage: use proxy state (updated from traffic), no probe needed
@@ -645,7 +647,6 @@ async function loadProfiles() {
       let rateLimits = null;
       let dormant = false;
       if (oauth.accessToken) {
-        const isActive = fp === activeFp;
         const persisted = persistedState[fp];
         const hasProxyState = !!(accountState.get(oauth.accessToken)?.updatedAt);
         const conserveMode = settings.rotationStrategy === 'conserve';
@@ -685,13 +686,30 @@ async function loadProfiles() {
       // Check if the proxy has marked this account as expired (e.g. via 401)
       const proxyExpired = !!(accountState.get(oauth.accessToken)?.expired);
 
+      // For the active account, prefer the live keychain's subscription/tier data
+      // over stale stored files (which may predate Claude Code populating these fields).
+      const activeOauth = activeCreds?.claudeAiOauth || {};
+      const subType = (isActive && activeOauth.subscriptionType) ? activeOauth.subscriptionType
+        : (oauth.subscriptionType || 'unknown');
+      const rlTier = (isActive && activeOauth.rateLimitTier) ? activeOauth.rateLimitTier
+        : (oauth.rateLimitTier || 'unknown');
+
+      // Backfill: if the stored file has stale/missing tier data but keychain has it,
+      // update the file so the data persists even when this account is inactive.
+      if (isActive && activeOauth.rateLimitTier && activeOauth.rateLimitTier !== oauth.rateLimitTier) {
+        try {
+          const updatedCreds = { ...creds, claudeAiOauth: { ...oauth, subscriptionType: subType, rateLimitTier: rlTier } };
+          writeFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(updatedCreds, null, 2));
+        } catch { /* non-critical */ }
+      }
+
       profiles.push({
         name,
         label: email || name,
-        subscriptionType: oauth.subscriptionType || 'unknown',
-        rateLimitTier: oauth.rateLimitTier || 'unknown',
+        subscriptionType: subType,
+        rateLimitTier: rlTier,
         expiresAt,
-        isActive: fp === activeFp,
+        isActive,
         fingerprint: fp,
         rateLimits,
         dormant,
@@ -6211,27 +6229,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       const bodyBuf = await drainResponse(proxyRes);
       const bodyStr = bodyBuf.toString('utf8').trim();
 
-      // Track this 400 for the global consecutive-failure counter.
-      // Time-decay: reset if last 400 was >30s ago (prevents stale counter
-      // from a past episode affecting unrelated future requests).
-      if (_consecutive400s > 0 && Date.now() - _consecutive400sAt > 30_000) {
-        _consecutive400s = 0;
-      }
-      _consecutive400s++;
-      _consecutive400sAt = Date.now();
-
-      // ── Circuit breaker: stop the death spiral ──
-      // If we've hit too many consecutive 400s across requests, all accounts
-      // are likely dead (billing, expired, etc).  Open the circuit breaker
-      // and fall through to passthrough mode instead of keep switching.
-      if (_consecutive400s >= CIRCUIT_400_THRESHOLD) {
-        _openCircuit(`${_consecutive400s} consecutive 400 errors`);
-        clientRes.writeHead(400, proxyRes.headers);
-        clientRes.end(bodyBuf);
-        return;
-      }
-
-      // Parse error type from response body
+      // Parse error type from response body (do this FIRST, before counter logic)
       let errorType = null;
       let parsedError = null;
       if (bodyStr) {
@@ -6257,6 +6255,19 @@ async function handleProxyRequest(clientReq, clientRes) {
       const errorMessage = parsedError?.error?.message || '';
       const isBillingError = /credit balance|billing.*issue|payment.*required/i.test(errorMessage);
 
+      // ── Content 400: pass through immediately ──
+      // If the API returned a well-formed invalid_request_error and it doesn't
+      // look like an auth/billing issue, this is a request *body* problem
+      // (bad model, invalid params, etc).  Switching accounts or refreshing
+      // tokens will never fix it — pass through without polluting the
+      // consecutive-400 counter or triggering recovery strategies.
+      if (errorType === 'invalid_request_error' && !looksLikeAuthIssue && !isBillingError) {
+        log('info', `${acctName} → 400 invalid_request_error (passing through): ${bodyStr.slice(0, 200)}`);
+        clientRes.writeHead(400, proxyRes.headers);
+        clientRes.end(bodyBuf);
+        return;
+      }
+
       // Billing errors: mark this account as temporarily unavailable so
       // pickBestAccount / pickByStrategy won't keep selecting it.
       // This is THE key fix for the death spiral: without this, the account
@@ -6269,10 +6280,23 @@ async function handleProxyRequest(clientReq, clientRes) {
         log('billing', `${acctName}: marked unavailable for ${BILLING_COOLDOWN_SEC}s (billing error)`);
       }
 
-      // Only pass through immediately if it's clearly a request validation
-      // error AND we haven't seen a suspicious pattern of repeated 400s
-      if (errorType === 'invalid_request_error' && _consecutive400s < 3 && !isBillingError) {
-        log('info', `${acctName} → 400 invalid_request_error (passing through): ${bodyStr.slice(0, 200)}`);
+      // Track this 400 for the global consecutive-failure counter.
+      // Only auth-looking and billing 400s count — content 400s were already
+      // passed through above and should not escalate the counter.
+      // Time-decay: reset if last 400 was >30s ago (prevents stale counter
+      // from a past episode affecting unrelated future requests).
+      if (_consecutive400s > 0 && Date.now() - _consecutive400sAt > 30_000) {
+        _consecutive400s = 0;
+      }
+      _consecutive400s++;
+      _consecutive400sAt = Date.now();
+
+      // ── Circuit breaker: stop the death spiral ──
+      // If we've hit too many consecutive 400s across requests, all accounts
+      // are likely dead (billing, expired, etc).  Open the circuit breaker
+      // and fall through to passthrough mode instead of keep switching.
+      if (_consecutive400s >= CIRCUIT_400_THRESHOLD) {
+        _openCircuit(`${_consecutive400s} consecutive 400 errors`);
         clientRes.writeHead(400, proxyRes.headers);
         clientRes.end(bodyBuf);
         return;
