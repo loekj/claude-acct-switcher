@@ -55,8 +55,13 @@ describe('/api/refresh  - mock OAuth server', () => {
       let body = '';
       req.on('data', c => body += c);
       req.on('end', () => {
-        const params = new URLSearchParams(body);
-        const refreshToken = params.get('refresh_token');
+        // The refresh body is JSON (see buildRefreshRequestBody), not
+        // form-urlencoded. Parsing it with URLSearchParams yielded null for
+        // every token, so all four cases fell through to the invalid_grant
+        // branch and three assertions failed against a mock that never saw the
+        // token it was handed.
+        let refreshToken = null;
+        try { refreshToken = JSON.parse(body).refresh_token; } catch { /* leave null */ }
 
         if (refreshToken === 'valid-rt') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -141,9 +146,13 @@ describe('/api/refresh  - mock OAuth server', () => {
 
 describe('Refresh flow end-to-end (pure functions)', () => {
   it('full refresh cycle: build request → parse response → compute expiry → build creds', () => {
-    // 1. Build request
+    // 1. Build request. The body is JSON — asserting on the form-encoded
+    // `refresh_token=…` shape checked a wire format this function has never
+    // produced, so the assertion passed only by accident of substring matching
+    // and broke as soon as the value moved inside quotes.
     const body = buildRefreshRequestBody('old-refresh-token');
-    assert.ok(body.includes('refresh_token=old-refresh-token'));
+    assert.equal(JSON.parse(body).refresh_token, 'old-refresh-token');
+    assert.equal(JSON.parse(body).grant_type, 'refresh_token');
 
     // 2. Simulate successful response
     const responseBody = JSON.stringify({
