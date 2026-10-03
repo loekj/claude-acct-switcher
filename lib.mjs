@@ -1482,3 +1482,45 @@ export function cacheEfficiency(rows, { since = 0, until = Infinity, bucketMs = 
   const mapAll = (o) => Object.fromEntries(Object.entries(o).map(([k, g]) => [k, finish(g)]));
   return { start, bucketMs, overall: finish(overall), byAccount: mapAll(byAccount), byModel: mapAll(byModel) };
 }
+
+// ─────────────────────────────────────────────────
+// Local-only access (dashboard + proxy)
+// ─────────────────────────────────────────────────
+
+const LOOPBACK_V4 = /^127\.\d{1,3}\.\d{1,3}\.\d{1,3}$/;
+
+/** True for a peer on this computer: 127.0.0.0/8, ::1, or IPv4-mapped 127.x. */
+export function isLoopbackAddr(addr) {
+  if (typeof addr !== 'string') return false;
+  const a = addr.toLowerCase();
+  if (a === '::1') return true;
+  return LOOPBACK_V4.test(a.startsWith('::ffff:') ? a.slice(7) : a);
+}
+
+/**
+ * True when a Host header names this computer (localhost, 127.x, [::1]). With a port,
+ * a Host that carries a different port is refused. Guards against DNS rebinding.
+ */
+export function isLocalHost(host, port = null) {
+  if (typeof host !== 'string' || !host) return false;
+  const m = host.toLowerCase().match(/^(\[[^\]]+\]|[^:]+)(?::(\d+))?$/);
+  if (!m) return false;
+  const [, name, p] = m;
+  if (p && port != null && Number(p) !== Number(port)) return false;
+  return name === 'localhost' || name === '[::1]' || LOOPBACK_V4.test(name);
+}
+
+/** An Origin header is fine when absent, or when it is a page served from this computer. */
+export function originAllowed(origin, port = null) {
+  if (origin == null || origin === '') return true;
+  try {
+    const u = new URL(origin);
+    return u.protocol === 'http:' && isLocalHost(u.host, port);
+  } catch { return false; }
+}
+
+/** Same-origin check: the Origin header names exactly the Host the request was sent to. */
+export function isSameOrigin(origin, host) {
+  if (typeof host !== 'string' || !host) return false;
+  try { return new URL(origin).host === host.toLowerCase(); } catch { return false; }
+}

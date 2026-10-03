@@ -256,7 +256,15 @@ import {
   createPerAccountLock,
   ROTATION_STRATEGIES,
   ROTATION_INTERVALS,
+  isLoopbackAddr,
+  isLocalHost,
+  originAllowed,
+  isSameOrigin,
 } from './lib.mjs';
+
+// Both servers answer only this computer. CSW_ALLOW_REMOTE=1 lets other devices in
+// (e.g. a devcontainer using host.docker.internal); web pages are still refused.
+const ALLOW_REMOTE = process.env.CSW_ALLOW_REMOTE === '1';
 
 // CSW_UPSTREAM (e.g. http://127.0.0.1:9999): send every API call to a stand-in server
 // instead of api.anthropic.com (tests).
@@ -1105,10 +1113,17 @@ function json(res, data, status = 200) {
   res.end(JSON.stringify(data));
 }
 
+const API_BODY_MAX = 1024 * 1024; // dashboard API bodies are tiny JSON
+
 function readBody(req) {
   return new Promise((resolve, reject) => {
     const chunks = [];
-    req.on('data', c => chunks.push(c));
+    let size = 0;
+    req.on('data', c => {
+      size += c.length;
+      if (size > API_BODY_MAX) { req.destroy(); reject(new Error('Request body too large')); return; }
+      chunks.push(c);
+    });
     req.on('end', () => resolve(Buffer.concat(chunks).toString()));
     req.on('error', reject);
   });
@@ -4087,12 +4102,32 @@ function openArtifactsFor(name) {
 // Server
 // ─────────────────────────────────────────────────
 
+/**
+ * Why a dashboard request is refused, or null. Only this computer may connect (unless
+ * CSW_ALLOW_REMOTE=1), the Host must be ours (DNS rebinding), and other web pages may not
+ * call the API (foreign Origin, or a cross-site fetch).
+ */
+function dashboardRefusal(req) {
+  if (!ALLOW_REMOTE) {
+    if (!isLoopbackAddr(req.socket.remoteAddress)) return 'remote';
+    if (!isLocalHost(req.headers.host, PORT)) return 'host';
+  }
+  const origin = req.headers.origin;
+  if (origin && !isSameOrigin(origin, req.headers.host)) return 'origin';
+  if (req.headers['sec-fetch-site'] === 'cross-site' && req.headers['sec-fetch-mode'] !== 'navigate') return 'cross-site';
+  return null;
+}
+
 const server = createServer(async (req, res) => {
   try {
-    // CORS for local dev
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    const refusal = dashboardRefusal(req);
+    if (refusal) {
+      res.writeHead(403, { 'Content-Type': 'text/plain' });
+      res.end(refusal === 'remote'
+        ? 'vdm dashboard: only this computer may connect (set CSW_ALLOW_REMOTE=1 to allow other devices)\n'
+        : 'vdm dashboard: request refused (not from this dashboard)\n');
+      return;
+    }
     if (req.method === 'OPTIONS') { res.writeHead(204); res.end(); return; }
 
     // API routes
@@ -5642,6 +5677,15 @@ function pipeAndWait(...streams) {
 // ── Proxy server ──
 
 const proxyServer = createServer((clientReq, clientRes) => {
+  // Only this computer may use the accounts (unless CSW_ALLOW_REMOTE=1); web pages never.
+  const remote = !ALLOW_REMOTE && !isLoopbackAddr(clientReq.socket.remoteAddress);
+  if (remote || !originAllowed(clientReq.headers.origin)) {
+    clientRes.writeHead(403, { 'Content-Type': 'application/json' });
+    clientRes.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: remote
+      ? 'vdm proxy: only this computer may connect. Set CSW_ALLOW_REMOTE=1 for the dashboard process to allow other devices.'
+      : 'vdm proxy: requests from web pages are refused.' } }));
+    return;
+  }
   // Health checks bypass the serialization queue
   if (clientReq.method === 'GET' && clientReq.url === '/health') {
     handleProxyRequest(clientReq, clientRes).catch(err => {
