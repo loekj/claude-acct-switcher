@@ -121,11 +121,11 @@ if [[ "$removed_link" != "true" ]]; then
   echo -e "  ${DIM}No vdm symlink found${NC}"
 fi
 
-# ── 4. Remove [BETA] hooks ──
+# ── 4. Remove hooks older versions installed ──
 
 if [[ -f "$INSTALL_DIR/install-hooks.sh" ]]; then
   source "$INSTALL_DIR/install-hooks.sh"
-  uninstall_beta_hooks && echo -e "  ${GREEN}✓${NC} Removed [BETA] token tracking hooks" || true
+  uninstall_beta_hooks && echo -e "  ${GREEN}✓${NC} Removed old token tracking hooks (if any)" || true
 fi
 
 # ── 5. Remove install directory ──

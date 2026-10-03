@@ -43,7 +43,7 @@ Restart your terminal. Done. The proxy auto-starts on new shells.
 vdm upgrade
 ```
 
-Fetches the latest release, auto-installs hooks, and restarts the dashboard.
+Fetches the latest release, removes hooks older versions installed, and restarts the dashboard.
 
 ## Usage
 
@@ -64,45 +64,43 @@ vdm status                  Current account + settings
 vdm config [key] [on|off]   View/toggle settings
 vdm dashboard [start|stop]  Dashboard control
 vdm logs [filter]           Stream live proxy logs
-vdm tokens [options]        Show token usage (BETA)
+vdm tokens [--days N]       Show token usage and API-price value
 vdm upgrade                 Update to latest version
 ```
 
 ### Dashboard
 
-`http://localhost:3333` — accounts, rate limits, token usage, activity log.
+`http://localhost:3333`  - accounts, sessions, artifacts, usage, activity log.
 
-#### Tokens Tab (BETA)
+#### Accounts
 
-Per-session token usage tracking with breakdowns by model, repo, branch, and time range.
+Per account: 5h and weekly windows, plus a separate **Fable weekly** bar when the account has that bucket (Fable has its own weekly limit). Each card lists the Claude Code sessions that ran through it in the last 24 hours, the account's 30-day cache hit rate, and how many artifacts it owns.
 
-- **Filter row** — repo, branch, model, and time range (1d/7d/30d/90d)
-- **Summary stats** — total tokens, input, output, requests at a glance
-- **Daily stacked bar chart** — per-model colored segments with hover tooltips
-- **Model breakdown** — input/output split with proportional bars
-- **Repo/branch breakdown** — sorted by total tokens, with per-model detail
+#### Sessions & affinity
 
-Token usage is tracked via Claude Code hooks and attributed to the correct git repo and branch — including worktrees.
+Prompt caches live per account. When a running session jumps to another account, its whole cache is written again there (1.25-2x the input price instead of ~0.1x), and limits burn faster.
 
-#### Commit Token Trailers
+With **session affinity** (on by default) every Claude Code session  - and each of its subagents  - stays on one account while its cache is warm. It only moves when that account is rate limited, used up, expired or failing. The rotation strategy decides where *new* and *idle* sessions go. Works with every strategy.
 
-When enabled, a `prepare-commit-msg` git hook appends a `Token-Usage:` trailer to each commit message showing the tokens consumed since the previous commit. This is **disabled by default**.
+Sessions are named by their `/rename` name, else `branch:id`. Each shows an affinity indicator:
 
-To enable:
+| Bars | Meaning |
+|------|---------|
+| 3 green | Locked: no move with a warm cache in the last hour |
+| 2 yellow | Holding: one warm move in the last hour, or requests a bit spread |
+| 1 red | Drifting: repeated warm moves or requests spread over accounts |
 
-```bash
-vdm config commit-tokens on
-```
+#### Artifacts
 
-Example commit message:
+Claude Code publishes artifacts with its own login (the account in the Keychain), not through the proxy. The Artifacts tab asks every account which artifacts it owns (every 15 minutes, or on demand). Paste an artifact link to find its owner. Artifact links seen in a session's messages are linked to that session.
 
-```
-Fix login validation bug
+#### Usage
 
-Token-Usage: 12,345 tokens (claude-sonnet-4-20250514)
-```
+Every request through the proxy is counted (input, output, cache reads, cache writes), per account, model, repo and branch. Data is kept as hourly rollups in `usage/` (one file per day), so it survives restarts and re-logins and has no row cap.
 
-The hook queries the dashboard for usage data and silently skips the trailer if the dashboard is unreachable or the setting is off. Merge, squash, and amend commits are always skipped. After changing this setting, run `vdm hooks` to reinstall the hook.
+- **Plan value**  - each Max account's subscription price (20x $200, 5x $100, prorated) vs the same usage at API prices
+- **Cache efficiency**  - rolling 30-day cache hit rate per account and per model, with a daily trend
+- Model, account and repo/branch breakdowns; CSV export of the hourly rows
 
 ### Settings
 
@@ -113,7 +111,7 @@ vdm config rotation <strategy>    # sticky|conserve|round-robin|spread|drain-fir
 vdm config interval <minutes>     # Round-robin timer
 vdm config serialize on|off       # Serialize proxy requests
 vdm config serialize-delay <ms>   # Serialization delay
-vdm config commit-tokens on|off  # Token-Usage trailer in commits
+vdm config affinity on|off        # Keep each session on one account
 ```
 
 ### Rotation Strategies
@@ -125,13 +123,17 @@ vdm config commit-tokens on|off  # Token-Usage trailer in commits
 | **Round-robin** | Rotate every N minutes |
 | **Spread** | Always pick lowest utilization |
 | **Drain first** | Use highest 5hr utilization first |
+| **Balance** | Put new sessions on the least-loaded account, capped per account |
+
+All strategies skip accounts whose 5h or weekly window is used up. Per-model weekly limits (Fable, and weekly Opus or Sonnet limits) only steer that model's requests away; other models keep using the account. With session affinity on, the strategy only places new and idle sessions.
 
 ## How It Works
 
 ```
 Claude Code  ──ANTHROPIC_BASE_URL──>  Local Proxy (:3334)  ──>  api.anthropic.com
                                           |
-                                          |-- Picks account per rotation strategy
+                                          |-- Keeps each session on its account (affinity)
+                                          |-- Places new sessions per rotation strategy
                                           |-- Swaps Authorization header
                                           |-- On 429 → retries with next account
                                           |-- On 401 → refreshes token, then switches
@@ -162,7 +164,7 @@ The proxy is designed to never kill your Claude Code sessions, even when things 
 
 ### Worktree Support
 
-Sessions running in git worktrees are correctly grouped with the parent repo in the dashboard and token tracking. The proxy resolves the main repo root via `--git-common-dir` and re-reads the checked-out branch on every prompt.
+Sessions running in git worktrees are grouped with the parent repo in the Usage tab. The proxy resolves the main repo root via `--git-common-dir` and maps Claude Code's `worktree-*` branches back to the real branch.
 
 ## Ports
 
@@ -176,6 +178,8 @@ Sessions running in git worktrees are correctly grouped with the parent repo in 
 ```bash
 node --test 'test/*.test.mjs'
 ```
+
+To run a throwaway copy of the proxy without touching your real login, point it at a test Keychain item and a stand-in API: `CSW_KEYCHAIN_SERVICE=vdm-test CSW_UPSTREAM=http://127.0.0.1:9999 CSW_PORT=4333 CSW_PROXY_PORT=4334 node dashboard.mjs` (run it from a copy with its own `accounts/`).
 
 ## Uninstall
 

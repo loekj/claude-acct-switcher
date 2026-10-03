@@ -1,282 +1,161 @@
 #!/usr/bin/env bash
-# install-hooks.sh — [BETA] Shared hook installer for token usage tracking
-# Sourced by install.sh, uninstall.sh, and vdm upgrade.
-# Provides: install_beta_hooks(), uninstall_beta_hooks()
+# install-hooks.sh — removes the hooks older versions installed (v4 dropped them).
+# Sourced by install.sh, uninstall.sh and vdm. Older `vdm upgrade` scripts also source
+# this file and call install_beta_hooks, so both entry points only clean up.
 #
-# Two hooks are installed:
-# 1. Claude Code hooks in ~/.claude/settings.json (UserPromptSubmit + Stop)
-# 2. Global git prepare-commit-msg hook for token usage trailers
+# Older versions installed exactly two things:
+# 1. Claude Code HTTP hooks in ~/.claude/settings.json: UserPromptSubmit → /api/session-start
+#    and Stop → /api/session-stop on localhost
+# 2. A global git prepare-commit-msg hook (marked "# vdm-token-usage") for commit trailers
+#
+# Cleanup only ever removes those exact entries. Everything else is left byte-for-byte.
 
-# Detect dashboard port (respect CSW_PORT env var)
-_VDM_PORT="${CSW_PORT:-3333}"
 _VDM_HOOKS_MARKER="# vdm-token-usage"
 _VDM_HOOKS_PATH_MARKER=".vdm-set-hooks-path"
 
-install_beta_hooks() {
-  _install_claude_code_hooks
-  _install_git_hook
-}
-
-uninstall_beta_hooks() {
+remove_legacy_hooks() {
   _uninstall_claude_code_hooks
   _uninstall_git_hook
+}
+
+# Entry points kept for older scripts
+install_beta_hooks() { remove_legacy_hooks; }
+uninstall_beta_hooks() { remove_legacy_hooks; }
+
+# True when ~/.claude/settings.json still has our old hooks
+has_legacy_hooks() {
+  [[ -f "$HOME/.claude/settings.json" ]] && grep -q "/api/session-start\|/api/session-stop" "$HOME/.claude/settings.json" 2>/dev/null
 }
 
 # ─────────────────────────────────────────────────
 # Claude Code hooks (~/.claude/settings.json)
 # ─────────────────────────────────────────────────
 
-_install_claude_code_hooks() {
-  local settings_dir="$HOME/.claude"
-  local settings_file="$settings_dir/settings.json"
-
-  mkdir -p "$settings_dir" 2>/dev/null || true
-
-  if ! python3 -c "
-import json, os, sys
-
-settings_file = '$settings_file'
-port = '$_VDM_PORT'
-start_url = f'http://localhost:{port}/api/session-start'
-stop_url = f'http://localhost:{port}/api/session-stop'
-
-# Load existing settings
-settings = {}
-if os.path.exists(settings_file):
-    try:
-        with open(settings_file) as f:
-            settings = json.load(f)
-    except (json.JSONDecodeError, ValueError):
-        # Corrupt file — backup and start fresh
-        backup = settings_file + '.vdm-backup'
-        try:
-            import shutil
-            shutil.copy2(settings_file, backup)
-        except:
-            pass
-        settings = {}
-
-if not isinstance(settings, dict):
-    settings = {}
-
-# Ensure hooks structure
-if 'hooks' not in settings:
-    settings['hooks'] = {}
-hooks = settings['hooks']
-
-def ensure_hook(event_name, url):
-    if event_name not in hooks:
-        hooks[event_name] = []
-    event_hooks = hooks[event_name]
-    if not isinstance(event_hooks, list):
-        event_hooks = []
-        hooks[event_name] = event_hooks
-    # Check if our hook is already present (by URL marker)
-    for entry in event_hooks:
-        inner = entry.get('hooks', []) if isinstance(entry, dict) else []
-        for h in inner:
-            if isinstance(h, dict) and h.get('url', '') == url:
-                return  # already installed
-    # Add our hook
-    event_hooks.append({
-        'hooks': [{'type': 'http', 'url': url, 'timeout': 5}]
-    })
-
-ensure_hook('UserPromptSubmit', start_url)
-ensure_hook('Stop', stop_url)
-
-with open(settings_file, 'w') as f:
-    json.dump(settings, f, indent=2)
-" 2>&1; then
-    echo -e "  ${YELLOW:-}Warning: Failed to install Claude Code hooks${NC:-}" >&2
-  fi
-}
-
 _uninstall_claude_code_hooks() {
   local settings_file="$HOME/.claude/settings.json"
   [[ -f "$settings_file" ]] || return 0
+  # Cheap pre-check: never parse or rewrite a file that doesn't mention our endpoints
+  grep -q "/api/session-start\|/api/session-stop" "$settings_file" 2>/dev/null || return 0
 
-  if ! python3 -c "
-import json, os, sys
+  if ! python3 - "$settings_file" <<'PY'
+import copy, json, os, re, shutil, sys, tempfile, time
 
-settings_file = '$settings_file'
-port = '$_VDM_PORT'
-start_url = f'http://localhost:{port}/api/session-start'
-stop_url = f'http://localhost:{port}/api/session-stop'
+path = os.path.realpath(sys.argv[1])  # write through a symlink, never replace it
 
-try:
-    with open(settings_file) as f:
-        settings = json.load(f)
-except:
+# Exactly what older versions installed: an http hook to localhost /api/session-start|stop
+OURS = re.compile(r'^http://(localhost|127\.0\.0\.1):\d+/api/session-(start|stop)$')
+EVENTS = ('UserPromptSubmit', 'Stop')
+
+def is_ours(h):
+    return isinstance(h, dict) and h.get('type') == 'http' and isinstance(h.get('url'), str) and bool(OURS.match(h['url']))
+
+def without_ours(settings):
+    """Copy of settings with only our hook entries removed (and containers we emptied)."""
+    out = copy.deepcopy(settings)
+    hooks = out.get('hooks')
+    if not isinstance(hooks, dict):
+        return out, False
+    changed = False
+    for ev in EVENTS:
+        groups = hooks.get(ev)
+        if not isinstance(groups, list):
+            continue
+        kept_groups = []
+        ev_changed = False
+        for g in groups:
+            inner = g.get('hooks') if isinstance(g, dict) else None
+            if isinstance(inner, list) and any(is_ours(h) for h in inner):
+                changed = ev_changed = True
+                kept = [h for h in inner if not is_ours(h)]
+                if kept:                      # a group shared with other hooks keeps them
+                    g = dict(g)
+                    g['hooks'] = kept
+                    kept_groups.append(g)
+                continue                      # a group that held only our hook goes
+            kept_groups.append(g)
+        if not ev_changed:
+            continue                          # untouched event: leave as is
+        if kept_groups:
+            hooks[ev] = kept_groups
+        else:
+            del hooks[ev]                     # we emptied this event list
+    if changed and not hooks:
+        del out['hooks']                      # we emptied the hooks object
+    return out, changed
+
+def indent_of(raw):
+    for line in raw.split('\n')[1:]:
+        stripped = line.lstrip(' \t')
+        if stripped and len(stripped) < len(line):
+            ws = line[:len(line) - len(stripped)]
+            return '\t' if ws.startswith('\t') else len(ws)
+    return 2
+
+for attempt in range(3):
+    try:
+        with open(path, encoding='utf-8') as f:
+            raw = f.read()
+        settings = json.loads(raw)
+    except Exception:
+        sys.exit(0)                           # unreadable / not JSON: leave it alone
+    if not isinstance(settings, dict):
+        sys.exit(0)
+    cleaned, changed = without_ours(settings)
+    if not changed:
+        sys.exit(0)
+
+    text = json.dumps(cleaned, indent=indent_of(raw), ensure_ascii=False)
+    if raw.endswith('\n'):
+        text += '\n'
+
+    # Backup of the exact original bytes, next to the file
+    backup = f"{path}.vdm-backup-{time.strftime('%Y%m%d-%H%M%S')}"
+    shutil.copy2(path, backup)
+
+    # Claude Code may have rewritten the file meanwhile: start over if so
+    with open(path, encoding='utf-8') as f:
+        if f.read() != raw:
+            os.remove(backup)
+            continue
+
+    mode = os.stat(path).st_mode & 0o7777
+    fd, tmp = tempfile.mkstemp(prefix='.settings.', dir=os.path.dirname(path))
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(text)
+            f.flush()
+            os.fsync(f.fileno())
+        os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except Exception:
+        try: os.remove(tmp)
+        except Exception: pass
+        raise
+
+    # Verify: the file now equals the original minus our entries, nothing else
+    try:
+        with open(path, encoding='utf-8') as f:
+            ok = json.load(f) == cleaned
+    except Exception:
+        ok = False
+    if not ok:
+        shutil.copy2(backup, path)
+        print(f"  Restored {sys.argv[1]} from backup: cleanup could not be verified", file=sys.stderr)
+        sys.exit(1)
+    print(f"  Removed old vdm hooks from {sys.argv[1]} (backup: {os.path.basename(backup)})")
     sys.exit(0)
 
-if not isinstance(settings, dict) or 'hooks' not in settings:
-    sys.exit(0)
-
-hooks = settings['hooks']
-
-def remove_hook(event_name, url):
-    if event_name not in hooks:
-        return
-    event_hooks = hooks[event_name]
-    if not isinstance(event_hooks, list):
-        return
-    filtered = []
-    for entry in event_hooks:
-        inner = entry.get('hooks', []) if isinstance(entry, dict) else []
-        has_ours = any(isinstance(h, dict) and h.get('url', '') == url for h in inner)
-        if not has_ours:
-            filtered.append(entry)
-    hooks[event_name] = filtered
-    # Clean up empty arrays
-    if not hooks[event_name]:
-        del hooks[event_name]
-
-remove_hook('UserPromptSubmit', start_url)
-remove_hook('Stop', stop_url)
-
-# Clean up empty hooks dict
-if not hooks:
-    del settings['hooks']
-
-with open(settings_file, 'w') as f:
-    json.dump(settings, f, indent=2)
-" 2>&1; then
-    echo -e "  ${YELLOW:-}Warning: Failed to uninstall Claude Code hooks${NC:-}" >&2
+print(f"  Skipped {sys.argv[1]}: it kept changing while vdm tried to clean it", file=sys.stderr)
+sys.exit(1)
+PY
+  then
+    echo -e "  ${YELLOW:-}Warning: could not remove old vdm hooks from $settings_file (file left as it was)${NC:-}" >&2
   fi
 }
 
 # ─────────────────────────────────────────────────
 # Global git prepare-commit-msg hook
 # ─────────────────────────────────────────────────
-
-_install_git_hook() {
-  local hooks_dir=""
-  local we_set_hooks_path=false
-
-  # Determine hooks directory
-  hooks_dir=$(git config --global core.hooksPath 2>/dev/null) || true
-
-  if [[ -z "$hooks_dir" ]]; then
-    hooks_dir="$HOME/.config/git/hooks"
-    mkdir -p "$hooks_dir" 2>/dev/null || true
-    git config --global core.hooksPath "$hooks_dir" 2>/dev/null || true
-    # Write marker so uninstall knows we set it
-    touch "$hooks_dir/$_VDM_HOOKS_PATH_MARKER" 2>/dev/null || true
-    we_set_hooks_path=true
-  else
-    # Expand ~ in path
-    hooks_dir="${hooks_dir/#\~/$HOME}"
-    mkdir -p "$hooks_dir" 2>/dev/null || true
-  fi
-
-  local hook_file="$hooks_dir/prepare-commit-msg"
-
-  # If our hook is already installed, remove it so we can write the latest version
-  if [[ -f "$hook_file" ]] && grep -q "$_VDM_HOOKS_MARKER" "$hook_file" 2>/dev/null; then
-    rm -f "$hook_file" 2>/dev/null || true
-  fi
-
-  # If existing hook without our marker, move aside
-  if [[ -f "$hook_file" ]] && ! grep -q "$_VDM_HOOKS_MARKER" "$hook_file" 2>/dev/null; then
-    mv "$hook_file" "${hook_file}.vdm-original" 2>/dev/null || true
-  fi
-
-  # Write our hook
-  cat > "$hook_file" << 'HOOKEOF'
-#!/bin/bash
-# vdm-token-usage
-# [BETA] Appends token usage trailer to commit messages.
-# Part of claude-acct-switcher (https://github.com/loekj/claude-acct-switcher)
-
-# Chain to repo-local hook (core.hooksPath disables .git/hooks/)
-LOCAL_HOOK="$(git rev-parse --git-dir 2>/dev/null)/hooks/prepare-commit-msg"
-[[ -x "$LOCAL_HOOK" ]] && [[ "$LOCAL_HOOK" != "$0" ]] && { "$LOCAL_HOOK" "$@" || exit $?; }
-
-# Chain to pre-existing global hook we moved aside
-[[ -x "${0}.vdm-original" ]] && { "${0}.vdm-original" "$@" || exit $?; }
-
-# Skip merge/squash/amend
-[[ "$2" == "merge" || "$2" == "squash" || "$2" == "commit" ]] && exit 0
-
-# Check if commitTokenUsage is enabled (disabled by default; silent fail = skip)
-VDM_PORT="${CSW_PORT:-3333}"
-SETTINGS=$(curl -s --max-time 2 "http://localhost:${VDM_PORT}/api/settings" 2>/dev/null) || true
-if echo "$SETTINGS" | python3 -c "import json,sys; s=json.load(sys.stdin); sys.exit(0 if s.get('commitTokenUsage',False) else 1)" 2>/dev/null; then
-  : # enabled, continue
-else
-  exit 0
-fi
-
-# Query proxy for token usage since last commit (2s timeout, silent fail)
-# Use --git-common-dir to resolve to main repo root (matches dashboard storage)
-REPO=$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null | sed 's|/\.git/*$||') ||
-REPO=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
-LAST_TS=$(( $(git log -1 --format=%ct 2>/dev/null || echo 0) * 1000 ))
-USAGE=$(curl -s --max-time 2 "http://localhost:${VDM_PORT}/api/token-usage?repo=${REPO}&since=${LAST_TS}" 2>/dev/null) || exit 0
-
-# Parse JSON and append trailer if tokens > 0
-python3 -c "
-import json, sys
-
-commit_msg_file = sys.argv[1]
-try:
-    usage = json.loads(sys.argv[2])
-except:
-    sys.exit(0)
-
-if not usage:
-    sys.exit(0)
-
-# Group by model
-models = {}
-for e in usage:
-    m = e.get('model', 'unknown')
-    if m not in models:
-        models[m] = {'in': 0, 'out': 0}
-    models[m]['in'] += e.get('inputTokens', 0)
-    models[m]['out'] += e.get('outputTokens', 0)
-
-total = sum(v['in'] + v['out'] for v in models.values())
-if total <= 0:
-    sys.exit(0)
-
-def fmt(n):
-    return f'{n:,}'
-
-# Shorten model names: claude-sonnet-4-6-20250514 -> sonnet 4.6
-def short_model(m):
-    import re
-    s = re.sub(r'^claude-', '', m)
-    s = re.sub(r'-\d{8}$', '', s)
-    # Match name-major-minor pattern
-    match = re.match(r'^([a-z]+(?:-[a-z]+)*)-(\d+(?:-\d+)*)$', s)
-    if match:
-        name = match.group(1)
-        ver = match.group(2).replace('-', '.')
-        return f'{name} {ver}'
-    return s
-
-lines = []
-for model in sorted(models.keys()):
-    v = models[model]
-    lines.append(f'{short_model(model)}: {fmt(v[\"in\"])} / {fmt(v[\"out\"])}')
-trailer = 'Token-Usage: ' + ', '.join(lines)
-
-with open(commit_msg_file, 'r') as f:
-    content = f.read()
-
-# Don't duplicate
-if 'Token-Usage:' in content:
-    sys.exit(0)
-
-with open(commit_msg_file, 'w') as f:
-    f.write(content.rstrip() + '\n\n' + trailer + '\n')
-" "$1" "$USAGE" 2>/dev/null || true
-HOOKEOF
-
-  chmod +x "$hook_file" 2>/dev/null || true
-}
 
 _uninstall_git_hook() {
   local hooks_dir=""
@@ -290,24 +169,28 @@ _uninstall_git_hook() {
 
   local hook_file="$hooks_dir/prepare-commit-msg"
 
-  if [[ -f "$hook_file" ]] && grep -q "$_VDM_HOOKS_MARKER" "$hook_file" 2>/dev/null; then
-    # Restore original if we moved one aside
+  # Only a hook that carries our marker is ours
+  if [[ -f "$hook_file" ]] && grep -qF "$_VDM_HOOKS_MARKER" "$hook_file" 2>/dev/null; then
     if [[ -f "${hook_file}.vdm-original" ]]; then
-      mv "${hook_file}.vdm-original" "$hook_file" 2>/dev/null || true
+      mv "${hook_file}.vdm-original" "$hook_file" 2>/dev/null || true   # put the user's hook back
     else
       rm -f "$hook_file" 2>/dev/null || true
     fi
   fi
 
-  # If we set core.hooksPath and no other hooks remain, unset it
+  # We created this hooks folder (and set core.hooksPath to it) only if our marker is there.
+  # Undo that only when nothing else lives in it; never delete anything that isn't ours.
   if [[ -f "$hooks_dir/$_VDM_HOOKS_PATH_MARKER" ]]; then
-    local remaining
-    remaining=$(find "$hooks_dir" -maxdepth 1 -type f ! -name "$_VDM_HOOKS_PATH_MARKER" 2>/dev/null | wc -l | tr -d ' ')
-    if [[ "$remaining" -eq 0 ]]; then
-      git config --global --unset core.hooksPath 2>/dev/null || true
-      rm -rf "$hooks_dir" 2>/dev/null || true
-    else
-      rm -f "$hooks_dir/$_VDM_HOOKS_PATH_MARKER" 2>/dev/null || true
+    local others
+    others=$(find "$hooks_dir" -mindepth 1 -maxdepth 1 ! -name "$_VDM_HOOKS_PATH_MARKER" 2>/dev/null | head -1)
+    rm -f "$hooks_dir/$_VDM_HOOKS_PATH_MARKER" 2>/dev/null || true
+    if [[ -z "$others" ]]; then
+      local current
+      current=$(git config --global core.hooksPath 2>/dev/null) || true
+      if [[ "${current/#\~/$HOME}" == "$hooks_dir" ]]; then
+        git config --global --unset core.hooksPath 2>/dev/null || true
+      fi
+      rmdir "$hooks_dir" 2>/dev/null || true
     fi
   fi
 }

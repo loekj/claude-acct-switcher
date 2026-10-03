@@ -3,13 +3,14 @@
 // Zero dependencies, uses Node.js built-in modules only.
 
 import { createServer } from 'node:http';
-import { readdir, readFile, writeFile, mkdir, unlink, chmod, rename } from 'node:fs/promises';
+import { readdir, readFile, writeFile, mkdir, unlink, chmod, rename, access, open } from 'node:fs/promises';
 import { join, basename } from 'node:path';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
 import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
-import { Transform } from 'node:stream';
+import { Transform, pipeline } from 'node:stream';
+import { StringDecoder } from 'node:string_decoder';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = dirname(__filename);
@@ -24,8 +25,11 @@ const ACCOUNTS_DIR = join(__dirname, 'accounts');
 const STATS_CACHE = join(process.env.HOME, '.claude', 'stats-cache.json');
 const CONFIG_FILE = join(__dirname, 'config.json');
 const STATE_FILE = join(__dirname, 'account-state.json');
-const TOKEN_USAGE_FILE = join(__dirname, 'token-usage.json');
-const SESSION_HISTORY_FILE = join(__dirname, 'session-history.json');
+const LEGACY_TOKEN_USAGE_FILE = join(__dirname, 'token-usage.json'); // pre-v4 per-request log, imported once
+const USAGE_DIR = join(__dirname, 'usage');                           // hourly rollups, one file per UTC day
+const SESSIONS_FILE = join(__dirname, 'sessions.json');               // session affinity pins + per-session stats
+const ARTIFACTS_FILE = join(__dirname, 'artifacts.json');             // which account owns which artifact
+const CLAUDE_DIR = process.env.CSW_CLAUDE_DIR || join(process.env.HOME, '.claude'); // Claude Code's data (session names); overridable for tests
 const KEYCHAIN_ACCOUNT = process.env.USER || execSync('whoami').toString().trim();
 
 // Detect installed Claude Code version for User-Agent mimicry
@@ -84,7 +88,8 @@ function detectKeychainService() {
   return 'Claude Code-credentials'; // fallback
 }
 
-const KEYCHAIN_SERVICE = detectKeychainService();
+// CSW_KEYCHAIN_SERVICE: use a different keychain item (tests run against a throwaway one).
+const KEYCHAIN_SERVICE = process.env.CSW_KEYCHAIN_SERVICE || detectKeychainService();
 
 // ─────────────────────────────────────────────────
 // Settings (persisted to config.json)
@@ -100,9 +105,11 @@ const DEFAULT_SETTINGS = {
   serializeDelayMs: 200,
   maxConcurrentPerAccount: 8, // balance mode: max concurrent in-flight requests per account
   balanceWaitMs: 10000,       // balance mode: wait for a freed slot before overflowing
-  commitTokenUsage: false,
-  sessionMonitor: false,
+  sessionAffinity: true,      // keep each Claude Code session on one account while its prompt cache is warm
 };
+
+// Settings of features removed in v4 (commit token trailers, AI session monitor).
+const REMOVED_SETTINGS = ['commitTokenUsage', 'sessionMonitor'];
 
 function loadSettings() {
   let s = { ...DEFAULT_SETTINGS };
@@ -111,6 +118,7 @@ function loadSettings() {
       s = { ...DEFAULT_SETTINGS, ...JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) };
     }
   } catch { /* corrupt file  - use defaults */ }
+  for (const k of REMOVED_SETTINGS) delete s[k];
   return clampSettings(s);
 }
 
@@ -129,10 +137,15 @@ function saveSettings(settings) {
 }
 
 let settings = loadSettings();
+// Drop settings of removed features from config.json
+try {
+  if (existsSync(CONFIG_FILE) && REMOVED_SETTINGS.some(k => k in JSON.parse(readFileSync(CONFIG_FILE, 'utf8')))) saveSettings(settings);
+} catch { /* unreadable config  - leave it */ }
 let lastRotationTime = 0; // tracks when proactive rotation last happened
 let _consecutive400s = 0;  // global: consecutive 400 errors across requests (reset on success)
 let _consecutive400sAt = 0;  // timestamp of last 400 (for time-based decay)
 const _lastWarnPct = new Map(); // acctName → last logged percentage (dedup 90%+ warnings)
+const _modelRouteLogged = new Map(); // "acct:model" → last log time (dedup per-model reroutes)
 
 // ── Circuit breaker ──
 // When the proxy fails repeatedly (all recovery strategies exhausted), it
@@ -206,6 +219,24 @@ import {
   stripHopByHopHeaders,
   createAccountStateManager,
   createBalanceLimiter,
+  parseRateLimitHeaders,
+  modelFamily,
+  createSessionStore,
+  sessionAffinity,
+  sessionLabel,
+  extractSessionId,
+  extractModel,
+  cacheTtlFromBody,
+  createSSEUsageParser,
+  parseJsonUsage,
+  usageCost,
+  planMonthlyUsd,
+  createUsageDay,
+  summarizeUsage,
+  cacheEfficiency,
+  utcDay,
+  extractArtifactRefs,
+  artifactRefMatches,
   isAccountAvailable as _isAccountAvailable,
   scoreAccount as _scoreAccount,
   pickBestAccount as _pickBestAccount,
@@ -227,10 +258,23 @@ import {
   ROTATION_INTERVALS,
 } from './lib.mjs';
 
+// CSW_UPSTREAM (e.g. http://127.0.0.1:9999): send every API call to a stand-in server
+// instead of api.anthropic.com (tests).
+const UPSTREAM = process.env.CSW_UPSTREAM ? new URL(process.env.CSW_UPSTREAM) : null;
+
+// http(s).request against the API host (or the CSW_UPSTREAM stand-in).
+function apiRequest(options, onResponse) {
+  if (!UPSTREAM) return https.request({ hostname: 'api.anthropic.com', port: 443, ...options }, onResponse);
+  const mod = UPSTREAM.protocol === 'http:' ? http : https;
+  return mod.request({ ...options, hostname: UPSTREAM.hostname, port: UPSTREAM.port || (UPSTREAM.protocol === 'http:' ? 80 : 443) }, onResponse);
+}
+
 // Fetch email from Anthropic roles API using OAuth token
 function fetchAccountEmail(token) {
   return new Promise((resolve) => {
-    const req = https.get('https://api.anthropic.com/api/oauth/claude_cli/roles', {
+    const req = apiRequest({
+      path: '/api/oauth/claude_cli/roles',
+      method: 'GET',
       headers: { 'Authorization': `Bearer ${token}` },
       timeout: 3000,
     }, (res) => {
@@ -247,6 +291,7 @@ function fetchAccountEmail(token) {
     });
     req.on('error', () => resolve(''));
     req.on('timeout', () => { req.destroy(); resolve(''); });
+    req.end();
   });
 }
 
@@ -293,35 +338,6 @@ function logActivity(type, detail = {}) {
   // Persist async  - fire and forget
   writeFile(ACTIVITY_LOG_FILE, JSON.stringify(activityLog)).catch(() => {});
 }
-
-// ─────────────────────────────────────────────────
-// [BETA] Session Monitor — constants & data
-// ─────────────────────────────────────────────────
-
-const SESSION_INACTIVITY_MS = 10 * 60 * 1000; // 10 min → session considered completed
-const SESSION_HISTORY_MAX = 200;               // max entries on disk
-const SESSION_MAX_ACTIVE = 30;                 // max concurrent tracked sessions
-const SESSION_TIMELINE_MAX = 50;               // max timeline entries per session
-const SESSION_FILES_MAX = 100;                 // max filesModified per session
-const SESSION_BODY_MAX = 2 * 1024 * 1024;      // 2 MB — skip parsing larger bodies
-const HAIKU_TIMEOUT = 5000;                    // 5s timeout on Haiku calls
-const HAIKU_BACKOFF_MS = 2 * 60 * 1000;        // 2 min backoff after 3 consecutive failures
-const SESSION_AWAITING_THRESHOLD = 120000;     // 2 min idle → "awaiting input"
-
-const monitoredSessions = new Map();           // sessionId → session object
-let _summarizerOverhead = { inputTokens: 0, outputTokens: 0 };
-let _haikuFailCount = 0;
-let _haikuBackoffUntil = 0;
-
-// Load persisted session history on startup
-let sessionHistory = [];
-try {
-  if (existsSync(SESSION_HISTORY_FILE)) {
-    sessionHistory = JSON.parse(readFileSync(SESSION_HISTORY_FILE, 'utf8'));
-    if (!Array.isArray(sessionHistory)) sessionHistory = [];
-    sessionHistory = sessionHistory.slice(0, SESSION_HISTORY_MAX);
-  }
-} catch { sessionHistory = []; }
 
 // Check if the current keychain creds match a saved profile.
 // If not, auto-save them as a new account.
@@ -502,8 +518,7 @@ function fetchRateLimits(token) {
       messages: [{ role: 'user', content: '.' }],
     });
 
-    const req = https.request({
-      hostname: 'api.anthropic.com',
+    const req = apiRequest({
       path: '/v1/messages',
       method: 'POST',
       headers: {
@@ -525,21 +540,16 @@ function fetchRateLimits(token) {
           return;
         }
         const h = res.headers;
+        const rl = parseRateLimitHeaders(h);
         resolve({
-          status: h['anthropic-ratelimit-unified-status'] || (res.statusCode === 429 ? 'limited' : 'unknown'),
-          fiveH: {
-            status: h['anthropic-ratelimit-unified-5h-status'] || 'unknown',
-            reset: Number(h['anthropic-ratelimit-unified-5h-reset'] || 0),
-            utilization: parseFloat(h['anthropic-ratelimit-unified-5h-utilization'] || '0'),
-          },
-          sevenD: {
-            status: h['anthropic-ratelimit-unified-7d-status'] || 'unknown',
-            reset: Number(h['anthropic-ratelimit-unified-7d-reset'] || 0),
-            utilization: parseFloat(h['anthropic-ratelimit-unified-7d-utilization'] || '0'),
-          },
-          fallbackPct: parseFloat(h['anthropic-ratelimit-unified-fallback-percentage'] || '0'),
-          overageStatus: h['anthropic-ratelimit-unified-overage-status'] || 'unknown',
+          status: rl.status || (res.statusCode === 429 ? 'rejected' : 'unknown'),
+          fiveH: { reset: rl.fiveH?.reset || 0, utilization: rl.fiveH?.utilization || 0 },
+          sevenD: { reset: rl.sevenD?.reset || 0, utilization: rl.sevenD?.utilization || 0 },
+          // Per-model weekly bucket (Fable)  - only on accounts that have one
+          sevenDOI: rl.sevenDOI ? { reset: rl.sevenDOI.reset, utilization: rl.sevenDOI.utilization } : null,
+          overageStatus: rl.overageStatus || 'unknown',
           overageDisabledReason: h['anthropic-ratelimit-unified-overage-disabled-reason'] || '',
+          headers: h,
           fetchedAt: Date.now(),
         });
       });
@@ -549,6 +559,45 @@ function fetchRateLimits(token) {
     req.write(body);
     req.end();
   });
+}
+
+// Why an account can't take requests right now (for the card), or null.
+// { until (epoch s), what: human-readable limit }
+function blockedInfo(name) {
+  const a = loadAllAccountTokens().find(x => x.name === name);
+  const st = a && accountState.get(a.token);
+  if (!st) return null;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const label = { five_hour: '5-hour limit', seven_day: 'weekly limit', seven_day_opus: 'weekly Opus limit', seven_day_sonnet: 'weekly Sonnet limit' };
+  if (st.limited && st.limitedUntil > nowSec) return { until: st.limitedUntil, what: label[st.claim] || 'rate limited' };
+  if (st.limited && st.retryAfter > Date.now()) return { until: Math.floor(st.retryAfter / 1000), what: 'cooling down' };
+  if ((st.utilization5h || 0) >= 1 && st.resetAt > nowSec) return { until: st.resetAt, what: '5-hour limit' };
+  if ((st.utilization7d || 0) >= 1 && st.resetAt7d > nowSec) return { until: st.resetAt7d, what: 'weekly limit' };
+  return null;
+}
+
+// Per-model weekly limits that are used up (other models still work): [{ family, until }]
+function modelBlocks(name) {
+  const a = loadAllAccountTokens().find(x => x.name === name);
+  const limits = a && accountState.get(a.token)?.modelLimits;
+  const nowSec = Math.floor(Date.now() / 1000);
+  return Object.entries(limits || {})
+    .filter(([family, until]) => family !== 'fable' && until > nowSec)   // Fable has its own row
+    .map(([family, until]) => ({ family, until }));
+}
+
+// Rate-limit view for the dashboard from tracked state (live or persisted).
+function rateLimitsFromState(st, fetchedAt) {
+  const limited = !!st.limitedUntil && st.limitedUntil > Math.floor(Date.now() / 1000);
+  return {
+    status: limited ? 'rejected' : 'ok',
+    claim: st.claim || null,
+    fiveH: { reset: st.resetAt || 0, utilization: st.utilization5h || 0 },
+    sevenD: { reset: st.resetAt7d || 0, utilization: st.utilization7d || 0 },
+    sevenDOI: st.utilization7dOI == null ? null : { reset: st.resetAt7dOI || 0, utilization: st.utilization7dOI || 0 },
+    fableBlockedUntil: st.modelLimits?.fable || 0,
+    fetchedAt,
+  };
 }
 
 async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
@@ -562,20 +611,7 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
   if (typeof accountState !== 'undefined') {
     const proxyState = accountState.get(token);
     if (proxyState && proxyState.updatedAt && Date.now() - proxyState.updatedAt < RATE_LIMIT_CACHE_TTL) {
-      return {
-        status: proxyState.limited ? 'limited' : 'ok',
-        fiveH: {
-          status: proxyState.limited ? 'limited' : 'ok',
-          reset: proxyState.resetAt || 0,
-          utilization: proxyState.utilization5h || 0,
-        },
-        sevenD: {
-          status: 'ok',
-          reset: proxyState.resetAt7d || 0,
-          utilization: proxyState.utilization7d || 0,
-        },
-        fetchedAt: proxyState.updatedAt,
-      };
+      return rateLimitsFromState(proxyState, proxyState.updatedAt);
     }
   }
 
@@ -586,12 +622,7 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
     // Pass through last-known values as-is. Don't zero out when the window
     // epoch has passed — that causes the UI to flash "0% / rolling window"
     // between data sources. The staleness indicator communicates the age.
-    fromPersisted = {
-      status: 'ok',
-      fiveH: { status: 'ok', reset: persisted.resetAt || 0, utilization: persisted.utilization5h || 0 },
-      sevenD: { status: 'ok', reset: persisted.resetAt7d || 0, utilization: persisted.utilization7d || 0 },
-      fetchedAt: persisted.updatedAt,
-    };
+    fromPersisted = rateLimitsFromState(persisted, persisted.updatedAt);
     // If probe suppressed, return persisted state (with reset-aware values)
     if (!allowProbe) return fromPersisted;
     // If persisted state is recent enough, use it
@@ -605,15 +636,17 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
   recordProbe();
   const data = await fetchRateLimits(token);
   if (data) {
-    rateLimitCache.set(fp, { data, fetchedAt: Date.now() });
-    // Persist probe results
-    updatePersistedState(fp, {
-      utilization5h: data.fiveH.utilization,
-      utilization7d: data.sevenD.utilization,
-      resetAt: data.fiveH.reset,
-      resetAt7d: data.sevenD.reset,
+    const { headers, ...pub } = data;
+    rateLimitCache.set(fp, { data: pub, fetchedAt: Date.now() });
+    // Feed the probe into live state too, so balance/strategy pickers see used-up windows
+    const acct = loadAllAccountTokens().find(a => a.token === token);
+    if (acct) updateAccountState(token, acct.label || acct.name, headers, fp);
+    else updatePersistedState(fp, {
+      utilization5h: pub.fiveH.utilization, utilization7d: pub.sevenD.utilization,
+      resetAt: pub.fiveH.reset, resetAt7d: pub.sevenD.reset,
+      utilization7dOI: pub.sevenDOI?.utilization ?? null, resetAt7dOI: pub.sevenDOI?.reset || 0,
     });
-    return data;
+    return pub;
   }
 
   // 5. Probe failed  - fall back to stale persisted data instead of null
@@ -761,6 +794,8 @@ async function loadProfiles() {
       try {
         unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.json`));
         try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.label`)); } catch {}
+        sessionStore.renameAccount(loser.name, keepNew ? p.name : prevP.name);
+        markSessionsDirty();
         log('dedup', `Removed duplicate account "${loser.name}" (same email as "${keepNew ? p.name : prevP.name}")`);
       } catch (e) {
         log('warn', `Failed to remove duplicate account file "${loser.name}": ${e.message}`);
@@ -805,6 +840,12 @@ async function handleAPI(req, res) {
       p.velocity5h = utilizationHistory.getVelocity(p.fingerprint);
       p.minutesToLimit = utilizationHistory.predictMinutesToLimit(p.fingerprint);
       p.inflight = balanceLimiter.get(p.name); // balance-mode concurrent in-flight (0 in other modes)
+      p.sessions = accountSessions(p.name);
+      p.artifactCount = (artifactIndex.accounts[p.name]?.frames || []).length;
+      p.blocked = blockedInfo(p.name);
+      p.modelBlocks = modelBlocks(p.name);
+      const c30 = cacheReport30d().byAccount[p.label] || cacheReport30d().byAccount[p.name];
+      p.cache30d = c30 ? { hit: c30.hit, rebuild: c30.rebuild } : null;
     }
     const stats = await loadStats();
     const probeStats = getProbeStats();
@@ -813,7 +854,11 @@ async function handleAPI(req, res) {
     const allExhausted = allAccounts.length > 0 &&
       allAccounts.every(a => !isAccountAvailable(a.token, a.expiresAt));
     const earliestReset = allExhausted ? getEarliestReset() : null;
-    json(res, { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy: settings.rotationStrategy, balanceCap: settings.maxConcurrentPerAccount || 8, queueStats: getQueueStats() });
+    json(res, {
+      profiles, stats, probeStats, allExhausted, earliestReset,
+      rotationStrategy: settings.rotationStrategy, balanceCap: settings.maxConcurrentPerAccount || 8,
+      sessionAffinity: settings.sessionAffinity !== false, queueStats: getQueueStats(),
+    });
     return true;
   }
 
@@ -831,6 +876,9 @@ async function handleAPI(req, res) {
       const creds = JSON.parse(raw);
       writeKeychain(creds);
       invalidateTokenCache();
+      // A manual switch moves every session: release all affinity pins
+      sessionStore.unpinAll('manual-switch');
+      markSessionsDirty();
       // Log the manual switch
       let label = '';
       try { label = (await readFile(join(ACCOUNTS_DIR, `${name}.label`), 'utf8')).trim(); } catch {}
@@ -877,6 +925,8 @@ async function handleAPI(req, res) {
       // Delete account files
       await unlink(file);
       try { await unlink(join(ACCOUNTS_DIR, `${name}.label`)); } catch {}
+      sessionStore.unpinAccount(name);
+      markSessionsDirty();
       logActivity('account-removed', { name });
       if (typeof invalidateAccountsCache === 'function') invalidateAccountsCache();
       json(res, { ok: true });
@@ -979,8 +1029,7 @@ async function handleAPI(req, res) {
     if (typeof patch.balanceWaitMs === 'number' && patch.balanceWaitMs >= 0 && patch.balanceWaitMs <= 30000) {
       settings.balanceWaitMs = patch.balanceWaitMs;
     }
-    if (typeof patch.commitTokenUsage === 'boolean') settings.commitTokenUsage = patch.commitTokenUsage;
-    if (typeof patch.sessionMonitor === 'boolean') settings.sessionMonitor = patch.sessionMonitor;
+    if (typeof patch.sessionAffinity === 'boolean') settings.sessionAffinity = patch.sessionAffinity;
     saveSettings(settings);
     logActivity('settings-changed', {
       autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
@@ -990,198 +1039,61 @@ async function handleAPI(req, res) {
     return true;
   }
 
-  // ── [BETA] Session tracking for token usage ──
-
-  if (url.pathname === '/api/session-start' && req.method === 'POST') {
-    try {
-      const body = await readBody(req);
-      const data = JSON.parse(body);
-      const sessionId = data.session_id;
-      const cwd = data.cwd;
-      if (!sessionId || !cwd) {
-        json(res, { ok: false, error: 'session_id and cwd required' }, 400);
-        return true;
-      }
-      // Only register new sessions — don't overwrite startedAt on subsequent
-      // UserPromptSubmit hooks (otherwise we'd lose usage from earlier prompts)
-      if (!pendingSessions.has(sessionId)) {
-        let repo = cwd, branch = '(no git)', commitHash = '';
-        try {
-          // Use --git-common-dir to resolve to main repo root (not worktree directory)
-          // so worktree sessions group with the parent repo in the dashboard.
-          try {
-            repo = execSync(`git -C "${cwd}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim().replace(/\/\.git\/?$/, '');
-          } catch {
-            repo = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-          }
-          branch = _resolveWorktreeBranch(cwd, execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
-          commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-        } catch { /* not a git repo */ }
-        pendingSessions.set(sessionId, { repo, branch, commitHash, cwd, startedAt: Date.now() });
-        ensureLocalCommitHook(cwd);
-        log('tokens', `Session started: ${sessionId.slice(0, 8)}… (${basename(repo)}/${branch})`);
-      } else {
-        // Re-read branch on subsequent prompts (handles worktree branch switches)
-        const session = pendingSessions.get(sessionId);
-        // Keep cwd up to date so periodic persist and auto-claim use the latest directory
-        if (cwd && cwd !== session.cwd) session.cwd = cwd;
-        try {
-          const newBranch = _resolveWorktreeBranch(cwd, execSync(`git -C "${cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
-          if (newBranch && newBranch !== session.branch) {
-            log('tokens', `Session ${sessionId.slice(0, 8)}… branch updated: ${session.branch} → ${newBranch}`);
-            session.branch = newBranch;
-            session.commitHash = execSync(`git -C "${cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-          }
-        } catch { /* ignore */ }
-      }
-      // Prune stale sessions (>24h — sessions can be long-lived)
-      const staleThreshold = Date.now() - 24 * 60 * 60 * 1000;
-      for (const [id, s] of pendingSessions) {
-        if (s.startedAt < staleThreshold) {
-          // Auto-persist before pruning so data isn't lost
-          _autoClaimSession(id, s);
-          pendingSessions.delete(id);
-        }
-      }
-      json(res, { ok: true });
-    } catch (e) {
-      json(res, { ok: false, error: e.message }, 500);
-    }
-    return true;
-  }
-
-  if (url.pathname === '/api/session-stop' && req.method === 'POST') {
-    try {
-      const body = await readBody(req);
-      const data = JSON.parse(body);
-      const sessionId = data.session_id;
-      if (!sessionId) {
-        json(res, { ok: false, error: 'session_id required' }, 400);
-        return true;
-      }
-      const session = pendingSessions.get(sessionId);
-      if (!session) {
-        log('tokens', `Session stop: ${sessionId.slice(0, 8)}… (not found — may have been auto-claimed)`);
-        json(res, { ok: true, claimed: 0 });
-        return true;
-      }
-      const stopAt = Date.now();
-      const claimed = claimUsageInRange(session.startedAt, stopAt);
-      for (const entry of claimed) {
-        appendTokenUsage({
-          ts: entry.ts,
-          repo: session.repo,
-          branch: session.branch,
-          commitHash: session.commitHash,
-          model: entry.model,
-          inputTokens: entry.inputTokens,
-          outputTokens: entry.outputTokens,
-          account: entry.account,
-        });
-      }
-      pendingSessions.delete(sessionId);
-      log('tokens', `Session stopped: ${sessionId.slice(0, 8)}… (claimed ${claimed.length} entries)`);
-      json(res, { ok: true, claimed: claimed.length });
-    } catch (e) {
-      json(res, { ok: false, error: e.message }, 500);
-    }
-    return true;
-  }
-
-  if (url.pathname === '/api/token-usage/flush' && req.method === 'POST') {
-    // Force all active sessions to claim and persist unclaimed usage now.
-    // Same logic as the periodic timer, but triggered on demand (used by commit hooks).
-    try {
-      let flushed = 0;
-      for (const [id, session] of pendingSessions) {
-        const now = Date.now();
-        if (session.cwd) {
-          try {
-            const cur = _resolveWorktreeBranch(session.cwd, execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
-            if (cur && cur !== session.branch) {
-              session.branch = cur;
-              session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-            }
-          } catch { /* ignore */ }
-        }
-        const claimed = claimUsageInRange(session.startedAt, now);
-        for (const entry of claimed) {
-          appendTokenUsage({
-            ts: entry.ts, repo: session.repo, branch: session.branch,
-            commitHash: session.commitHash, model: entry.model,
-            inputTokens: entry.inputTokens, outputTokens: entry.outputTokens,
-            account: entry.account,
-          });
-        }
-        if (claimed.length > 0) {
-          session.startedAt = now;
-          flushed += claimed.length;
-        }
-      }
-      if (flushed > 0) log('tokens', `Flush: persisted ${flushed} entries on demand`);
-      json(res, { ok: true, flushed });
-    } catch (e) {
-      json(res, { ok: false, error: e.message }, 500);
-    }
-    return true;
-  }
-
-  if (url.pathname === '/api/token-usage' && req.method === 'GET') {
-    try {
-      const usage = loadTokenUsage();
-      let filtered = usage;
-      const repo = url.searchParams.get('repo');
-      const branch = url.searchParams.get('branch');
-      const since = url.searchParams.get('since');
-      const limit = parseInt(url.searchParams.get('limit') || '0', 10);
-      if (repo) filtered = filtered.filter(e => e.repo === repo);
-      if (branch) filtered = filtered.filter(e => e.branch === branch);
-      if (since) filtered = filtered.filter(e => e.ts >= Number(since));
-      if (limit > 0) filtered = filtered.slice(-limit);
-      json(res, filtered);
-    } catch (e) {
-      json(res, [], 500);
-    }
-    return true;
-  }
-
-  // ── [BETA] Session Monitor API ──
+  // ── Sessions (affinity) ──
 
   if (url.pathname === '/api/sessions' && req.method === 'GET') {
-    const now = Date.now();
-    const active = [];
-    for (const [, s] of monitoredSessions) {
-      active.push({
-        id: s.id,
-        account: s.account,
-        model: s.model,
-        cwd: s.cwd,
-        repo: s.repo,
-        branch: s.branch,
-        timeline: s.timeline,
-        currentActivity: s.currentActivity,
-        requestCount: s.requestCount,
-        totalInputTokens: s.totalInputTokens,
-        totalOutputTokens: s.totalOutputTokens,
-        startedAt: s.startedAt,
-        lastActiveAt: s.lastActiveAt,
-      });
+    const hours = Math.min(Math.max(parseInt(url.searchParams.get('hours') || '24', 10) || 24, 1), 168);
+    json(res, { affinity: settings.sessionAffinity !== false, sessions: listSessions(hours) });
+    return true;
+  }
+
+  // ── Artifacts (which account owns what) ──
+
+  if (url.pathname === '/api/artifacts' && req.method === 'GET') {
+    json(res, artifactsView());
+    return true;
+  }
+
+  if (url.pathname === '/api/artifacts/refresh' && req.method === 'POST') {
+    await refreshArtifacts('manual').catch(() => {});
+    json(res, artifactsView());
+    return true;
+  }
+
+  // ── Usage (hourly rollups) ──
+
+  if (url.pathname === '/api/usage' && req.method === 'GET') {
+    try {
+      json(res, usageReport(url.searchParams));
+    } catch (e) {
+      json(res, { error: e.message }, 500);
     }
-    // Sort: processing first, then by lastActiveAt desc
-    active.sort((a, b) => {
-      const aProc = (now - a.lastActiveAt) < SESSION_AWAITING_THRESHOLD;
-      const bProc = (now - b.lastActiveAt) < SESSION_AWAITING_THRESHOLD;
-      if (aProc !== bProc) return aProc ? -1 : 1;
-      return b.lastActiveAt - a.lastActiveAt;
+    return true;
+  }
+
+  if (url.pathname === '/api/usage/export' && req.method === 'GET') {
+    const days = Math.min(Math.max(parseInt(url.searchParams.get('days') || '30', 10) || 30, 1), 400);
+    const since = Date.now() - days * 86400000;
+    const f = {};
+    for (const k of ['repo', 'branch', 'model', 'account']) if (url.searchParams.get(k)) f[k] = url.searchParams.get(k);
+    const rows = loadUsageRows(since, Date.now()).filter(r => r.h >= since
+      && (!f.repo || r.repo === f.repo) && (!f.branch || r.branch === f.branch)
+      && (!f.model || r.model === f.model) && (!f.account || r.account === f.account));
+    const cols = ['hour', 'account', 'model', 'repo', 'branch', 'requests', 'input', 'output', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'webSearches', 'apiCostUsd'];
+    const q = (v) => '"' + String(v ?? '').replace(/"/g, '""') + '"';
+    const lines = [cols.join(',')];
+    for (const r of rows.sort((a, b) => a.h - b.h)) {
+      lines.push([
+        new Date(r.h).toISOString(), q(r.account), q(r.model), q(r.repo), q(r.branch),
+        r.requests, r.input, r.output, r.cacheRead, r.cacheWrite5m, r.cacheWrite1h, r.webSearches,
+        usageCost({ ...r, speed: r.fast ? 'fast' : null }, r.model).toFixed(4),
+      ].join(','));
+    }
+    res.writeHead(200, {
+      'Content-Type': 'text/csv',
+      'Content-Disposition': `attachment; filename="vdm-usage-${new Date().toISOString().slice(0, 10)}.csv"`,
     });
-    const recent = sessionHistory.slice(0, 20);
-    json(res, {
-      enabled: !!settings.sessionMonitor,
-      active,
-      recent,
-      overhead: _summarizerOverhead,
-      conflicts: getFileConflicts(),
-    });
+    res.end(lines.join('\n'));
     return true;
   }
 
@@ -1246,6 +1158,8 @@ function renderHTML() {
     --shadow-lg: 0 4px 12px -2px rgba(0,0,0,0.06), 0 2px 6px -1px rgba(0,0,0,0.04);
     --radius: 14px;
     --radius-sm: 10px;
+    --surface: hsl(220 14% 98%);
+    --muted-foreground: var(--muted);
   }
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body {
@@ -1469,13 +1383,16 @@ function renderHTML() {
     display: flex;
     align-items: center;
     justify-content: space-between;
+    gap: 0.75rem;
     margin-bottom: 0.75rem;
   }
   .card-identity {
     display: flex;
     align-items: center;
     gap: 0.625rem;
+    min-width: 0;
   }
+  .card-identity .card-name { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .status-dot {
     width: 8px; height: 8px;
     border-radius: 50%;
@@ -1497,7 +1414,7 @@ function renderHTML() {
     font-weight: 400;
   }
 
-  .card-badges { display: flex; gap: 0.375rem; align-items: center; }
+  .card-badges { display: flex; gap: 0.375rem; align-items: center; flex-wrap: wrap; justify-content: flex-end; flex-shrink: 0; max-width: 60%; }
   .badge {
     display: inline-flex;
     align-items: center;
@@ -1633,124 +1550,13 @@ function renderHTML() {
 
   .card.switching { opacity: 0.5; pointer-events: none; }
 
-  /* ── Session Monitor ── */
-  .session-card {
-    background: var(--card);
-    border: 1px solid var(--border);
-    border-radius: var(--radius);
-    box-shadow: var(--shadow);
-    padding: 0.875rem 1rem;
-    margin-bottom: 0.75rem;
-    border-left: 3px solid var(--muted);
-    position: relative;
-  }
-  .session-card.processing { border-left-color: #3fb950; }
-  .session-card.awaiting { border-left-color: var(--yellow); }
-  .session-card.completed { border-left-color: var(--muted); opacity: 0.85; }
-  .session-header {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: 0.8125rem;
-    color: var(--muted);
-    margin-bottom: 0.5rem;
-    cursor: pointer;
-    user-select: none;
-  }
-  .session-card.collapsed .session-header { margin-bottom: 0; }
-  .session-header b { color: var(--foreground); font-weight: 600; }
-  .session-header-left { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .session-header-right { flex-shrink: 0; white-space: nowrap; display: flex; align-items: center; gap: 0.5rem; margin-left: 0.5rem; }
-  .session-collapse-indicator { font-size: 0.625rem; color: var(--muted); transition: transform 0.15s; }
-  .session-card.collapsed .session-collapse-indicator { transform: rotate(-90deg); }
-  .session-card.collapsed .session-timeline,
-  .session-card.collapsed .session-meta,
-  .session-card.collapsed .session-copy-btn { display: none; }
-  .session-collapsed-activity {
-    display: none;
-    font-size: 0.75rem;
-    color: var(--muted);
-    font-style: italic;
-    margin-top: 0.375rem;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-  }
-  .session-card.collapsed .session-collapsed-activity { display: block; }
-  .session-awaiting {
-    display: inline-flex;
-    align-items: center;
-    gap: 0.25rem;
-    background: var(--yellow-soft);
-    color: var(--yellow);
-    border: 1px solid var(--yellow-border);
-    border-radius: 4px;
-    padding: 0.0625rem 0.375rem;
-    font-size: 0.6875rem;
-    font-weight: 600;
-    white-space: nowrap;
-  }
-  .session-timeline {
-    font-size: 0.8125rem;
-    line-height: 1.6;
-    margin: 0.375rem 0;
-    max-height: 500px;
-    overflow-y: auto;
-  }
-  .tl-input {
-    color: var(--foreground);
-    font-weight: 600;
-  }
-  .tl-input::before { content: '\\2192 '; color: var(--primary); }
-  .tl-action {
-    color: var(--muted);
-    padding-left: 1.25rem;
-  }
-  .tl-action::before { content: '\\21B3 '; }
-  .tl-current {
-    color: var(--muted);
-    padding-left: 1.25rem;
-    font-style: italic;
-    font-size: 0.75rem;
-  }
-  .session-meta {
-    font-size: 0.75rem;
-    color: var(--muted);
-    margin-top: 0.375rem;
-    display: flex;
-    gap: 0.75rem;
-  }
-  .session-conflicts {
-    background: rgba(248,81,73,0.08);
-    border: 1px solid rgba(248,81,73,0.3);
-    border-radius: var(--radius);
-    padding: 0.5rem 0.75rem;
-    margin-bottom: 0.75rem;
-    font-size: 0.8125rem;
-    color: #f85149;
-  }
-  .session-copy-btn {
-    position: absolute;
-    bottom: 0.5rem;
-    right: 0.5rem;
-    background: none;
-    border: 1px solid var(--border);
-    border-radius: 4px;
-    cursor: pointer;
-    font-size: 0.75rem;
-    padding: 0.125rem 0.375rem;
-    color: var(--muted);
-    opacity: 0;
-    transition: opacity 0.15s;
-  }
-  .session-card:hover .session-copy-btn { opacity: 1; }
-  .session-copy-btn:hover { background: var(--surface); }
+  /* ── Sessions & affinity ── */
   .tab-badge {
     display: inline-flex;
     align-items: center;
     justify-content: center;
-    background: var(--yellow);
-    color: #000;
+    background: var(--border);
+    color: var(--foreground);
     font-size: 0.625rem;
     font-weight: 700;
     min-width: 1rem;
@@ -1760,43 +1566,200 @@ function renderHTML() {
     margin-left: 0.375rem;
     vertical-align: middle;
   }
-  .session-section-title {
+  /* Affinity strength: 3 bars = strong, 2 = ok, 1 = weak */
+  .aff { display: inline-flex; align-items: flex-end; gap: 2px; height: 11px; flex-shrink: 0; }
+  .aff i { display: block; width: 3px; border-radius: 1px; background: var(--border); }
+  .aff i:nth-child(1) { height: 5px; }
+  .aff i:nth-child(2) { height: 8px; }
+  .aff i:nth-child(3) { height: 11px; }
+  .aff-strong i { background: var(--green); }
+  .aff-ok i:nth-child(-n+2) { background: var(--yellow); }
+  .aff-weak i:nth-child(1) { background: var(--red); }
+  .acct-sessions {
+    margin-top: 0.875rem;
+    padding-top: 0.75rem;
+    border-top: 1px dashed var(--border);
+  }
+  .acct-sessions-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
     font-size: 0.6875rem;
     font-weight: 600;
     text-transform: uppercase;
     letter-spacing: 0.05em;
     color: var(--muted);
-    margin: 0.75rem 0 0.375rem;
+    margin-bottom: 0.375rem;
   }
-  .session-overhead {
+  .sess-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8125rem; padding: 0.1875rem 0; }
+  .sess-here { width: 6px; height: 6px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
+  .sess-here.away { background: var(--border); }
+  .sess-name { flex: 1; min-width: 0; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess-meta { font-size: 0.75rem; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .link-btn {
+    background: none;
+    border: none;
+    padding: 0;
+    font-family: inherit;
     font-size: 0.75rem;
+    color: var(--primary);
+    cursor: pointer;
+  }
+  .link-btn:hover { text-decoration: underline; }
+  .chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.25rem;
+    font-family: inherit;
+    font-size: 0.6875rem;
+    font-weight: 500;
+    padding: 0.125rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid var(--border);
+    background: var(--card);
     color: var(--muted);
-    margin-top: 0.75rem;
-    padding-top: 0.5rem;
-    border-top: 1px solid var(--border);
+    cursor: pointer;
   }
-  @keyframes braille-spin {
-    0%   { content: '\\280B'; }
-    10%  { content: '\\2819'; }
-    20%  { content: '\\2839'; }
-    30%  { content: '\\2838'; }
-    40%  { content: '\\283C'; }
-    50%  { content: '\\2834'; }
-    60%  { content: '\\2826'; }
-    70%  { content: '\\2827'; }
-    80%  { content: '\\2807'; }
-    90%  { content: '\\280F'; }
+  .chip:hover { border-color: var(--primary); color: var(--primary); }
+  .section-note { font-size: 0.8125rem; color: var(--muted); line-height: 1.55; margin-bottom: 0.875rem; }
+  .sess-card {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    padding: 1rem 1.25rem;
+    margin-bottom: 0.75rem;
   }
-  .braille-spin::before {
-    content: '\\280B';
-    animation: braille-spin 1.2s steps(1) infinite;
-    margin-right: 0.25rem;
+  .sess-card-top { display: flex; align-items: center; gap: 0.5rem; }
+  .sess-card-title { flex: 1; min-width: 0; font-weight: 600; font-size: 0.9375rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess-sub { font-size: 0.75rem; color: var(--muted); margin-top: 0.125rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess-aff-line { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8125rem; margin-top: 0.625rem; }
+  .sess-accts { margin-top: 0.5rem; }
+  .sess-acct-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.75rem; padding: 0.125rem 0; font-variant-numeric: tabular-nums; }
+  .sess-acct-name { width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess-acct-bar { flex: 1; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  .sess-acct-bar > div { height: 100%; background: var(--primary); }
+  .sess-moves { margin-top: 0.5rem; font-size: 0.75rem; color: var(--muted); }
+  .sess-move { padding: 0.0625rem 0; }
+  .sess-move.warm { color: var(--red); }
+  .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px var(--green-soft); flex-shrink: 0; }
+  .live-dot.off { background: var(--border); box-shadow: none; }
+
+  /* ── Artifacts ── */
+  .art-toolbar { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.75rem; flex-wrap: wrap; }
+  .art-search { flex: 1; min-width: 200px; cursor: text; }
+  .art-group {
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    box-shadow: var(--shadow);
+    margin-bottom: 0.75rem;
+    overflow: hidden;
   }
-  .braille-static::before {
-    content: '\\28FF';
-    margin-right: 0.25rem;
-    opacity: 0.6;
+  .art-group-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.625rem 1rem;
+    font-size: 0.8125rem;
+    font-weight: 600;
+    border-bottom: 1px solid var(--border);
   }
+  .art-row { display: flex; align-items: baseline; gap: 0.75rem; padding: 0.5rem 1rem; border-top: 1px solid var(--border); font-size: 0.8125rem; }
+  .art-group-head + .art-row { border-top: none; }
+  .art-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--foreground); text-decoration: none; font-weight: 500; }
+  .art-title:hover { color: var(--primary); }
+  .art-meta { font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
+  .art-err { font-size: 0.75rem; font-weight: 500; color: var(--red); }
+
+  /* ── Plan value ── */
+  .plan-table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; font-variant-numeric: tabular-nums; }
+  .plan-table th {
+    text-align: left;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    padding: 0 0.5rem 0.375rem 0;
+  }
+  .plan-table td { padding: 0.375rem 0.5rem 0.375rem 0; border-top: 1px solid var(--border); }
+  .plan-table .num { text-align: right; }
+  .plan-table td.name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .val-good { color: var(--green); font-weight: 600; }
+  .val-bad { color: var(--red); font-weight: 600; }
+
+  /* ── Account card extras ── */
+  .badge-soft { background: var(--card); color: var(--muted); border: 1px solid var(--border); }
+  .blocked-banner {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    margin: -0.25rem 0 0.75rem;
+    padding: 0.4375rem 0.75rem;
+    border-radius: 8px;
+    background: var(--red-soft);
+    border: 1px solid var(--red-border);
+    color: var(--red);
+    font-size: 0.8125rem;
+    font-weight: 500;
+  }
+  .blocked-banner .muted { color: var(--muted); font-weight: 400; }
+  .blocked-banner.model { background: var(--yellow-soft); border-color: var(--yellow-border); color: hsl(32 80% 38%); }
+  .rate-sub { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.375rem; font-size: 0.75rem; color: var(--muted); }
+  .rate-sub .rate-track { flex: 1; height: 4px; }
+  .rate-sub .rate-pct { font-size: 0.75rem; min-width: 2.5rem; text-align: right; }
+
+  /* ── Sessions tab ── */
+  .sess-toolbar { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
+  .sess-toolbar .sess-meta { flex: 1; }
+  .sess-section-title {
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+    margin: 1rem 0 0.5rem;
+  }
+  .sess-line {
+    display: flex;
+    align-items: center;
+    gap: 0.625rem;
+    padding: 0.5rem 1rem;
+    background: var(--card);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    margin-bottom: 0.375rem;
+    font-size: 0.8125rem;
+  }
+  .pill {
+    font-size: 0.625rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    padding: 0.0625rem 0.375rem;
+    border-radius: 4px;
+    flex-shrink: 0;
+  }
+  .pill-running { color: var(--green); background: var(--green-soft); border: 1px solid var(--green-border); }
+
+  /* ── Usage extras ── */
+  .eff-row {
+    display: grid;
+    grid-template-columns: minmax(0, 1.5fr) 96px minmax(0, 1.4fr) 4.5rem;
+    align-items: center;
+    gap: 0.75rem;
+    padding: 0.4375rem 0;
+    font-size: 0.875rem;
+  }
+  .eff-row + .eff-row { border-top: 1px solid var(--border); }
+  .eff-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .eff-detail { color: var(--muted); font-size: 0.8125rem; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .eff-hit { text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
+  .eff-group { font-size: 0.6875rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0.875rem 0 0.25rem; }
+  .notice { font-size: 0.8125rem; color: var(--muted); background: var(--surface); border: 1px dashed var(--border); border-radius: 8px; padding: 0.625rem 0.75rem; }
+  .err-state { color: var(--red); }
 
   /* ── Activity log ── */
   .activity-card {
@@ -2070,6 +2033,10 @@ function renderHTML() {
   .tok-model-name {
     font-weight: 500;
     min-width: 120px;
+    max-width: 240px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
   }
   .tok-model-detail {
     color: var(--muted);
@@ -2130,7 +2097,7 @@ function renderHTML() {
     margin-top: 0.25rem;
     line-height: 1.6;
   }
-  #tok-stats.stat-grid { grid-template-columns: repeat(5, 1fr); }
+  #tok-stats.stat-grid { grid-template-columns: repeat(4, 1fr); }
   .tok-stat-sub { font-size: 0.5625rem; color: var(--muted); margin-top: 0.0625rem; }
   .tok-savings-banner {
     display: flex;
@@ -2265,40 +2232,6 @@ function renderHTML() {
     text-align: center;
   }
 
-  /* ── Chart carousel ── */
-  .chart-carousel {
-    position: relative;
-  }
-  .chart-carousel-inner {
-    overflow: hidden;
-  }
-  .chart-carousel-slides {
-    display: flex;
-    transition: transform 0.3s ease;
-  }
-  .chart-carousel-slide {
-    min-width: 100%;
-    flex-shrink: 0;
-  }
-  .chart-carousel-dots {
-    display: flex;
-    justify-content: center;
-    gap: 0.5rem;
-    margin-top: 0.75rem;
-  }
-  .chart-carousel-dot {
-    width: 8px;
-    height: 8px;
-    border-radius: 50%;
-    background: var(--border);
-    border: none;
-    cursor: pointer;
-    padding: 0;
-    transition: background 0.2s;
-  }
-  .chart-carousel-dot.active { background: var(--primary); }
-  .chart-carousel-dot:hover { background: var(--muted); }
-
   /* ── Cost savings chart ── */
   .savings-chart-container {
     position: relative;
@@ -2382,9 +2315,10 @@ function renderHTML() {
 
   <div class="tabs">
     <button class="tab active" onclick="switchTab('accounts')">Accounts</button>
-    <button class="tab" onclick="switchTab('activity')">Activity</button>
-    <button class="tab" onclick="switchTab('usage')">Usage</button>
     <button class="tab" onclick="switchTab('sessions')">Sessions<span id="sessions-badge" class="tab-badge" style="display:none"></span></button>
+    <button class="tab" onclick="switchTab('artifacts')">Artifacts</button>
+    <button class="tab" onclick="switchTab('usage')">Usage</button>
+    <button class="tab" onclick="switchTab('activity')">Activity</button>
     <button class="tab" onclick="switchTab('config')">Config</button>
     <button class="tab" onclick="switchTab('logs')">Logs</button>
   </div>
@@ -2402,17 +2336,6 @@ function renderHTML() {
   </div>
 
   <div id="tab-usage" class="tab-content">
-    <div id="stats-section" class="usage-card" style="display:none">
-      <div class="usage-title">Usage  - All Accounts</div>
-      <div id="stats-grid" class="stat-grid"></div>
-      <div>
-        <div class="chart-legend">
-          <div class="chart-legend-item"><span class="chart-legend-dot" style="background:var(--primary)"></span> Messages</div>
-          <div class="chart-legend-item"><span class="chart-legend-dot" style="background:var(--purple)"></span> Tokens</div>
-        </div>
-        <div id="chart" class="chart-container"></div>
-      </div>
-    </div>
     <div class="tok-filters">
       <select class="config-select" id="tok-repo" onchange="tokFilterChange('repo')"><option value="">All repos</option></select>
       <select class="config-select" id="tok-branch" onchange="tokFilterChange('branch')"><option value="">All branches</option></select>
@@ -2423,25 +2346,25 @@ function renderHTML() {
         <option value="7" selected>7 days</option>
         <option value="30">30 days</option>
         <option value="90">90 days</option>
+        <option value="365">1 year</option>
       </select>
       <button class="tok-export-btn" onclick="exportUsageCsv()">Export CSV</button>
     </div>
-    <div id="tok-empty" class="empty-state" style="display:none">No token usage data yet.</div>
+    <div id="tok-empty" class="empty-state" style="display:none"></div>
     <div id="tok-content" style="display:none">
-      <div class="usage-card chart-carousel" style="margin-bottom:1rem">
-        <div class="chart-carousel-inner">
-          <div class="chart-carousel-slides" id="chart-carousel-slides">
-            <div class="chart-carousel-slide" id="tok-savings-chart"></div>
-            <div class="chart-carousel-slide" id="tok-chart"></div>
-          </div>
-        </div>
-        <div class="chart-carousel-dots" id="chart-carousel-dots">
-          <button class="chart-carousel-dot active" onclick="chartCarouselGo(0)"></button>
-          <button class="chart-carousel-dot" onclick="chartCarouselGo(1)"></button>
-        </div>
+      <div id="tok-stats" class="stat-grid" style="margin-bottom:1rem"></div>
+      <div class="usage-card" style="margin-bottom:1rem" id="tok-savings-chart"></div>
+      <div class="usage-card" style="margin-bottom:1rem" id="tok-chart"></div>
+      <div class="usage-card" style="margin-bottom:1rem">
+        <div class="usage-title">Plan value</div>
+        <div class="section-note">What each account's usage would cost at API prices (cache reads and writes included), against its subscription price for the same period.</div>
+        <div id="tok-plans"></div>
       </div>
-      <div id="tok-stats" class="stat-grid" style="margin-bottom:0.5rem"></div>
-      <div id="tok-savings" class="tok-savings-banner"></div>
+      <div class="usage-card" style="margin-bottom:1rem">
+        <div class="usage-title">Cache efficiency &middot; last 30 days, all traffic</div>
+        <div class="section-note">Hit = share of prompt tokens read from cache: higher is cheaper and uses up limits slower. Rebuilt = share written to cache again; it rises when sessions move between accounts. The line is the daily hit rate.</div>
+        <div id="tok-cache"></div>
+      </div>
       <div class="usage-card" style="margin-bottom:1rem">
         <div class="usage-title">Model Breakdown</div>
         <div id="tok-models"></div>
@@ -2455,12 +2378,36 @@ function renderHTML() {
         <div id="tok-repos"></div>
       </div>
     </div>
+    <div id="stats-section" class="usage-card" style="display:none;margin-top:1rem">
+      <div class="usage-title">Claude Code's own counters (this Mac, all time)</div>
+      <div id="stats-grid" class="stat-grid"></div>
+      <div>
+        <div class="chart-legend">
+          <div class="chart-legend-item"><span class="chart-legend-dot" style="background:var(--primary)"></span> Messages</div>
+          <div class="chart-legend-item"><span class="chart-legend-dot" style="background:var(--purple)"></span> Tokens</div>
+        </div>
+        <div id="chart" class="chart-container"></div>
+      </div>
+    </div>
   </div>
 
   <div id="tab-sessions" class="tab-content">
-    <div id="sessions-content">
-      <div class="empty-state" id="sessions-disabled">Session Monitor is OFF. Enable it in Config (BETA).</div>
+    <div class="section-note" id="sessions-note"></div>
+    <div class="sess-toolbar">
+      <select class="config-select" id="sess-account" onchange="renderSessions()" aria-label="Filter sessions by account"><option value="">All accounts</option></select>
+      <span class="sess-meta" id="sess-counts"></span>
     </div>
+    <div id="sessions-content"><div class="empty-state">Loading...</div></div>
+  </div>
+
+  <div id="tab-artifacts" class="tab-content">
+    <div class="section-note">Claude Code publishes artifacts with its own login (the active account), not through the proxy. This list asks every account which artifacts it owns. Paste a link or type a title to find the owner.</div>
+    <div class="art-toolbar">
+      <input class="config-select art-search" id="art-search" placeholder="Search title or paste an artifact link" aria-label="Search artifacts" oninput="renderArtifacts()" onkeydown="if (event.key === 'Escape') { this.value = ''; renderArtifacts(); }">
+      <button class="tok-export-btn" id="art-refresh" onclick="refreshArtifactsNow()">Check now</button>
+    </div>
+    <div class="section-note" id="art-status" style="margin-bottom:0.5rem"></div>
+    <div id="artifacts-content"><div class="empty-state">Loading...</div></div>
   </div>
 
   <div id="tab-config" class="tab-content">
@@ -2472,14 +2419,14 @@ function renderHTML() {
             <div class="config-label">Enable proxy</div>
             <div class="config-desc">Route Claude Code API calls through the local proxy for account switching</div>
           </div>
-          <input type="checkbox" class="sw" id="toggle-proxy" checked onchange="toggleSetting('proxyEnabled', this.checked)">
+          <input type="checkbox" class="sw" id="toggle-proxy" aria-label="Enable proxy" checked onchange="toggleSetting('proxyEnabled', this.checked)">
         </div>
         <div class="config-row">
           <div class="config-info">
             <div class="config-label">Auto-switch on rate limit</div>
             <div class="config-desc">Automatically switch to another account when the current one hits a 429 or 401</div>
           </div>
-          <input type="checkbox" class="sw" id="toggle-autoswitch" checked onchange="toggleSetting('autoSwitch', this.checked)">
+          <input type="checkbox" class="sw" id="toggle-autoswitch" aria-label="Auto-switch on rate limit" checked onchange="toggleSetting('autoSwitch', this.checked)">
         </div>
       </div>
 
@@ -2529,13 +2476,24 @@ function renderHTML() {
       </div>
 
       <div class="config-section">
+        <div class="config-section-title">Session Affinity</div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Keep each session on one account</div>
+            <div class="config-desc" title="Prompt caches live per account. Moving a running session rebuilds its whole cache on the new account, which costs more and uses up limits faster. A session only moves when its account is limited, expired or failing. The rotation strategy decides where new and idle sessions go.">Running sessions stay on their account while their cache is warm (saves cost and limits). New and idle sessions follow the strategy.</div>
+          </div>
+          <input type="checkbox" class="sw" id="toggle-affinity" aria-label="Session affinity" checked onchange="toggleSetting('sessionAffinity', this.checked)">
+        </div>
+      </div>
+
+      <div class="config-section">
         <div class="config-section-title">Notifications</div>
         <div class="config-row">
           <div class="config-info">
             <div class="config-label">Desktop notifications</div>
             <div class="config-desc">Show macOS notifications on account switches, rate limits, and errors</div>
           </div>
-          <input type="checkbox" class="sw" id="toggle-notifs" checked onchange="toggleSetting('notifications', this.checked)">
+          <input type="checkbox" class="sw" id="toggle-notifs" aria-label="Desktop notifications" checked onchange="toggleSetting('notifications', this.checked)">
         </div>
       </div>
 
@@ -2546,7 +2504,7 @@ function renderHTML() {
             <div class="config-label">Serialize requests</div>
             <div class="config-desc">Queue concurrent API requests to avoid 429 collisions from multiple sessions</div>
           </div>
-          <input type="checkbox" class="sw" id="toggle-serialize" onchange="toggleSetting('serializeRequests', this.checked)">
+          <input type="checkbox" class="sw" id="toggle-serialize" aria-label="Serialize requests" onchange="toggleSetting('serializeRequests', this.checked)">
         </div>
         <div class="config-row" id="serialize-delay-ctrl" style="display:none">
           <div class="config-info">
@@ -2564,27 +2522,6 @@ function renderHTML() {
         <div id="queue-stats" style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem;display:none"></div>
       </div>
 
-      <div class="config-section">
-        <div class="config-section-title">Commit Tokens <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
-        <div class="config-row">
-          <div class="config-info">
-            <div class="config-label">Token-Usage commit trailer</div>
-            <div class="config-desc">Append a Token-Usage trailer to commit messages showing tokens consumed since the last commit</div>
-          </div>
-          <input type="checkbox" class="sw" id="toggle-commit-tokens" onchange="toggleSetting('commitTokenUsage', this.checked)">
-        </div>
-      </div>
-
-      <div class="config-section">
-        <div class="config-section-title">Session Monitor <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
-        <div class="config-row">
-          <div class="config-info">
-            <div class="config-label">Enable session monitor</div>
-            <div class="config-desc">Track active Claude Code sessions with AI-summarized timelines. Uses Haiku for summaries (separate token overhead).</div>
-          </div>
-          <input type="checkbox" class="sw" id="toggle-session-monitor" onchange="toggleSetting('sessionMonitor', this.checked)">
-        </div>
-      </div>
     </div>
   </div>
 
@@ -2606,8 +2543,10 @@ function switchTab(id) {
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.getElementById('tab-' + id).classList.add('active');
   document.querySelector('.tab[onclick*="' + id + '"]').classList.add('active');
-  if (id === 'usage') refreshTokens();
+  if (id === 'usage') refreshTokens(true);
   if (id === 'sessions') refreshSessions();
+  if (id === 'artifacts') refreshArtifactsTab();
+  if (id === 'config') loadSettingsUI(); // may have changed via vdm or another tab
   if (id === 'logs') connectLogStream();
   const url = new URL(location);
   url.searchParams.set('tab', id);
@@ -2896,8 +2835,9 @@ function quickHash(obj) {
 async function refresh() {
   try {
     const resp = await fetch('/api/profiles');
-    const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy, balanceCap, queueStats } = await resp.json();
+    const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy, balanceCap, sessionAffinity, queueStats } = await resp.json();
     _cachedProfiles = profiles;
+    updateSessionsBadge(profiles);
     const balanceMode = rotationStrategy === 'balance';
     const cap = balanceCap || 8;
     // Fold balance context into the hash so strategy/cap flips also force a re-render.
@@ -2909,7 +2849,8 @@ async function refresh() {
     document.getElementById('account-count').textContent = profiles.length;
     if (rotationStrategy) {
       const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first', balance: 'Balance' };
-      document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy);
+      document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy) +
+        (sessionAffinity ? ' \\u00b7 session affinity on' : ' \\u00b7 session affinity off');
     }
     if (probeStats) renderProbeStats(probeStats);
     // [BETA] Queue stats
@@ -2952,104 +2893,134 @@ async function refresh() {
     }
   } catch {}
   _firstRender = false;
+  // Each of these only fetches while its tab is open
   refreshTokens();
-  // Only fetch sessions when the tab is active or periodically for badge updates
-  var sessTab = document.getElementById('tab-sessions');
-  if (sessTab && sessTab.classList.contains('active')) {
-    refreshSessions();
-  } else {
-    refreshSessionsBadgeOnly();
-  }
+  refreshSessions();
+  refreshArtifactsTab();
 }
+
+// Per-card HTML from the last render, keyed by account name. Only cards whose HTML
+// changed are replaced, so a click on a card isn't lost to the 5s refresh.
+var _cardHtml = {};
 
 function renderAccounts(profiles, animate, balanceMode, balanceCap) {
-  const el = document.getElementById('accounts');
+  var el = document.getElementById('accounts');
   if (!profiles.length) {
-    el.innerHTML = '<div class="empty-state">No accounts yet. Run <code>/login</code> in Claude Code  - accounts are auto-discovered.</div>';
+    el.innerHTML = '<div class="empty-state">No accounts yet. Run <code>/login</code> in Claude Code: accounts are picked up automatically.</div>';
+    el.dataset.names = '';
+    _cardHtml = {};
     return;
   }
-  el.innerHTML = profiles.map((p, i) => {
-    const active = p.isActive;
-    const displayName = p.label || p.name;
-    const eName = p.name.replace(/'/g, "\\\\'");
-    const tok = tokenStatus(p.expiresAt);
-
-    let barsHtml = '';
-    if (p.rateLimits) {
-      const rl = p.rateLimits;
-      const f = Math.round(rl.fiveH.utilization * 100);
-      const s = Math.round(rl.sevenD.utilization * 100);
-
-      // 5hr sparkline  - 24h sliding window
-      const hist5h = p.utilizationHistory || [];
-      const spark5h = '<div class="sparkline-wrap">' +
-        renderSparkline(hist5h, 'u5h', 24*60*60*1000, 'hours') +
-        '</div>';
-
-      // Weekly sparkline  - 7d sliding window
-      const hist7d = p.weeklyHistory || [];
-      const spark7d = '<div class="sparkline-wrap">' +
-        renderSparkline(hist7d, 'u7d', 7*24*60*60*1000, 'days') +
-        '</div>';
-
-      barsHtml = '<div class="rate-bars">' +
-        '<div class="rate-group">' +
-          '<div class="rate-head"><span class="rate-label">5h window</span><span class="rate-pct ' + pctClass(f) + '">' + f + '%</span></div>' +
-          '<div class="rate-track"><div class="rate-fill ' + fillClass(rl.fiveH.utilization) + '" style="width:' + Math.min(f,100) + '%"></div></div>' +
-          '<div class="rate-reset" data-reset="' + rl.fiveH.reset + '">' + formatTimeLeft(rl.fiveH.reset) + '</div>' +
-          spark5h +
-        '</div>' +
-        '<div class="rate-group">' +
-          '<div class="rate-head"><span class="rate-label">Weekly</span><span class="rate-pct ' + pctClass(s) + '">' + s + '%</span></div>' +
-          '<div class="rate-track"><div class="rate-fill ' + fillClass(rl.sevenD.utilization) + '" style="width:' + Math.min(s,100) + '%"></div></div>' +
-          '<div class="rate-reset" data-reset="' + rl.sevenD.reset + '">' + formatTimeLeft(rl.sevenD.reset) + '</div>' +
-          spark7d +
-        '</div>' +
-      '</div>';
-    } else if (p.dormant) {
-      barsHtml = '<div style="font-size:0.8125rem;color:var(--cyan);margin-top:0.25rem;font-weight:500">Dormant  - window preserved</div>';
-    } else {
-      barsHtml = '<div style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem">Rate limits unavailable</div>';
-    }
-
-    const animStyle = animate ? ' style="animation-delay:' + (i*0.05) + 's"' : ' style="animation:none"';
-    const isStale = !active && (p.expired || p.refreshFailed || (p.expiresAt && p.expiresAt < Date.now()));
-    var staleMsg = '';
-    if (isStale) {
-      if (p.refreshFailed && !p.refreshFailed.retriable) {
-        staleMsg = '<div class="stale-msg">Token expired. Click Refresh or run <code>claude login</code> to reactivate.</div>';
-      } else {
-        staleMsg = '<div class="stale-msg">Token expired. Auto-refresh will retry shortly.</div>';
-      }
-    }
-    var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '');
-    var buttonsHtml = '';
-    if (!active) {
-      buttonsHtml = '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center">' +
-        '<button class="remove-btn" onclick="doRemove(\\''+eName+'\\',event)">Remove</button>' +
-        (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\''+eName+'\\',event)">Refresh</button>' : '<button class="switch-btn" onclick="doSwitch(\\''+eName+'\\',\\''+displayName.replace(/'/g, "\\\\'")+'\\''+',event)">Switch to this account</button>') +
-      '</div>';
-    }
-    return '<div class="' + cardClass + '"' + animStyle + '>' +
-      '<div class="card-top">' +
-        '<div class="card-identity">' +
-          '<div class="status-dot ' + (active ? 'active' : 'inactive') + '"></div>' +
-          '<span class="card-name">' + displayName + '</span>' +
-          (active ? renderVelocityInline(p) : '') +
-        '</div>' +
-        '<div class="card-badges">' +
-          inflightBadge(p, balanceMode, balanceCap) +
-          planBadge(p.subscriptionType, p.rateLimitTier) +
-          (active ? '<span class="badge badge-active">Active</span>' : '') +
-        '</div>' +
-      '</div>' +
-      barsHtml +
-      staleMsg +
-      buttonsHtml +
-    '</div>';
-  }).join('');
+  var cards = profiles.map(function(p, i) { return [p.name, accountCardHtml(p, i, animate, balanceMode, balanceCap)]; });
+  var names = cards.map(function(c) { return c[0]; }).join('|');
+  if (el.dataset.names !== names) {
+    el.innerHTML = cards.map(function(c) { return c[1]; }).join('');
+    el.dataset.names = names;
+    _cardHtml = {};
+    cards.forEach(function(c) { _cardHtml[c[0]] = c[1]; });
+  } else {
+    var nodes = el.children || [];
+    cards.forEach(function(c, i) {
+      if (_cardHtml[c[0]] === c[1]) return;
+      if (nodes[i]) nodes[i].outerHTML = c[1];
+      else el.dataset.names = '';   // DOM out of step: full render next time
+      _cardHtml[c[0]] = c[1];
+    });
+  }
+  tickCountdowns();
 }
 
+function rateGroup(label, util, reset, extra) {
+  var pct = Math.round(util * 100);
+  return '<div class="rate-group">' +
+    '<div class="rate-head"><span class="rate-label">' + label + '</span><span class="rate-pct ' + pctClass(pct) + '">' + pct + '%</span></div>' +
+    '<div class="rate-track"><div class="rate-fill ' + fillClass(util) + '" style="width:' + Math.min(pct, 100) + '%"></div></div>' +
+    '<div class="rate-reset" data-reset="' + reset + '"></div>' +
+    (extra || '') +
+  '</div>';
+}
+
+function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
+  var active = p.isActive;
+  var displayName = p.label || p.name;
+  var eName = p.name.replace(/'/g, "\\\\'");
+
+  var barsHtml = '';
+  if (p.rateLimits) {
+    var rl = p.rateLimits;
+    var spark5h = '<div class="sparkline-wrap">' + renderSparkline(p.utilizationHistory || [], 'u5h', 24*60*60*1000, 'hours') + '</div>';
+    var spark7d = '<div class="sparkline-wrap">' + renderSparkline(p.weeklyHistory || [], 'u7d', 7*24*60*60*1000, 'days') + '</div>';
+    // Fable has its own weekly bucket (only on accounts whose responses carry it)
+    var fable = '';
+    if (rl.sevenDOI) {
+      var blocked = rl.fableBlockedUntil && rl.fableBlockedUntil > Date.now() / 1000;
+      var o = blocked ? 100 : Math.round(rl.sevenDOI.utilization * 100);
+      fable = '<div class="rate-sub" title="Fable has its own weekly limit on this account. When it is used up, only Fable requests move to another account.">' +
+        '<span>Fable</span>' +
+        '<div class="rate-track"><div class="rate-fill ' + fillClass(o / 100) + '" style="width:' + Math.min(o, 100) + '%"></div></div>' +
+        '<span class="rate-pct ' + pctClass(o) + '">' + (blocked ? 'used up' : o + '%') + '</span></div>';
+    }
+    barsHtml = '<div class="rate-bars">' +
+      rateGroup('5h window', rl.fiveH.utilization, rl.fiveH.reset, spark5h) +
+      rateGroup('Weekly', rl.sevenD.utilization, rl.sevenD.reset, fable + spark7d) +
+    '</div>';
+  } else if (p.dormant) {
+    barsHtml = '<div style="font-size:0.8125rem;color:var(--cyan);margin-top:0.25rem;font-weight:500">Dormant: its limit windows have not started</div>';
+  } else {
+    barsHtml = '<div style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem">Limits not known yet</div>';
+  }
+
+  var blockedHtml = p.blocked
+    ? '<div class="blocked-banner">Used up: ' + escHtml(p.blocked.what) + ' <span class="muted">&middot; back in <span data-reset="' + p.blocked.until + '" data-short="1"></span>. New and moved sessions skip it.</span></div>'
+    : '';
+  // Weekly limit for one model family (Opus or Sonnet): other models keep using the account
+  (p.modelBlocks || []).forEach(function(b) {
+    var fam = b.family.charAt(0).toUpperCase() + b.family.slice(1);
+    blockedHtml += '<div class="blocked-banner model">' + escHtml(fam) + ' weekly limit used up <span class="muted">&middot; back in <span data-reset="' + b.until + '" data-short="1"></span>. Other models still use this account.</span></div>';
+  });
+
+  var animStyle = animate ? ' style="animation-delay:' + (i*0.05) + 's"' : ' style="animation:none"';
+  var isStale = !active && (p.expired || p.refreshFailed || (p.expiresAt && p.expiresAt < Date.now()));
+  var staleMsg = '';
+  if (isStale) {
+    staleMsg = p.refreshFailed && !p.refreshFailed.retriable
+      ? '<div class="stale-msg">Login expired. Click Refresh or run <code>claude login</code> for this account.</div>'
+      : '<div class="stale-msg">Login expired. Auto-refresh will retry shortly.</div>';
+  }
+  var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '');
+  var buttonsHtml = '';
+  if (!active) {
+    buttonsHtml = '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center">' +
+      '<button class="remove-btn" onclick="doRemove(\\'' + eName + '\\',event)">Remove</button>' +
+      (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\'' + eName + '\\',event)">Refresh</button>'
+               : '<button class="switch-btn" onclick="doSwitch(\\'' + eName + '\\',\\'' + displayName.replace(/'/g, "\\\\'") + '\\',event)">Switch to this account</button>') +
+    '</div>';
+  }
+  var cache = p.cache30d && p.cache30d.hit != null
+    ? '<span class="badge badge-soft" title="Share of prompt tokens read from cache over the last 30 days. Higher is cheaper.">cache ' + Math.round(p.cache30d.hit * 100) + '%</span>' : '';
+  var arts = p.artifactCount
+    ? '<button class="chip" onclick="openArtifactsFor(\\'' + eName + '\\')" title="Artifacts this account owns on claude.ai">' + p.artifactCount + ' artifact' + (p.artifactCount === 1 ? '' : 's') + '</button>' : '';
+  return '<div class="' + cardClass + '"' + animStyle + ' data-name="' + escHtml(p.name) + '">' +
+    '<div class="card-top">' +
+      '<div class="card-identity">' +
+        '<div class="status-dot ' + (active ? 'active' : 'inactive') + '"></div>' +
+        '<span class="card-name" title="' + escHtml(displayName) + '">' + escHtml(displayName) + '</span>' +
+        (active ? renderVelocityInline(p) : '') +
+      '</div>' +
+      '<div class="card-badges">' +
+        cache + arts +
+        inflightBadge(p, balanceMode, balanceCap) +
+        planBadge(p.subscriptionType, p.rateLimitTier) +
+        (active ? '<span class="badge badge-active" title="Claude Code is logged in with this account; new sessions start here">Active</span>' : '') +
+      '</div>' +
+    '</div>' +
+    blockedHtml +
+    barsHtml +
+    renderAccountSessions(p) +
+    staleMsg +
+    buttonsHtml +
+  '</div>';
+}
 const MONTHS = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
 
 const evtColors = {
@@ -3060,6 +3031,13 @@ const evtColors = {
   'settings-changed': 'var(--muted)',
   'upgrade': 'var(--green)',
   'refresh-failed': 'var(--red)', 'token-refreshed': 'var(--green)',
+  'session-moved': 'var(--yellow)',
+};
+
+const LIMIT_TEXT = {
+  five_hour: 'used up its 5-hour limit', seven_day: 'used up its weekly limit',
+  seven_day_opus: 'used up its weekly Opus limit', seven_day_sonnet: 'used up its weekly Sonnet limit',
+  seven_day_overage_included: 'used up its Fable limit', 'retry-after': 'rate limited',
 };
 
 function evtMsg(e) {
@@ -3067,7 +3045,8 @@ function evtMsg(e) {
     case 'auto-switch': return 'Auto-switched from <b>' + (e.from||'?') + '</b> to <b>' + (e.to||'?') + '</b>';
     case 'proactive-switch': return 'Proactive switch to <b>' + (e.to||'?') + '</b>';
     case 'manual-switch': return 'Switched to <b>' + (e.to||'?') + '</b>';
-    case 'rate-limited': return '<b>' + (e.account||'?') + '</b> rate limited' + (e.retryAfter ? ' (' + Math.round(e.retryAfter/60) + ' min)' : '');
+    case 'rate-limited': return '<b>' + escHtml(e.account||'?') + '</b> ' + (LIMIT_TEXT[e.limit] || (e.limit && / bucket$/.test(e.limit) ? 'used up its Fable limit' : 'rate limited')) + (!e.limit && e.retryAfter ? ' (' + Math.round(e.retryAfter/60) + ' min)' : '');
+    case 'session-moved': return 'Session <b>' + escHtml(e.session || '?') + '</b> moved from <b>' + escHtml(e.from || '?') + '</b> to <b>' + escHtml(e.to || '?') + '</b>: ' + escHtml(MOVE_REASON[e.reason] || e.reason || '') + ', cache rebuilt';
     case 'auth-expired': return '<b>' + (e.account||'?') + '</b> token expired';
     case 'all-exhausted': return 'All accounts exhausted';
     case 'account-discovered': return 'Discovered <b>' + (e.label||e.name||'?') + '</b>';
@@ -3143,9 +3122,15 @@ function renderStats(stats) {
   }
 }
 
+// Live countdowns ("2h 5m left") and relative times ("3m ago"), so cards don't need
+// re-rendering just because time passed.
 function tickCountdowns() {
   document.querySelectorAll('[data-reset]').forEach(el => {
-    el.textContent = formatTimeLeft(Number(el.dataset.reset));
+    const t = formatTimeLeft(Number(el.dataset.reset));
+    el.textContent = el.dataset.short ? t.replace(/ left$/, '') : t;
+  });
+  document.querySelectorAll('[data-ago]').forEach(el => {
+    el.textContent = timeAgo(Number(el.dataset.ago));
   });
 }
 
@@ -3155,7 +3140,7 @@ const STRATEGY_HINTS = {
   'round-robin': 'Rotates to the least-used account on a timer. Good balance of safety and efficiency.',
   spread: 'Picks the least-used account on every request. Switches often  - may trigger Anthropic notices.',
   'drain-first': 'Uses the account with highest 5hr utilization first. Good for short sessions.',
-  balance: 'Spreads concurrent requests across accounts, capped per account. Best for running many sessions at once  - avoids per-account rate limits.',
+  balance: 'Spreads sessions across accounts by load, capped per account. Skips accounts whose 5h, weekly or Fable window is used up. Best for running many sessions at once.',
 };
 
 async function loadSettingsUI() {
@@ -3172,10 +3157,7 @@ async function loadSettingsUI() {
     document.getElementById('toggle-serialize').checked = !!s.serializeRequests;
     document.getElementById('sel-serialize-delay').value = s.serializeDelayMs || 200;
     document.getElementById('serialize-delay-ctrl').style.display = s.serializeRequests ? '' : 'none';
-    // Commit token usage
-    document.getElementById('toggle-commit-tokens').checked = !!s.commitTokenUsage;
-    // Session monitor
-    document.getElementById('toggle-session-monitor').checked = !!s.sessionMonitor;
+    document.getElementById('toggle-affinity').checked = s.sessionAffinity !== false;
   } catch {}
 }
 
@@ -3185,7 +3167,7 @@ const STRATEGY_DETAILS = {
   'round-robin': { name: 'Round-robin', desc: 'Rotate to the least-used account on a fixed timer. Balances load evenly while limiting switch frequency.' },
   spread:        { name: 'Spread',      desc: 'Always pick the account with the lowest 5hr utilization on every request. Switches often  - best for short, bursty sessions.' },
   'drain-first': { name: 'Drain first', desc: 'Use the account with the highest 5hr utilization first, draining it before moving on. Good for finishing off nearly-exhausted windows.' },
-  balance:       { name: 'Balance',     desc: 'Spread concurrent requests across accounts by least in-flight count, capped per account. When all accounts hit the cap it briefly waits for a free slot, then overflows rather than dropping. Best when running many sessions/subagents at once  - divides per-minute load so no single account gets throttled.' },
+  balance:       { name: 'Balance',     desc: 'Place new sessions on the least-loaded account (in-flight requests plus warm sessions), capped per account. Accounts whose 5h, weekly or Fable window is used up are skipped, and nearly full ones go last. With session affinity a running session stays on its account (it waits for a slot there instead of moving). Best when running many sessions/subagents at once.' },
 };
 
 function updateStrategyUI(strategy) {
@@ -3213,7 +3195,7 @@ async function toggleSetting(key, value) {
       autoSwitch: value ? 'Auto-switch enabled' : 'Auto-switch disabled',
       notifications: value ? 'Notifications enabled' : 'Notifications disabled',
       serializeRequests: value ? 'Request serialization enabled' : 'Request serialization disabled',
-      commitTokenUsage: value ? 'Commit token trailer enabled' : 'Commit token trailer disabled',
+      sessionAffinity: value ? 'Session affinity on' : 'Session affinity off  - sessions follow the strategy per request',
     };
     showToast(msgs[key] || (key + ' = ' + value));
     // Show/hide serialize delay control
@@ -3273,44 +3255,31 @@ async function changeInterval(value) {
   } catch { showToast('Failed to update'); }
 }
 
-// ── Tokens tab ──
+// ── Usage tab ──
 
-var TOK_COLORS = ['var(--primary)', 'var(--purple)', 'var(--cyan)', 'var(--green)', 'var(--yellow)', 'var(--red)'];
-
-var TOK_PRICING = {
-  'claude-opus-4-6': { input: 15, output: 75 },
-  'claude-sonnet-4-6': { input: 3, output: 15 },
-  'claude-haiku-4-5': { input: 0.80, output: 4 },
-};
-var TOK_PRICING_DEFAULT = { input: 3, output: 15 };
-var TOK_PLANS = {
-  'pro':    { label: 'Pro ($20/mo)', monthly: 20 },
-  'max5x':  { label: 'MAX 5x ($100/mo)', monthly: 100 },
-  'max20x': { label: 'MAX 20x ($200/mo)', monthly: 200 },
-};
-var _tokPrevPeriodData = [];
+var TOK_COLORS = ['var(--primary)', 'var(--purple)', 'var(--cyan)', 'var(--green)', 'var(--yellow)', 'var(--red)',
+  'hsl(330 75% 58%)', 'hsl(25 90% 55%)', 'hsl(160 60% 38%)', 'hsl(250 55% 62%)', 'hsl(200 15% 50%)', 'hsl(90 55% 40%)'];
+var _usage = null;
+var _usageHash = '';
+var _usageFetchedAt = 0;
+var USAGE_REFRESH_MS = 30000;   // the tab is about trends: a slower refresh keeps it calm
+var _tokFetching = false;
+var _tokNeedsRefresh = false;
 var _tokRepoCollapsed = {};
 
-function estimateCost(model, inTok, outTok) {
-  var key = Object.keys(TOK_PRICING).find(function(k) { return model && model.indexOf(k) === 0; });
-  var p = key ? TOK_PRICING[key] : TOK_PRICING_DEFAULT;
-  return (inTok / 1e6) * p.input + (outTok / 1e6) * p.output;
-}
-
 function formatCost(dollars) {
-  if (dollars === 0) return '$0.00';
+  if (!dollars) return '$0.00';
   if (dollars < 0.01) return '&lt;$0.01';
   if (dollars < 100) return '$' + dollars.toFixed(2);
   return '$' + Math.round(dollars).toLocaleString();
 }
 
-function toggleRepoCollapse(repoKey) {
-  _tokRepoCollapsed[repoKey] = !_tokRepoCollapsed[repoKey];
-  renderRepoBranchBreakdown(_tokFilteredData || []);
+function formatPct(x) {
+  return x == null ? '&ndash;' : Math.round(x * 100) + '%';
 }
 
 function escHtml(s) {
-  if (!s) return '';
+  if (s == null || s === '') return '';
   return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
 }
 
@@ -3328,632 +3297,386 @@ function getModelColor(model, sortedModels) {
   return TOK_COLORS[idx % TOK_COLORS.length];
 }
 
-var _lastTokensHash = '';
-var _tokensRawData = [];
-var _tok30dData = [];
-var _tokFilteredData = [];
-var _tokFetching = false;
-var _tokNeedsRefresh = false;
-
 function tokTimeRange() {
   var sel = document.getElementById('tok-time');
   return sel ? parseInt(sel.value, 10) || 7 : 7;
 }
 
-async function refreshTokens() {
+// Prompt tokens = uncached input + cache reads + cache writes
+function tokPrompt(t) {
+  return (t.input || 0) + (t.cacheRead || 0) + (t.cacheWrite5m || 0) + (t.cacheWrite1h || 0);
+}
+function tokTotal(t) { return tokPrompt(t) + (t.output || 0); }
+
+async function refreshTokens(force) {
   var tab = document.getElementById('tab-usage');
   if (!tab || !tab.classList.contains('active')) return;
+  if (!force && _usage && Date.now() - _usageFetchedAt < USAGE_REFRESH_MS) return;
   if (_tokFetching) { _tokNeedsRefresh = true; return; }
   _tokFetching = true;
   _tokNeedsRefresh = false;
   try {
-    var days = tokTimeRange();
-    var now = Date.now();
-    var currentCutoff = now - days * 24 * 60 * 60 * 1000;
-    var since = now - Math.max(2 * days, 30) * 24 * 60 * 60 * 1000;
-    var url = '/api/token-usage?since=' + since;
-    var repoSel = document.getElementById('tok-repo');
-    var branchSel = document.getElementById('tok-branch');
-    if (repoSel && repoSel.value) url += '&repo=' + encodeURIComponent(repoSel.value);
-    if (branchSel && branchSel.value) url += '&branch=' + encodeURIComponent(branchSel.value);
-    var resp = await fetch(url);
+    var q = 'days=' + tokTimeRange();
+    ['repo', 'branch', 'model', 'account'].forEach(function(k) {
+      var el = document.getElementById('tok-' + k);
+      if (el && el.value) q += '&' + k + '=' + encodeURIComponent(el.value);
+    });
+    var resp = await fetch('/api/usage?' + q);
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     var data = await resp.json();
-    if (!Array.isArray(data)) data = [];
-    var hash = quickHash(data);
-    if (hash === _lastTokensHash) return;
-    _lastTokensHash = hash;
-    var cutoff30d = now - 30 * 24 * 60 * 60 * 1000;
-    _tok30dData = data.filter(function(e) { return (e.timestamp || e.ts || 0) >= cutoff30d; });
-    _tokensRawData = data.filter(function(e) { return (e.timestamp || e.ts || 0) >= currentCutoff; });
-    _tokPrevPeriodData = data.filter(function(e) { var t = e.timestamp || e.ts || 0; return t < currentCutoff; });
-    applyTokenModelFilter();
+    _usageFetchedAt = Date.now();
+    var h = quickHash({ t: data.totals, s: data.series, p: data.plans, o: data.options, f: data.filter, c: data.cache30d && data.cache30d.overall });
+    if (h === _usageHash) return;
+    _usageHash = h;
+    _usage = data;
+    renderUsage(data);
   } catch (e) {
-    console.error('Token fetch:', e);
-    // Show empty state on error if no cached data
-    if (!_tokensRawData.length) {
-      var content = document.getElementById('tok-content');
+    if (!_usage) {
       var empty = document.getElementById('tok-empty');
-      if (content) content.style.display = 'none';
-      if (empty) empty.style.display = '';
+      empty.className = 'empty-state err-state';
+      empty.textContent = 'Could not load usage (' + e.message + '). Retrying...';
+      empty.style.display = '';
     }
   } finally {
     _tokFetching = false;
-    if (_tokNeedsRefresh) refreshTokens();
+    if (_tokNeedsRefresh) refreshTokens(true);
   }
 }
 
-function applyTokenModelFilter() {
-  var data = _tokensRawData;
-  var prevData = _tokPrevPeriodData;
-  var modelSel = document.getElementById('tok-model');
-  var accountSel = document.getElementById('tok-account');
-  if (modelSel && modelSel.value) {
-    data = data.filter(function(e) { return e.model === modelSel.value; });
-    prevData = prevData.filter(function(e) { return e.model === modelSel.value; });
-  }
-  if (accountSel && accountSel.value) {
-    data = data.filter(function(e) { return e.account === accountSel.value; });
-    prevData = prevData.filter(function(e) { return e.account === accountSel.value; });
-  }
-  _tokFilteredData = data;
-  populateTokenFilters(_tokensRawData);
-  renderTokenStats(data, prevData);
-  renderDailyChart(data);
-  renderCostSavingsChart();
-  renderModelBreakdown(data);
-  renderAccountBreakdown(data);
-  renderRepoBranchBreakdown(data);
+function hasUsageFilter() {
+  return ['repo', 'branch', 'model', 'account'].some(function(k) { var el = document.getElementById('tok-' + k); return el && el.value; });
 }
 
-function populateTokenFilters(data) {
-  var repoSel = document.getElementById('tok-repo');
-  var branchSel = document.getElementById('tok-branch');
-  var modelSel = document.getElementById('tok-model');
-  var accountSel = document.getElementById('tok-account');
-  if (!repoSel || !branchSel || !modelSel) return;
-  var prevRepo = repoSel.value;
-  var prevBranch = branchSel.value;
-  var prevModel = modelSel.value;
-  var prevAccount = accountSel ? accountSel.value : '';
-  var repoSet = {}, modelSet = {}, accountSet = {};
-  for (var i = 0; i < data.length; i++) {
-    if (data[i].repo) repoSet[data[i].repo] = 1;
-    if (data[i].model) modelSet[data[i].model] = 1;
-    if (data[i].account) accountSet[data[i].account] = 1;
-  }
-  var repos = Object.keys(repoSet).sort();
-  repoSel.innerHTML = '<option value="">All repos</option>' +
-    repos.map(function(r) {
-      return '<option value="' + escHtml(r) + '"' + (r === prevRepo ? ' selected' : '') + '>' + escHtml(r.split('/').pop()) + '</option>';
-    }).join('');
-  var branchData = prevRepo ? data.filter(function(e) { return e.repo === prevRepo; }) : data;
-  var filteredBranches = {};
-  for (var j = 0; j < branchData.length; j++) {
-    if (branchData[j].branch) filteredBranches[branchData[j].branch] = 1;
-  }
-  var branches = Object.keys(filteredBranches).sort();
-  branchSel.innerHTML = '<option value="">All branches</option>' +
-    branches.map(function(b) {
-      return '<option value="' + escHtml(b) + '"' + (b === prevBranch ? ' selected' : '') + '>' + escHtml(b) + '</option>';
-    }).join('');
-  var models = Object.keys(modelSet).sort();
-  modelSel.innerHTML = '<option value="">All models</option>' +
-    models.map(function(m) {
-      return '<option value="' + escHtml(m) + '"' + (m === prevModel ? ' selected' : '') + '>' + escHtml(shortModel(m)) + '</option>';
-    }).join('');
-  if (accountSel) {
-    var accounts = Object.keys(accountSet).sort();
-    accountSel.innerHTML = '<option value="">All accounts</option>' +
-      accounts.map(function(a) {
-        return '<option value="' + escHtml(a) + '"' + (a === prevAccount ? ' selected' : '') + '>' + escHtml(a) + '</option>';
-      }).join('');
-  }
+function clearUsageFilters() {
+  ['repo', 'branch', 'model', 'account'].forEach(function(k) { var el = document.getElementById('tok-' + k); if (el) el.value = ''; });
+  tokFilterChange('time');
 }
 
-function renderTokenStats(data, prevData) {
+function renderUsage(d) {
+  populateTokenFilters(d.options);
   var content = document.getElementById('tok-content');
   var empty = document.getElementById('tok-empty');
-  if (!content || !empty) return;
-  if (!data.length) {
+  if (!d.totals.requests) {
     content.style.display = 'none';
+    empty.className = 'empty-state';
+    empty.innerHTML = hasUsageFilter()
+      ? 'No usage matches these filters. <button class="link-btn" style="font-size:inherit" onclick="clearUsageFilters()">Clear filters</button>'
+      : 'No token usage recorded in this period yet.';
     empty.style.display = '';
     return;
   }
   content.style.display = '';
   empty.style.display = 'none';
-  var totalIn = 0, totalOut = 0, requests = 0, totalCost = 0;
-  for (var i = 0; i < data.length; i++) {
-    var inT = data[i].inputTokens || 0;
-    var outT = data[i].outputTokens || 0;
-    totalIn += inT;
-    totalOut += outT;
-    totalCost += estimateCost(data[i].model, inT, outT);
-    requests++;
+  renderTokenStats(d);
+  renderDailyChart(d);
+  renderCostSavingsChart(d);
+  renderPlanValue(d);
+  renderCacheEfficiency(d.cache30d);
+  renderModelBreakdown(d);
+  renderAccountBreakdown(d);
+  renderRepoBranchBreakdown(d);
+}
+
+function populateTokenFilters(opts) {
+  function fill(id, values, allLabel, labelFn) {
+    var sel = document.getElementById(id);
+    if (!sel || document.activeElement === sel) return;   // never rebuild a select the user is using
+    var cur = sel.value;
+    var list = values.slice();
+    if (cur && list.indexOf(cur) === -1) list.push(cur);
+    var html = '<option value="">' + allLabel + '</option>' + list.map(function(v) {
+      return '<option value="' + escHtml(v) + '"' + (v === cur ? ' selected' : '') + '>' + escHtml(labelFn ? labelFn(v) : v) + '</option>';
+    }).join('');
+    if (sel.dataset.opts === html) return;
+    sel.innerHTML = html;
+    sel.dataset.opts = html;
   }
+  fill('tok-repo', opts.repos || [], 'All repos', function(r) { return r.split('/').pop(); });
+  fill('tok-branch', opts.branches || [], 'All branches');
+  fill('tok-model', opts.models || [], 'All models', shortModel);
+  fill('tok-account', opts.accounts || [], 'All accounts');
+}
+
+function renderTokenStats(d) {
+  var t = d.totals, p = d.prevTotals || {};
+  var total = tokTotal(t), prevTotal = tokTotal(p);
   var trendHtml = '';
-  if (prevData && prevData.length) {
-    var prevTotal = 0;
-    for (var p = 0; p < prevData.length; p++) prevTotal += (prevData[p].inputTokens || 0) + (prevData[p].outputTokens || 0);
-    if (prevTotal > 0) {
-      var curTotal = totalIn + totalOut;
-      var pctChange = Math.round(((curTotal - prevTotal) / prevTotal) * 100);
-      if (pctChange !== 0) {
-        var arrow = pctChange > 0 ? '\u2191' : '\u2193';
-        var cls = pctChange > 0 ? 'up' : 'down';
-        trendHtml = '<div class="tok-trend ' + cls + '">' + arrow + ' ' + Math.abs(pctChange) + '% vs prev period</div>';
-      }
+  if (prevTotal > 0) {
+    var pctChange = Math.round(((total - prevTotal) / prevTotal) * 100);
+    if (pctChange !== 0) {
+      trendHtml = '<div class="tok-trend ' + (pctChange > 0 ? 'up' : 'down') + '">' + (pctChange > 0 ? '&uarr;' : '&darr;') + ' ' + Math.abs(pctChange) + '% vs prev period</div>';
     }
   }
-  var statsEl = document.getElementById('tok-stats');
-  if (statsEl) statsEl.innerHTML = [
-    { v: formatNum(totalIn + totalOut), l: 'Total Tokens', extra: trendHtml },
-    { v: formatNum(totalIn), l: 'Input' },
-    { v: formatNum(totalOut), l: 'Output' },
-    { v: formatNum(requests), l: 'Requests' },
-    { v: formatCost(totalCost), l: 'API Equiv.', sub: 'at API rates' },
-  ].map(function(s) {
+  var prompt = tokPrompt(t);
+  var writes = (t.cacheWrite5m || 0) + (t.cacheWrite1h || 0);
+  var stats = [
+    { v: formatNum(total), l: 'Total tokens', sub: 'incl. cache', extra: trendHtml },
+    { v: formatNum(t.requests), l: 'Requests' },
+    { v: formatPct(prompt ? t.cacheRead / prompt : null), l: 'Cache hit', sub: formatPct(prompt ? writes / prompt : null) + ' rebuilt' },
+    { v: formatCost(t.cost), l: 'API price', sub: 'same usage, pay-as-you-go' },
+    { v: formatNum(t.cacheRead), l: 'Cache reads' },
+    { v: formatNum(writes), l: 'Cache writes' },
+    { v: formatNum(t.input), l: 'Uncached input' },
+    { v: formatNum(t.output), l: 'Output' },
+  ];
+  document.getElementById('tok-stats').innerHTML = stats.map(function(s) {
     var h = '<div class="stat-item"><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div>';
     if (s.sub) h += '<div class="tok-stat-sub">' + s.sub + '</div>';
     if (s.extra) h += s.extra;
     return h + '</div>';
   }).join('');
-  // Savings banner — daily rate comparison
-  var savingsEl = document.getElementById('tok-savings');
-  if (savingsEl) {
-    var days = tokTimeRange();
-    var planSel = document.getElementById('tok-plan');
-    var planKey = planSel ? planSel.value : 'max5x';
-    var plan = TOK_PLANS[planKey] || TOK_PLANS['max5x'];
-    var planDaily = plan.monthly / 30;
-    var apiDaily = days > 0 ? totalCost / days : 0;
-    var savedDaily = apiDaily - planDaily;
-    var opts = Object.keys(TOK_PLANS).map(function(k) {
-      return '<option value="' + k + '"' + (k === planKey ? ' selected' : '') + '>' + TOK_PLANS[k].label + '</option>';
-    }).join('');
-    var msg;
-    if (savedDaily > 0) {
-      msg = 'saves you ~<span class="tok-savings-val">' + formatCost(savedDaily) + '/day</span> vs API rates (' + formatCost(planDaily) + '/day plan vs ' + formatCost(apiDaily) + '/day API)';
-    } else {
-      msg = 'costs ' + formatCost(planDaily) + '/day \u00b7 API equiv ' + formatCost(apiDaily) + '/day';
-    }
-    savingsEl.innerHTML = 'Your <select id="tok-plan" onchange="applyTokenModelFilter()">' + opts + '</select> ' + msg;
-  }
 }
 
-function renderModelBreakdown(data) {
-  var el = document.getElementById('tok-models');
-  if (!el) return;
-  if (!data.length) { el.innerHTML = ''; return; }
-  var modelMap = {};
-  for (var i = 0; i < data.length; i++) {
-    var m = data[i].model || 'unknown';
-    if (!modelMap[m]) modelMap[m] = { input: 0, output: 0, total: 0 };
-    modelMap[m].input += data[i].inputTokens || 0;
-    modelMap[m].output += data[i].outputTokens || 0;
-    modelMap[m].total += (data[i].inputTokens || 0) + (data[i].outputTokens || 0);
-  }
-  var sortedModels = Object.keys(modelMap).sort().filter(function(k) { return modelMap[k].total > 0; });
-  if (!sortedModels.length) { el.innerHTML = ''; return; }
-  var grandTotal = 0;
-  for (var j = 0; j < sortedModels.length; j++) grandTotal += modelMap[sortedModels[j]].total;
-  if (!grandTotal) grandTotal = 1;
-  var propBar = '<div class="tok-proportion">';
-  for (var k = 0; k < sortedModels.length; k++) {
-    var pct = (modelMap[sortedModels[k]].total / grandTotal) * 100;
-    propBar += '<div class="tok-proportion-seg" style="width:'+pct+'%;background:'+getModelColor(sortedModels[k], sortedModels)+'"></div>';
-  }
-  propBar += '</div>';
-  var rows = '';
-  for (var r = 0; r < sortedModels.length; r++) {
-    var md = modelMap[sortedModels[r]];
-    var pctR = Math.round((md.total / grandTotal) * 100);
-    var mdCost = estimateCost(sortedModels[r], md.input, md.output);
-    rows += '<div class="tok-model-row">' +
-      '<div class="tok-model-dot" style="background:'+getModelColor(sortedModels[r], sortedModels)+'"></div>' +
-      '<div class="tok-model-name">'+escHtml(shortModel(sortedModels[r]))+'</div>' +
-      '<div class="tok-model-detail">'+formatNum(md.input)+' in / '+formatNum(md.output)+' out</div>' +
-      '<div class="tok-model-total">'+formatNum(md.total)+'</div>' +
-      '<div class="tok-model-cost">'+formatCost(mdCost)+'</div>' +
-      '<div class="tok-model-pct">'+pctR+'%</div>' +
-    '</div>';
-  }
-  el.innerHTML = propBar + rows;
+// Time buckets for charts: hourly (1-2 days), daily (up to a month), weekly (longer).
+function usageBuckets(d) {
+  var groupMs = d.days > 31 ? 7 * 86400000 : d.bucketMs;
+  var start = Math.floor(d.since / groupMs) * groupMs;
+  var count = Math.max(1, Math.ceil((Date.now() - start) / groupMs));
+  var buckets = [];
+  for (var i = 0; i < count; i++) buckets.push({ t: start + i * groupMs, total: 0, cost: 0, byModel: {} });
+  (d.series || []).forEach(function(s) {
+    var idx = Math.floor((s.t - start) / groupMs);
+    if (idx < 0) return;
+    if (idx >= count) idx = count - 1;
+    var b = buckets[idx];
+    b.cost += s.cost || 0;
+    Object.keys(s.byModel).forEach(function(m) {
+      b.byModel[m] = (b.byModel[m] || 0) + s.byModel[m];
+      b.total += s.byModel[m];
+    });
+  });
+  return { buckets: buckets, groupMs: groupMs };
 }
 
-function renderDailyChart(data) {
+function bucketLabel(t, groupMs) {
+  var dt = new Date(t);
+  if (groupMs < 86400000) return String(dt.getHours()).padStart(2, '0') + 'h';
+  return (dt.getMonth() + 1) + '/' + dt.getDate();
+}
+
+function renderDailyChart(d) {
   var el = document.getElementById('tok-chart');
-  if (!el) return;
-  if (!data.length) { el.innerHTML = ''; return; }
-  var days = tokTimeRange();
-  var now = Date.now();
-  var buckets, labelFn, bucketCount;
-  if (days === 1) {
-    bucketCount = 24;
-    labelFn = function(idx) { return idx + 'h'; };
-  } else if (days <= 30) {
-    bucketCount = days;
-    labelFn = function(idx) {
-      var d = new Date(now - (days - 1 - idx) * 86400000);
-      return (d.getMonth()+1) + '/' + d.getDate();
-    };
-  } else {
-    bucketCount = 13;
-    labelFn = function(idx) {
-      var d = new Date(now - (12 - idx) * 7 * 86400000);
-      return (d.getMonth()+1) + '/' + d.getDate();
-    };
-  }
-  // Collect all models
-  var allModels = {};
-  for (var i = 0; i < data.length; i++) allModels[data[i].model || 'unknown'] = 1;
-  var sortedModels = Object.keys(allModels).sort();
-  // Init buckets
-  buckets = [];
-  for (var b = 0; b < bucketCount; b++) {
-    var obj = { total: 0 };
-    for (var mi = 0; mi < sortedModels.length; mi++) obj[sortedModels[mi]] = 0;
-    buckets.push(obj);
-  }
-  // Fill buckets
-  var periodStart = days === 1
-    ? now - 24 * 3600000
-    : days <= 30
-      ? now - days * 86400000
-      : now - 13 * 7 * 86400000;
-  for (var j = 0; j < data.length; j++) {
-    var ts = data[j].timestamp || data[j].ts || 0;
-    var tok = (data[j].inputTokens || 0) + (data[j].outputTokens || 0);
-    var elapsed = ts - periodStart;
-    if (elapsed < 0) continue;
-    var idx;
-    if (days === 1) {
-      idx = Math.floor(elapsed / 3600000);
-    } else if (days <= 30) {
-      idx = Math.floor(elapsed / 86400000);
-    } else {
-      idx = Math.floor(elapsed / (7 * 86400000));
-    }
-    if (idx >= bucketCount) idx = bucketCount - 1;
-    if (idx < 0) idx = 0;
-    var model = data[j].model || 'unknown';
-    buckets[idx][model] = (buckets[idx][model] || 0) + tok;
-    buckets[idx].total += tok;
-  }
+  var bk = usageBuckets(d);
+  var buckets = bk.buckets;
+  var sortedModels = Object.keys(d.byModel).sort();
   var maxTotal = Math.max.apply(null, buckets.map(function(b) { return b.total; })) || 1;
-  // Build legend
-  var legend = '<div class="chart-legend">';
-  for (var li = 0; li < sortedModels.length; li++) {
-    legend += '<div class="chart-legend-item"><span class="chart-legend-dot" style="background:' + getModelColor(sortedModels[li], sortedModels) + '"></span> ' + escHtml(shortModel(sortedModels[li])) + '</div>';
-  }
-  legend += '</div>';
-  // Build bars
-  var showLabel = bucketCount <= 31;
+  var legend = '<div class="chart-legend">' + sortedModels.map(function(m) {
+    return '<div class="chart-legend-item"><span class="chart-legend-dot" style="background:' + getModelColor(m, sortedModels) + '"></span> ' + escHtml(shortModel(m)) + '</div>';
+  }).join('') + '</div>';
+  var labelEvery = Math.ceil(buckets.length / 16);
   var bars = '<div class="tok-chart-wrap">';
-  for (var k = 0; k < bucketCount; k++) {
-    var bucket = buckets[k];
-    var stackH = Math.round((bucket.total / maxTotal) * 120);
-    bars += '<div class="tok-chart-bar-group">';
-    bars += '<div class="tok-chart-bar-area"><div class="tok-chart-stack" style="height:' + stackH + 'px">';
-    for (var si = 0; si < sortedModels.length; si++) {
-      var segVal = bucket[sortedModels[si]] || 0;
-      if (segVal <= 0) continue;
-      var segH = Math.max(1, Math.round((segVal / bucket.total) * stackH));
-      bars += '<div class="tok-chart-seg" style="height:' + segH + 'px;background:' + getModelColor(sortedModels[si], sortedModels) + '" data-tooltip="' + escHtml(shortModel(sortedModels[si])) + ': ' + formatNum(segVal) + '"></div>';
-    }
+  buckets.forEach(function(b, k) {
+    var stackH = Math.round((b.total / maxTotal) * 120);
+    bars += '<div class="tok-chart-bar-group"><div class="tok-chart-bar-area"><div class="tok-chart-stack" style="height:' + stackH + 'px">';
+    sortedModels.forEach(function(m) {
+      var v = b.byModel[m] || 0;
+      if (v <= 0) return;
+      var segH = Math.max(1, Math.round((v / b.total) * stackH));
+      bars += '<div class="tok-chart-seg" style="height:' + segH + 'px;background:' + getModelColor(m, sortedModels) + '" data-tooltip="' + escHtml(shortModel(m)) + ': ' + formatNum(v) + ' tokens"></div>';
+    });
     bars += '</div></div>';
-    if (showLabel) {
-      bars += '<div class="tok-chart-label">' + labelFn(k) + '</div>';
-    }
-    bars += '</div>';
-  }
+    bars += '<div class="tok-chart-label">' + (k % labelEvery === 0 ? bucketLabel(b.t, bk.groupMs) : '') + '</div></div>';
+  });
   bars += '</div>';
-  var chartTitle = days === 1 ? 'Hourly Usage' : days <= 30 ? 'Daily Usage' : 'Weekly Usage';
-  el.innerHTML = '<div class="usage-title">' + chartTitle + '</div>' + legend + bars;
+  var title = bk.groupMs < 86400000 ? 'Hourly Usage' : bk.groupMs === 86400000 ? 'Daily Usage' : 'Weekly Usage';
+  el.innerHTML = '<div class="usage-title">' + title + ' &middot; tokens by model, incl. cache</div>' + legend + bars;
 }
 
-var _chartCarouselIdx = 0;
-var _chartCarouselTimer = null;
-function chartCarouselGo(idx) {
-  _chartCarouselIdx = idx;
-  var slides = document.getElementById('chart-carousel-slides');
-  var dots = document.getElementById('chart-carousel-dots');
-  if (slides) slides.style.transform = 'translateX(-' + (idx * 100) + '%)';
-  if (dots) {
-    var btns = dots.querySelectorAll('.chart-carousel-dot');
-    for (var i = 0; i < btns.length; i++) {
-      btns[i].classList.toggle('active', i === idx);
-    }
-  }
-  clearInterval(_chartCarouselTimer);
-  _chartCarouselTimer = setInterval(chartCarouselNext, 10000);
-}
-function chartCarouselNext() {
-  var dots = document.getElementById('chart-carousel-dots');
-  var count = dots ? dots.querySelectorAll('.chart-carousel-dot').length : 2;
-  chartCarouselGo((_chartCarouselIdx + 1) % count);
-}
-_chartCarouselTimer = setInterval(chartCarouselNext, 10000);
-
-function getPlanMonthlyCost(subscriptionType, rateLimitTier) {
-  var sub = (subscriptionType || '').toLowerCase();
-  var tier = (rateLimitTier || '').toLowerCase();
-  // Infer subscription type from tier string when subscriptionType is missing/unknown
-  var isMax = sub === 'max' || tier.indexOf('max') !== -1;
-  var isPro = sub === 'pro' || tier.indexOf('pro') !== -1;
-  if (isMax) {
-    var m = tier.match(/(\d+)x/);
-    if (m) {
-      var mult = parseInt(m[1], 10);
-      if (mult >= 20) return 200;
-      return 100;
-    }
-    return 100;
-  }
-  if (isPro) return 20;
-  return 0;
-}
-
-function renderCostSavingsChart() {
+// Cumulative API-price value of the usage vs the cumulative (prorated) plan price.
+function renderCostSavingsChart(d) {
   var el = document.getElementById('tok-savings-chart');
-  if (!el) return;
-  var data = _tok30dData;
-  if (!data.length) { el.innerHTML = '<div class="usage-title">Cost Savings</div><div style="color:var(--muted);font-size:0.8125rem;padding:2rem 0;text-align:center">No usage data for savings chart</div>'; return; }
-
-  // Compute total monthly plan cost from profiles
-  var totalMonthlyPlan = 0;
-  for (var pi = 0; pi < _cachedProfiles.length; pi++) {
-    totalMonthlyPlan += getPlanMonthlyCost(_cachedProfiles[pi].subscriptionType, _cachedProfiles[pi].rateLimitTier);
-  }
-  if (totalMonthlyPlan === 0) totalMonthlyPlan = 100; // fallback
-
-  var dailyPlanCost = totalMonthlyPlan / 30;
-
-  // Build 30-day buckets of API cost
-  var now = Date.now();
-  var dayMs = 86400000;
-  var bucketCount = 30;
-  var periodStart = now - bucketCount * dayMs;
-  var dailyCosts = [];
-  for (var b = 0; b < bucketCount; b++) dailyCosts.push(0);
-
-  for (var i = 0; i < data.length; i++) {
-    var ts = data[i].timestamp || data[i].ts || 0;
-    var elapsed = ts - periodStart;
-    if (elapsed < 0) continue;
-    var idx = Math.floor(elapsed / dayMs);
-    if (idx >= bucketCount) idx = bucketCount - 1;
-    if (idx < 0) idx = 0;
-    dailyCosts[idx] += estimateCost(data[i].model, data[i].inputTokens || 0, data[i].outputTokens || 0);
-  }
-
-  // Accumulate
-  var cumPlan = [];
-  var cumApi = [];
-  var runPlan = 0, runApi = 0;
-  for (var d = 0; d < bucketCount; d++) {
-    runPlan += dailyPlanCost;
-    runApi += dailyCosts[d];
+  var bk = usageBuckets(d);
+  var buckets = bk.buckets;
+  var n = buckets.length;
+  var showPlan = d.planComparable && d.planDaily > 0;
+  var planPerBucket = showPlan ? d.planDaily * bk.groupMs / 86400000 : 0;
+  var cumPlan = [], cumApi = [], runPlan = 0, runApi = 0;
+  buckets.forEach(function(b) {
+    runPlan += planPerBucket;
+    runApi += b.cost;
     cumPlan.push(runPlan);
     cumApi.push(runApi);
-  }
-
-  var maxVal = Math.max(cumPlan[bucketCount - 1], cumApi[bucketCount - 1], 1);
-  var totalSaved = cumApi[bucketCount - 1] - cumPlan[bucketCount - 1];
-
-  // SVG dimensions
-  var svgW = 500, svgH = 140;
-  var padL = 45, padR = 10, padT = 10, padB = 25;
-  var chartW = svgW - padL - padR;
-  var chartH = svgH - padT - padB;
-
-  function xPos(idx) { return padL + (idx / (bucketCount - 1)) * chartW; }
-  function yPos(val) { return padT + chartH - (val / maxVal) * chartH; }
-
-  // Grid lines
-  var gridLines = '';
-  var gridCount = 4;
-  for (var g = 0; g <= gridCount; g++) {
-    var gVal = (maxVal / gridCount) * g;
-    var gy = yPos(gVal);
-    gridLines += '<line x1="' + padL + '" y1="' + gy + '" x2="' + (svgW - padR) + '" y2="' + gy + '" class="grid-line"/>';
-    gridLines += '<text x="' + (padL - 4) + '" y="' + (gy + 3) + '" class="axis-label" text-anchor="end">$' + Math.round(gVal) + '</text>';
-  }
-
-  // X-axis labels (every 5 days)
-  var xLabels = '';
-  for (var xl = 0; xl < bucketCount; xl += 5) {
-    var labelDate = new Date(periodStart + (xl + 0.5) * dayMs);
-    xLabels += '<text x="' + xPos(xl) + '" y="' + (svgH - 2) + '" class="axis-label" text-anchor="middle">' + (labelDate.getMonth() + 1) + '/' + labelDate.getDate() + '</text>';
-  }
-  // Last day label
-  var lastDate = new Date(now - 0.5 * dayMs);
-  xLabels += '<text x="' + xPos(bucketCount - 1) + '" y="' + (svgH - 2) + '" class="axis-label" text-anchor="middle">' + (lastDate.getMonth() + 1) + '/' + lastDate.getDate() + '</text>';
-
-  // Build path strings
-  var planPath = '', apiPath = '';
-  for (var p = 0; p < bucketCount; p++) {
-    var cmd = p === 0 ? 'M' : 'L';
-    planPath += cmd + xPos(p).toFixed(1) + ',' + yPos(cumPlan[p]).toFixed(1);
-    apiPath += cmd + xPos(p).toFixed(1) + ',' + yPos(cumApi[p]).toFixed(1);
-  }
-
-  // Area between the two lines (for savings visualization)
-  var areaPath = '';
-  for (var a = 0; a < bucketCount; a++) {
-    areaPath += (a === 0 ? 'M' : 'L') + xPos(a).toFixed(1) + ',' + yPos(cumApi[a]).toFixed(1);
-  }
-  for (var a2 = bucketCount - 1; a2 >= 0; a2--) {
-    areaPath += 'L' + xPos(a2).toFixed(1) + ',' + yPos(cumPlan[a2]).toFixed(1);
-  }
-  areaPath += 'Z';
-
-  var areaColor = totalSaved > 0 ? 'var(--green)' : 'var(--red)';
-
-  var svg = '<svg class="savings-chart-svg" viewBox="0 0 ' + svgW + ' ' + svgH + '" preserveAspectRatio="none">' +
-    gridLines + xLabels +
-    '<path d="' + areaPath + '" class="area-savings" fill="' + areaColor + '"/>' +
-    '<path d="' + planPath + '" class="line-plan"/>' +
-    '<path d="' + apiPath + '" class="line-api"/>' +
-    '</svg>';
-
-  var legend = '<div class="savings-chart-legend">' +
-    '<div class="savings-chart-legend-item"><span class="savings-chart-legend-line dashed"></span>Plan cost</div>' +
-    '<div class="savings-chart-legend-item"><span class="savings-chart-legend-line solid"></span>API equiv.</div>' +
-    '</div>';
-
-  var totalLine = '';
-  if (totalSaved > 0) {
-    totalLine = '<div class="savings-chart-total">30-day savings: <span class="saved">' + formatCost(totalSaved) + '</span> (' + formatCost(totalMonthlyPlan) + '/mo plan vs ' + formatCost(cumApi[bucketCount - 1]) + ' API)</div>';
-  } else {
-    totalLine = '<div class="savings-chart-total">30-day delta: <span class="over">' + formatCost(Math.abs(totalSaved)) + ' over</span> (' + formatCost(totalMonthlyPlan) + '/mo plan vs ' + formatCost(cumApi[bucketCount - 1]) + ' API)</div>';
-  }
-
-  el.innerHTML = '<div class="usage-title">Cost Savings (30 days)</div>' + legend +
-    '<div class="savings-chart-container">' + svg + '</div>' + totalLine;
-}
-
-function renderAccountBreakdown(data) {
-  var el = document.getElementById('tok-accounts');
-  if (!el) return;
-  if (!data.length) { el.innerHTML = ''; return; }
-  var accountMap = {};
-  for (var i = 0; i < data.length; i++) {
-    var acct = data[i].account || 'unknown';
-    if (!accountMap[acct]) accountMap[acct] = { input: 0, output: 0, total: 0, cost: 0 };
-    var inT = data[i].inputTokens || 0;
-    var outT = data[i].outputTokens || 0;
-    accountMap[acct].input += inT;
-    accountMap[acct].output += outT;
-    accountMap[acct].total += inT + outT;
-    accountMap[acct].cost += estimateCost(data[i].model, inT, outT);
-  }
-  var sortedAccounts = Object.keys(accountMap).sort(function(a,b) { return accountMap[b].total - accountMap[a].total; });
-  if (!sortedAccounts.length) { el.innerHTML = ''; return; }
-  var grandTotal = 0;
-  for (var j = 0; j < sortedAccounts.length; j++) grandTotal += accountMap[sortedAccounts[j]].total;
-  if (!grandTotal) grandTotal = 1;
-  var propBar = '<div class="tok-proportion">';
-  for (var k = 0; k < sortedAccounts.length; k++) {
-    var pct = (accountMap[sortedAccounts[k]].total / grandTotal) * 100;
-    propBar += '<div class="tok-proportion-seg" style="width:' + pct + '%;background:' + TOK_COLORS[k % TOK_COLORS.length] + '"></div>';
-  }
-  propBar += '</div>';
-  var rows = '';
-  for (var r = 0; r < sortedAccounts.length; r++) {
-    var ad = accountMap[sortedAccounts[r]];
-    var pctR = Math.round((ad.total / grandTotal) * 100);
-    var cost = ad.cost;
-    rows += '<div class="tok-model-row">' +
-      '<div class="tok-model-dot" style="background:' + TOK_COLORS[r % TOK_COLORS.length] + '"></div>' +
-      '<div class="tok-model-name">' + escHtml(sortedAccounts[r]) + '</div>' +
-      '<div class="tok-model-detail">' + formatNum(ad.input) + ' in / ' + formatNum(ad.output) + ' out</div>' +
-      '<div class="tok-model-total">' + formatNum(ad.total) + '</div>' +
-      '<div class="tok-model-cost">' + formatCost(cost) + '</div>' +
-      '<div class="tok-model-pct">' + pctR + '%</div>' +
-    '</div>';
-  }
-  el.innerHTML = propBar + rows;
-}
-
-function renderRepoBranchBreakdown(data) {
-  var el = document.getElementById('tok-repos');
-  if (!el) return;
-  if (!data.length) { el.innerHTML = ''; return; }
-  var now = Date.now();
-  var inactiveThreshold = now - 3 * 86400000;
-  var allModels = {};
-  // Group by repo, then by branch
-  var repoMap = {};
-  for (var i = 0; i < data.length; i++) {
-    var repo = data[i].repo || 'unknown';
-    var branch = data[i].branch || 'unknown';
-    var inTok = data[i].inputTokens || 0;
-    var outTok = data[i].outputTokens || 0;
-    var m = data[i].model || 'unknown';
-    var ts = data[i].timestamp || data[i].ts || 0;
-    allModels[m] = 1;
-    if (!repoMap[repo]) repoMap[repo] = { totalIn: 0, totalOut: 0, lastTs: 0, cost: 0, branches: {} };
-    repoMap[repo].totalIn += inTok;
-    repoMap[repo].totalOut += outTok;
-    repoMap[repo].cost += estimateCost(m, inTok, outTok);
-    if (ts > repoMap[repo].lastTs) repoMap[repo].lastTs = ts;
-    if (!repoMap[repo].branches[branch]) repoMap[repo].branches[branch] = { totalIn: 0, totalOut: 0, lastTs: 0, models: {} };
-    var br = repoMap[repo].branches[branch];
-    br.totalIn += inTok;
-    br.totalOut += outTok;
-    if (ts > br.lastTs) br.lastTs = ts;
-    if (!br.models[m]) br.models[m] = { input: 0, output: 0 };
-    br.models[m].input += inTok;
-    br.models[m].output += outTok;
-  }
-  var sortedAllModels = Object.keys(allModels).sort();
-  var grandTotal = 0;
-  var repoList = Object.keys(repoMap).map(function(r) {
-    var rd = repoMap[r];
-    var total = rd.totalIn + rd.totalOut;
-    grandTotal += total;
-    return { key: r, name: r.split('/').pop(), totalIn: rd.totalIn, totalOut: rd.totalOut, total: total, lastTs: rd.lastTs, cost: rd.cost, branches: rd.branches };
   });
-  if (!grandTotal) grandTotal = 1;
-  // Split active/inactive
-  var active = repoList.filter(function(r) { return r.lastTs >= inactiveThreshold; });
-  var inactive = repoList.filter(function(r) { return r.lastTs < inactiveThreshold; });
-  active.sort(function(a,b) { return b.total - a.total; });
-  inactive.sort(function(a,b) { return b.total - a.total; });
-  // Default collapse: collapsed if more than 3 active repos
-  var defaultCollapsed = active.length > 3;
-  function renderRepoGroup(repo, isInactive) {
-    if (_tokRepoCollapsed[repo.key] === undefined) {
-      _tokRepoCollapsed[repo.key] = isInactive ? true : defaultCollapsed;
-    }
-    var collapsed = _tokRepoCollapsed[repo.key];
-    var pct = Math.round((repo.total / grandTotal) * 100);
-    var cost = repo.cost;
-    var cls = 'tok-repo-group' + (isInactive ? ' tok-repo-inactive' : '');
-    var chevCls = 'tok-repo-chevron' + (collapsed ? ' collapsed' : '');
-    var h = '<div class="' + cls + '">';
-    h += '<div class="tok-repo-header" onclick="toggleRepoCollapse(this.dataset.key)" data-key="' + escHtml(repo.key) + '">';
-    h += '<span class="' + chevCls + '">\u25BC</span>';
-    h += '<span class="tok-repo-name">' + escHtml(repo.name) + '</span>';
-    h += '<span class="tok-model-detail" style="flex:1">' + formatNum(repo.totalIn) + ' in / ' + formatNum(repo.totalOut) + ' out</span>';
-    h += '<span class="tok-model-cost">' + formatCost(cost) + '</span>';
-    h += '<span class="tok-model-pct">' + pct + '%</span>';
-    h += '</div>';
-    if (!collapsed) {
-      var branchKeys = Object.keys(repo.branches).sort(function(a,b) {
-        var ta = repo.branches[a].totalIn + repo.branches[a].totalOut;
-        var tb = repo.branches[b].totalIn + repo.branches[b].totalOut;
-        return tb - ta;
-      });
-      for (var bi = 0; bi < branchKeys.length; bi++) {
-        var br = repo.branches[branchKeys[bi]];
-        var brTotal = br.totalIn + br.totalOut;
-        var brPct = Math.round((brTotal / grandTotal) * 100);
-        var brInactive = br.lastTs < inactiveThreshold;
-        var brCls = 'tok-branch-row' + (brInactive ? ' tok-branch-inactive' : '');
-        var modelEntries = Object.entries(br.models).sort(function(a,b) { return (b[1].input + b[1].output) - (a[1].input + a[1].output); });
-        var modelDetail = modelEntries.map(function(e) {
-          return '<span style="color:'+getModelColor(e[0], sortedAllModels)+'">'+escHtml(shortModel(e[0]))+'</span> '+formatNum(e[1].input)+' / '+formatNum(e[1].output);
-        }).join(' \u00b7 ');
-        h += '<div class="' + brCls + '" style="padding-left:1.5rem">';
-        h += '<div class="tok-branch-name"><span class="tok-branch-badge">' + escHtml(branchKeys[bi]) + '</span></div>';
-        h += '<div class="tok-branch-stats">';
-        h += '<span class="tok-branch-total">' + formatNum(br.totalIn) + ' / ' + formatNum(br.totalOut) + '</span>';
-        h += '<span class="tok-branch-pct">' + brPct + '%</span>';
-        h += '</div>';
-        h += '<div class="tok-branch-detail">' + modelDetail + '</div>';
-        h += '</div>';
-      }
-    }
-    h += '</div>';
-    return h;
+  var maxVal = Math.max(cumPlan[n - 1], cumApi[n - 1], 1);
+  var svgW = 500, svgH = 140, padL = 45, padR = 10, padT = 10, padB = 25;
+  var chartW = svgW - padL - padR, chartH = svgH - padT - padB;
+  function xPos(i) { return padL + (n > 1 ? i / (n - 1) : 0) * chartW; }
+  function yPos(v) { return padT + chartH - (v / maxVal) * chartH; }
+  var grid = '';
+  for (var g = 0; g <= 4; g++) {
+    var gv = (maxVal / 4) * g, gy = yPos(gv);
+    grid += '<line x1="' + padL + '" y1="' + gy + '" x2="' + (svgW - padR) + '" y2="' + gy + '" class="grid-line"/>';
+    grid += '<text x="' + (padL - 4) + '" y="' + (gy + 3) + '" class="axis-label" text-anchor="end">$' + Math.round(gv).toLocaleString() + '</text>';
   }
-  var html = '';
-  for (var a = 0; a < active.length; a++) html += renderRepoGroup(active[a], false);
+  var labelEvery = Math.ceil(n / 6);
+  var xl = '';
+  for (var i = 0; i < n; i += labelEvery) {
+    xl += '<text x="' + xPos(i) + '" y="' + (svgH - 2) + '" class="axis-label" text-anchor="middle">' + bucketLabel(buckets[i].t, bk.groupMs) + '</text>';
+  }
+  var planPath = '', apiPath = '', area = '';
+  for (var p = 0; p < n; p++) {
+    var c = p === 0 ? 'M' : 'L';
+    planPath += c + xPos(p).toFixed(1) + ',' + yPos(cumPlan[p]).toFixed(1);
+    apiPath += c + xPos(p).toFixed(1) + ',' + yPos(cumApi[p]).toFixed(1);
+    area += c + xPos(p).toFixed(1) + ',' + yPos(cumApi[p]).toFixed(1);
+  }
+  for (var a2 = n - 1; a2 >= 0; a2--) area += 'L' + xPos(a2).toFixed(1) + ',' + yPos(cumPlan[a2]).toFixed(1);
+  area += 'Z';
+  var saved = cumApi[n - 1] - cumPlan[n - 1];
+  var svg = '<svg class="savings-chart-svg" viewBox="0 0 ' + svgW + ' ' + svgH + '" preserveAspectRatio="none" role="img" aria-label="Cumulative API price' + (showPlan ? ' versus plan price' : '') + '">' + grid + xl +
+    (showPlan ? '<path d="' + area + '" class="area-savings" fill="' + (saved > 0 ? 'var(--green)' : 'var(--red)') + '"/><path d="' + planPath + '" class="line-plan"/>' : '') +
+    '<path d="' + apiPath + '" class="line-api"/></svg>';
+  var legend = '<div class="savings-chart-legend">' +
+    (showPlan ? '<div class="savings-chart-legend-item"><span class="savings-chart-legend-line dashed"></span>Plan price (prorated)</div>' : '') +
+    '<div class="savings-chart-legend-item"><span class="savings-chart-legend-line solid"></span>Same usage at API prices</div></div>';
+  var multiple = showPlan && cumPlan[n - 1] > 0 ? (cumApi[n - 1] / cumPlan[n - 1]) : null;
+  var total = showPlan
+    ? '<div class="savings-chart-total">Plans ' + formatCost(cumPlan[n - 1]) + ' vs API price ' + formatCost(cumApi[n - 1]) +
+      ' &middot; <span class="' + (multiple >= 1 ? 'saved' : 'over') + '">' + multiple.toFixed(1) + '&times; value</span></div>'
+    : '<div class="savings-chart-total">API price ' + formatCost(cumApi[n - 1]) + (d.planComparable ? '' : ' &middot; plan line hidden: a plan covers all of an account\\'s usage, not one repo, branch or model') + '</div>';
+  el.innerHTML = '<div class="usage-title">' + (showPlan ? 'Plan vs API price' : 'API price') + ' &middot; last ' + d.days + ' day' + (d.days === 1 ? '' : 's') + '</div>' + legend +
+    '<div class="savings-chart-container">' + svg + '</div>' + total;
+}
+
+function renderPlanValue(d) {
+  var el = document.getElementById('tok-plans');
+  if (!d.planComparable) {
+    el.innerHTML = '<div class="notice">A plan covers all of an account\\'s usage, so it can\\'t be compared to one repo, branch or model. Clear those filters (an account filter is fine) to see plan value.</div>';
+    return;
+  }
+  var plans = (d.plans || []).slice().sort(function(a, b) { return b.apiCost - a.apiCost; });
+  if (!plans.length) { el.innerHTML = '<div class="section-note">No accounts.</div>'; return; }
+  var sumPlan = 0, sumApi = 0;
+  var rows = plans.map(function(p) {
+    var mult = p.planCost ? p.apiCost / p.planCost : null;
+    if (p.planCost) { sumPlan += p.planCost; sumApi += p.apiCost; }
+    return '<tr><td class="name" title="' + escHtml(p.label) + '">' + escHtml(p.label) + '</td>' +
+      '<td>' + escHtml(p.monthly ? p.tier + ' ($' + p.monthly + '/mo)' : p.tier + ' (not supported)') + '</td>' +
+      '<td class="num">' + (p.planCost ? formatCost(p.planCost) : '&ndash;') + '</td>' +
+      '<td class="num">' + formatCost(p.apiCost) + '</td>' +
+      '<td class="num">' + (mult == null ? '&ndash;' : '<span class="' + (mult >= 1 ? 'val-good' : 'val-bad') + '">' + mult.toFixed(1) + '&times;</span>') + '</td></tr>';
+  }).join('');
+  var totalMult = sumPlan ? sumApi / sumPlan : null;
+  rows += '<tr><td class="name"><b>Total (Max plans)</b></td><td></td><td class="num"><b>' + formatCost(sumPlan) + '</b></td><td class="num"><b>' + formatCost(sumApi) + '</b></td>' +
+    '<td class="num">' + (totalMult == null ? '&ndash;' : '<span class="' + (totalMult >= 1 ? 'val-good' : 'val-bad') + '">' + totalMult.toFixed(1) + '&times;</span>') + '</td></tr>';
+  el.innerHTML = '<table class="plan-table"><thead><tr><th>Account</th><th>Plan</th><th class="num" title="Subscription price prorated to ' + d.days + ' days">Plan, ' + d.days + 'd</th><th class="num" title="The same tokens at pay-as-you-go API prices">API price</th><th class="num" title="API price divided by plan price">Value</th></tr></thead><tbody>' + rows + '</tbody></table>';
+}
+
+// Tiny 30-day trend line of cache hit % (gaps on days without traffic).
+function cacheSparkline(trend) {
+  var W = 90, H = 18, n = trend.length;
+  if (!n) return '';
+  var segs = [], cur = '';
+  trend.forEach(function(v, i) {
+    if (v == null) { if (cur) segs.push(cur); cur = ''; return; }
+    var x = (n > 1 ? i / (n - 1) : 0.5) * (W - 2) + 1;
+    var y = H - 1 - v * (H - 2);
+    cur += (cur ? ' L' : 'M') + x.toFixed(1) + ',' + y.toFixed(1);
+  });
+  if (cur) segs.push(cur);
+  var paths = segs.map(function(p) {
+    return p.indexOf('L') === -1 ? '<circle cx="' + p.slice(1).split(',')[0] + '" cy="' + p.split(',')[1] + '" r="1.5" fill="var(--primary)"/>'
+      : '<path d="' + p + '" fill="none" stroke="var(--primary)" stroke-width="1.25"/>';
+  }).join('');
+  return '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" style="flex-shrink:0">' +
+    '<line x1="0" y1="1" x2="' + W + '" y2="1" stroke="var(--border)" stroke-width="0.5"/>' + paths + '</svg>';
+}
+
+function renderCacheEfficiency(c) {
+  var el = document.getElementById('tok-cache');
+  if (!c || !c.overall || !c.overall.prompt) { el.innerHTML = '<div class="notice">No traffic in the last 30 days.</div>'; return; }
+  function row(name, g, bold) {
+    return '<div class="eff-row">' +
+      '<div class="eff-name" title="' + escHtml(name) + '">' + (bold ? '<b>' + escHtml(name) + '</b>' : escHtml(name)) + '</div>' +
+      cacheSparkline(g.trend) +
+      '<div class="eff-detail">' + formatNum(g.prompt) + ' prompt tokens &middot; ' + formatPct(g.rebuild) + ' rebuilt</div>' +
+      '<div class="eff-hit" title="Cache hit rate">' + formatPct(g.hit) + ' hit</div>' +
+    '</div>';
+  }
+  function rows(map, labelFn) {
+    return Object.keys(map).sort(function(a, b) { return map[b].prompt - map[a].prompt; }).map(function(k) {
+      return row(labelFn ? labelFn(k) : k, map[k]);
+    }).join('');
+  }
+  el.innerHTML = row('All traffic', c.overall, true) +
+    '<div class="eff-group">Per account</div>' + rows(c.byAccount) +
+    '<div class="eff-group">Per model</div>' + rows(c.byModel, shortModel);
+}
+
+function breakdownRows(map, colorFn, labelFn) {
+  var keys = Object.keys(map).sort(function(a, b) { return map[b].cost - map[a].cost; });
+  var grand = keys.reduce(function(s, k) { return s + map[k].cost; }, 0) || 1;
+  var bar = '<div class="tok-proportion">' + keys.map(function(k, i) {
+    return '<div class="tok-proportion-seg" style="width:' + (map[k].cost / grand * 100) + '%;background:' + colorFn(k, i) + '"></div>';
+  }).join('') + '</div>';
+  var rows = keys.map(function(k, i) {
+    var m = map[k];
+    var prompt = tokPrompt(m);
+    return '<div class="tok-model-row">' +
+      '<div class="tok-model-dot" style="background:' + colorFn(k, i) + '"></div>' +
+      '<div class="tok-model-name" title="' + escHtml(k) + '">' + escHtml(labelFn ? labelFn(k) : k) + '</div>' +
+      '<div class="tok-model-detail">' + formatNum(m.requests) + ' calls &middot; ' + formatNum(prompt) + ' in (' + formatPct(prompt ? m.cacheRead / prompt : null) + ' cached) / ' + formatNum(m.output) + ' out</div>' +
+      '<div class="tok-model-cost">' + formatCost(m.cost) + '</div>' +
+      '<div class="tok-model-pct">' + Math.round(m.cost / grand * 100) + '%</div>' +
+    '</div>';
+  }).join('');
+  return bar + rows + '<div class="section-note" style="margin:0.5rem 0 0">% = share of the API price.</div>';
+}
+
+function renderModelBreakdown(d) {
+  var models = Object.keys(d.byModel).sort();
+  document.getElementById('tok-models').innerHTML = breakdownRows(d.byModel, function(k) { return getModelColor(k, models); }, shortModel);
+}
+
+function renderAccountBreakdown(d) {
+  document.getElementById('tok-accounts').innerHTML = breakdownRows(d.byAccount, function(k, i) { return TOK_COLORS[i % TOK_COLORS.length]; });
+}
+
+function toggleRepoCollapse(repoKey) {
+  _tokRepoCollapsed[repoKey] = !_tokRepoCollapsed[repoKey];
+  if (_usage) renderRepoBranchBreakdown(_usage);
+}
+
+function renderRepoBranchBreakdown(d) {
+  var el = document.getElementById('tok-repos');
+  var models = Object.keys(d.byModel).sort();
+  var inactiveThreshold = Date.now() - 3 * 86400000;
+  var grandCost = d.totals.cost || 1;
+  var repos = Object.keys(d.byRepo).map(function(k) {
+    var r = d.byRepo[k];
+    return { key: k, name: k.split('/').pop() || k, total: tokTotal(r), cost: r.cost, lastTs: r.lastTs, branches: r.branches };
+  });
+  var active = repos.filter(function(r) { return r.lastTs >= inactiveThreshold; }).sort(function(a, b) { return b.total - a.total; });
+  var inactive = repos.filter(function(r) { return r.lastTs < inactiveThreshold; }).sort(function(a, b) { return b.total - a.total; });
+  var defaultCollapsed = active.length > 3;
+  function group(repo, isInactive) {
+    if (_tokRepoCollapsed[repo.key] === undefined) _tokRepoCollapsed[repo.key] = isInactive ? true : defaultCollapsed;
+    var collapsed = _tokRepoCollapsed[repo.key];
+    var h = '<div class="tok-repo-group' + (isInactive ? ' tok-repo-inactive' : '') + '">';
+    h += '<div class="tok-repo-header" role="button" tabindex="0" aria-expanded="' + !collapsed + '" onclick="toggleRepoCollapse(this.dataset.key)" onkeydown="if (event.key === \\'Enter\\' || event.key === \\' \\') { event.preventDefault(); toggleRepoCollapse(this.dataset.key); }" data-key="' + escHtml(repo.key) + '">';
+    h += '<span class="tok-repo-chevron' + (collapsed ? ' collapsed' : '') + '">&#9660;</span>';
+    h += '<span class="tok-repo-name">' + escHtml(repo.name) + '</span>';
+    h += '<span class="tok-model-detail" style="flex:1">' + formatNum(repo.total) + ' tokens</span>';
+    h += '<span class="tok-model-cost">' + formatCost(repo.cost) + '</span>';
+    h += '<span class="tok-model-pct" title="Share of the API price">' + Math.round(repo.cost / grandCost * 100) + '%</span></div>';
+    if (!collapsed) {
+      Object.keys(repo.branches).sort(function(a, b) { return tokTotal(repo.branches[b]) - tokTotal(repo.branches[a]); }).forEach(function(bn) {
+        var br = repo.branches[bn];
+        var detail = Object.keys(br.byModel).sort(function(a, b) { return br.byModel[b] - br.byModel[a]; }).map(function(m) {
+          return '<span style="color:' + getModelColor(m, models) + '">' + escHtml(shortModel(m)) + '</span> ' + formatNum(br.byModel[m]);
+        }).join(' &middot; ');
+        h += '<div class="tok-branch-row' + (br.lastTs < inactiveThreshold ? ' tok-branch-inactive' : '') + '" style="padding-left:1.5rem">';
+        h += '<div class="tok-branch-name"><span class="tok-branch-badge">' + escHtml(bn) + '</span></div>';
+        h += '<div class="tok-branch-stats"><span class="tok-branch-total">' + formatCost(br.cost) + '</span><span class="tok-branch-pct">' + Math.round(br.cost / grandCost * 100) + '%</span></div>';
+        h += '<div class="tok-branch-detail">' + detail + '</div></div>';
+      });
+    }
+    return h + '</div>';
+  }
+  var html = active.map(function(r) { return group(r, false); }).join('');
   if (inactive.length) {
     html += '<div class="tok-inactive-sep">Inactive (no usage in last 3 days)</div>';
-    for (var n = 0; n < inactive.length; n++) html += renderRepoGroup(inactive[n], true);
+    html += inactive.map(function(r) { return group(r, true); }).join('');
   }
   el.innerHTML = html;
 }
@@ -3962,43 +3685,18 @@ function tokFilterChange(which) {
   if (which === 'repo') {
     var branchEl = document.getElementById('tok-branch');
     if (branchEl) branchEl.value = '';
-    _lastTokensHash = '';
-    refreshTokens();
-  } else if (which === 'model' || which === 'account') {
-    applyTokenModelFilter();
-  } else {
-    _lastTokensHash = '';
-    refreshTokens();
   }
+  _usageHash = '';
+  refreshTokens(true);
 }
 
 function exportUsageCsv() {
-  var data = _tokFilteredData || _tokensRawData;
-  if (!data.length) { showToast('No data to export'); return; }
-  var lines = ['timestamp,repo,branch,model,account,input_tokens,output_tokens'];
-  for (var i = 0; i < data.length; i++) {
-    var e = data[i];
-    var ts = e.timestamp || e.ts || '';
-    if (ts) ts = new Date(ts).toISOString();
-    lines.push([
-      ts,
-      '"' + (e.repo || '').replace(/"/g, '""') + '"',
-      '"' + (e.branch || '').replace(/"/g, '""') + '"',
-      '"' + (e.model || '').replace(/"/g, '""') + '"',
-      '"' + (e.account || '').replace(/"/g, '""') + '"',
-      e.inputTokens || 0,
-      e.outputTokens || 0
-    ].join(','));
-  }
-  var blob = new Blob([lines.join('\\n')], { type: 'text/csv' });
-  var url = URL.createObjectURL(blob);
-  var a = document.createElement('a');
-  a.href = url;
-  a.download = 'usage-export-' + new Date().toISOString().slice(0,10) + '.csv';
-  document.body.appendChild(a);
-  a.click();
-  document.body.removeChild(a);
-  URL.revokeObjectURL(url);
+  var q = 'days=' + tokTimeRange();
+  ['repo', 'branch', 'model', 'account'].forEach(function(k) {
+    var el = document.getElementById('tok-' + k);
+    if (el && el.value) q += '&' + k + '=' + encodeURIComponent(el.value);
+  });
+  window.location = '/api/usage/export?' + q;
 }
 
 refresh();
@@ -4063,211 +3761,318 @@ function escapeHtml(s) {
   return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
 }
 
-// ── Session Monitor ──
+// ── Sessions (affinity) ──
 
-function sessionDuration(ms) {
-  if (ms < 60000) return Math.floor(ms / 1000) + 's';
-  if (ms < 3600000) return Math.floor(ms / 60000) + 'm ' + Math.floor((ms % 60000) / 1000) + 's';
-  return Math.floor(ms / 3600000) + 'h ' + Math.floor((ms % 3600000) / 60000) + 'm';
-}
+var AFF_TEXT = { strong: 'Locked', ok: 'Holding', weak: 'Drifting' };
+var MOVE_REASON = {
+  assign: 'placed',
+  idle: 'cache had expired, re-placed',
+  unavailable: 'account was limited or used up',
+  'account-removed': 'account was removed',
+  '429-limit': 'account hit its limit',
+  '429-burst': 'account was briefly overloaded',
+  '401': 'login expired',
+  '400': 'account rejected the request',
+  'network-error': 'network error',
+  'manual-switch': 'you switched accounts',
+};
 
-function sessionTimeAgo(ts) {
+function timeAgo(ts) {
+  if (!ts) return '';
   var d = Date.now() - ts;
-  if (d < 60000) return Math.floor(d / 1000) + 's ago';
+  if (d < 60000) return 'just now';
   if (d < 3600000) return Math.floor(d / 60000) + 'm ago';
-  return Math.floor(d / 3600000) + 'h ago';
+  if (d < 86400000) return Math.floor(d / 3600000) + 'h ago';
+  return Math.floor(d / 86400000) + 'd ago';
 }
 
-function sessionEstCost(inTok, outTok, model) {
-  // Rough estimates per 1M tokens
-  var inCost = 15, outCost = 75; // opus defaults
-  if (model && model.includes('sonnet')) { inCost = 3; outCost = 15; }
-  if (model && model.includes('haiku')) { inCost = 0.25; outCost = 1.25; }
-  return ((inTok * inCost + outTok * outCost) / 1e6).toFixed(2);
+function agoSpan(ts) {
+  return '<span data-ago="' + (ts || 0) + '">' + timeAgo(ts) + '</span>';
 }
 
-var _lastBadgeRefresh = 0;
-var _collapsedSessions = new Set();
-function toggleSessionCollapse(id) {
-  if (_collapsedSessions.has(id)) _collapsedSessions.delete(id);
-  else _collapsedSessions.add(id);
-  var card = document.querySelector('.session-card[data-sid="' + id + '"]');
-  if (card) card.classList.toggle('collapsed');
+function affTitle(level, warmMoves1h, cacheHit, share) {
+  var parts = [(AFF_TEXT[level] || level) + ' to its account'];
+  parts.push(warmMoves1h ? warmMoves1h + (warmMoves1h === 1 ? ' move' : ' moves') + ' with a warm cache in the last hour' : 'no cache-losing moves in the last hour');
+  if (share != null && share < 1) parts.push(Math.round(share * 100) + '% of recent requests on one account');
+  if (cacheHit != null) parts.push(Math.round(cacheHit * 100) + '% of recent prompt tokens read from cache');
+  return parts.join(' · ');
 }
-function refreshSessionsBadgeOnly() {
-  // Throttle badge-only fetches to once per 10s
-  var now = Date.now();
-  if (now - _lastBadgeRefresh < 10000) return;
-  _lastBadgeRefresh = now;
-  fetch('/api/sessions').then(function(r) { return r.json(); }).then(function(data) {
-    var threshold = ${SESSION_AWAITING_THRESHOLD};
-    updateSessionsBadge((data.active || []).filter(function(s) { return (Date.now() - s.lastActiveAt) >= threshold; }).length);
-  }).catch(function() {});
+
+function affBars(level, title) {
+  return '<span class="aff aff-' + level + '" title="' + escHtml(title || '') + '" role="img" aria-label="' + escHtml(title || '') + '"><i></i><i></i><i></i></span>';
 }
+
+function cachePct(hit) {
+  return hit == null ? '&ndash; cache' : Math.round(hit * 100) + '% cache';
+}
+
+// Sessions block on an account card: who ran through this account in the last 24h.
+function renderAccountSessions(p) {
+  var list = p.sessions || [];
+  if (!list.length) return '';
+  var warm = list.filter(function(s) { return s.pinnedHere; }).length;
+  var rows = list.slice(0, 5).map(function(s) {
+    var title = affTitle(s.affinity, s.warmMoves1h, s.cacheHit, s.share) + (s.title ? ' · ' + s.title : '');
+    return '<div class="sess-row" title="' + escHtml(title) + '">' +
+      '<span class="sess-here' + (s.pinnedHere ? '' : ' away') + '" title="' + (s.pinnedHere ? 'Warm here: this session is pinned to this account right now' : 'Not pinned here now') + '"></span>' +
+      affBars(s.affinity, title) +
+      '<span class="sess-name">' + escHtml(s.label) + '</span>' +
+      '<span class="sess-meta">' + s.requests + ' req &middot; ' + cachePct(s.cacheHit) + ' &middot; ' + agoSpan(s.lastAt) + '</span></div>';
+  }).join('');
+  var eName = p.name.replace(/'/g, "\\\\'");
+  var more = list.length > 5 ? '<button class="link-btn" onclick="openSessionsFor(\\'' + eName + '\\')">Show all ' + list.length + '</button>' : '';
+  return '<div class="acct-sessions"><div class="acct-sessions-head"><span>Sessions</span>' +
+    '<span title="Green dot = pinned here now with a warm cache">' + warm + ' warm here &middot; ' + list.length + ' in 24h</span></div>' + rows + more + '</div>';
+}
+
+var _sessions = null;
+var _sessionsHash = '';
+var _sessionsError = '';
 
 async function refreshSessions() {
+  var tab = document.getElementById('tab-sessions');
+  if (!tab || !tab.classList.contains('active')) return;
   try {
-    var resp = await fetch('/api/sessions');
+    var resp = await fetch('/api/sessions?hours=24');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
     var data = await resp.json();
-    // No quickHash guard — time-derived displays (duration, idle, state) must
-    // update even when API data is unchanged (wall-clock drives state transitions)
-    renderSessions(data);
-    var threshold = ${SESSION_AWAITING_THRESHOLD};
-    updateSessionsBadge((data.active || []).filter(function(s) { return (Date.now() - s.lastActiveAt) >= threshold; }).length);
-  } catch {}
+    _sessionsError = '';
+    var h = quickHash(data);
+    if (h === _sessionsHash) return;
+    _sessionsHash = h;
+    _sessions = data;
+  } catch (e) {
+    _sessionsError = 'Could not load sessions (' + e.message + '). Retrying...';
+  }
+  renderSessions();
 }
 
-function renderSessions(data) {
+function openSessionsFor(name) {
+  switchTab('sessions');
+  var sel = document.getElementById('sess-account');
+  sel.dataset.want = name;
+  sel.value = name;
+  renderSessions();
+}
+
+function moveLine(m) {
+  return '<div class="sess-move' + (m.warm ? ' warm' : '') + '">' + agoSpan(m.ts) + ' &middot; ' + escHtml(m.fromLabel) + ' &rarr; ' + escHtml(m.toLabel) +
+    ' &middot; ' + escHtml(MOVE_REASON[m.reason] || m.reason) + (m.agent !== 'main' ? ' (subagent)' : '') +
+    (m.warm ? ' &middot; cache rebuilt' : ' &middot; cache was already cold') + '</div>';
+}
+
+function sessionCard(s) {
+  var a = s.affinity;
+  var title = affTitle(a.level, a.warmMoves1h, a.cacheHit, a.share);
+  // The label is often "branch:id": don't repeat the branch underneath
+  var branch = s.meta.branch && s.label.indexOf(s.meta.branch + ':') !== 0 ? s.meta.branch : '';
+  var where = [s.meta.repoName, branch].filter(Boolean).join(' · ');
+  var sub = s.meta.autoTitle ? s.meta.autoTitle + (where ? ' · ' + where : '') : where;
+  var warmLanes = s.lanes.filter(function(l) { return l.warm; });
+  var subagents = warmLanes.filter(function(l) { return l.agent !== 'main'; }).length;
+  var on = 'On <b>' + escHtml(s.homeLabel || '?') + '</b>' + (subagents ? ' &middot; ' + subagents + ' subagent' + (subagents === 1 ? '' : 's') + ' warm' : '');
+  var total = s.accounts.reduce(function(n, x) { return n + x.requests; }, 0) || 1;
+  var accts = s.accounts.map(function(x) {
+    var prompt = x.input + x.cacheRead + x.cacheWrite;
+    return '<div class="sess-acct-row"><span class="sess-acct-name" title="' + escHtml(x.label) + '">' + escHtml(x.label) + '</span>' +
+      '<span class="sess-acct-bar" title="' + Math.round(x.requests / total * 100) + '% of this session\\'s requests"><div style="width:' + (x.requests / total * 100).toFixed(1) + '%"></div></span>' +
+      '<span class="sess-meta">' + x.requests + ' req &middot; ' + cachePct(prompt ? x.cacheRead / prompt : null) + ' &middot; ' + formatCost(x.cost) + '</span></div>';
+  }).join('');
+  var moves = s.moves.length ? '<div class="sess-moves">' + s.moves.slice(0, 3).map(moveLine).join('') +
+    (s.moves.length > 3 ? '<div>+' + (s.moves.length - 3) + ' earlier moves</div>' : '') + '</div>' : '';
+  var arts = s.artifacts && s.artifacts.length
+    ? ' <button class="chip" onclick="openArtifactSearch(\\'claude.ai/artifact/' + escHtml(s.artifacts[s.artifacts.length - 1]) + '\\')" title="Find who owns the latest artifact linked in this session">' + (s.artifacts.length === 1 ? 'artifact' : 'latest of ' + s.artifacts.length + ' artifacts') + '</button>' : '';
+  return '<div class="sess-card">' +
+    '<div class="sess-card-top">' +
+      '<span class="sess-card-title" title="' + escHtml(s.id) + '">' + escHtml(s.label) + '</span>' +
+      (s.live ? '<span class="pill pill-running" title="This Claude Code session is still open">running</span>' : '') +
+      '<span class="sess-meta">' + agoSpan(s.lastAt) + '</span></div>' +
+    (sub ? '<div class="sess-sub" title="' + escHtml(sub) + '">' + escHtml(sub) + '</div>' : '') +
+    '<div class="sess-aff-line">' + affBars(a.level, title) + '<span><b>' + (AFF_TEXT[a.level] || a.level) + '</b> &middot; ' + on + ' &middot; ' + cachePct(a.cacheHit) +
+      ' &middot; ' + s.requests + ' req' + (s.model ? ' &middot; ' + escHtml(shortModel(s.model)) : '') + '</span>' + arts + '</div>' +
+    '<div class="sess-accts">' + accts + '</div>' + moves +
+  '</div>';
+}
+
+function sessionLine(s) {
+  var a = s.affinity;
+  var title = affTitle(a.level, a.warmMoves1h, a.cacheHit, a.share);
+  var where = [s.meta.repoName, s.meta.branch].filter(Boolean).join(' · ');
+  return '<div class="sess-line" title="' + escHtml((s.meta.autoTitle ? s.meta.autoTitle + ' · ' : '') + where) + '">' +
+    affBars(a.level, title) +
+    '<span class="sess-name">' + escHtml(s.label) + '</span>' +
+    (s.live ? '<span class="pill pill-running">running</span>' : '') +
+    '<span class="sess-meta">last on ' + escHtml(s.homeLabel || '?') + ' &middot; ' + s.requests + ' req' + (s.moves.length ? ' &middot; ' + s.moves.length + ' move' + (s.moves.length === 1 ? '' : 's') : '') + ' &middot; ' + agoSpan(s.lastAt) + '</span></div>';
+}
+
+function renderSessions() {
+  var note = document.getElementById('sessions-note');
   var el = document.getElementById('sessions-content');
-  if (!el) return;
-  var active = data.active || [];
-  var recent = data.recent || [];
-  if (!active.length && !recent.length) {
-    if (!data.enabled) {
-      el.innerHTML = '<div class="empty-state">Session Monitor is OFF. Enable it in Config (BETA).</div>';
-    } else {
-      el.innerHTML = '<div class="empty-state">No sessions yet. Start a Claude Code session with the proxy running.</div>';
-    }
+  var data = _sessions;
+  if (!data) {
+    el.innerHTML = _sessionsError ? '<div class="empty-state err-state">' + escHtml(_sessionsError) + '</div>' : '<div class="empty-state">Loading...</div>';
+    return;
+  }
+  note.innerHTML = data.affinity
+    ? 'Each Claude Code session, and each of its subagents, stays on one account while its prompt cache is warm. <span style="color:var(--red)">Red</span> moves rebuilt a warm cache on another account.' +
+      (_sessionsError ? ' <span class="err-state">' + escHtml(_sessionsError) + '</span>' : '')
+    : 'Session affinity is <b>off</b> (Config): sessions are tracked, but not kept on one account.';
+  var sel = document.getElementById('sess-account');
+  var names = {};
+  data.sessions.forEach(function(s) { s.accounts.forEach(function(x) { names[x.name] = x.label; }); });
+  var want = sel.dataset.want || sel.value;
+  var opts = '<option value="">All accounts</option>' + Object.keys(names).sort().map(function(n) {
+    return '<option value="' + escHtml(n) + '"' + (n === want ? ' selected' : '') + '>' + escHtml(names[n]) + '</option>';
+  }).join('');
+  if (sel.dataset.opts !== opts && document.activeElement !== sel) { sel.innerHTML = opts; sel.dataset.opts = opts; }
+  delete sel.dataset.want;
+  var acct = sel.value;
+  var list = data.sessions.filter(function(s) { return !acct || s.accounts.some(function(x) { return x.name === acct; }); });
+  var activeNow = list.filter(function(s) { return s.lanes.some(function(l) { return l.warm; }); });
+  var earlier = list.filter(function(s) { return !s.lanes.some(function(l) { return l.warm; }); });
+  document.getElementById('sess-counts').textContent = activeNow.length + ' active now · ' + earlier.length + ' earlier (last 24h)';
+  if (!list.length) {
+    el.innerHTML = '<div class="empty-state">' + (acct ? 'No sessions used this account in the last 24 hours.' : 'No sessions in the last 24 hours. A session shows up after its first request through the proxy.') + '</div>';
     return;
   }
   var html = '';
-
-  // Conflicts banner
-  if (data.conflicts && data.conflicts.length) {
-    html += '<div class="session-conflicts">';
-    data.conflicts.forEach(function(c) {
-      html += '<div>\\u26A0 ' + c.count + ' sessions editing ' + escapeHtml(c.file) + '</div>';
-    });
-    html += '</div>';
-  }
-
-  // Active sessions
-  if (active.length) {
-    html += '<div class="session-section-title">ACTIVE</div>';
-    active.forEach(function(s) {
-      var idleMs = Date.now() - s.lastActiveAt;
-      var state = idleMs < ${SESSION_AWAITING_THRESHOLD} ? 'processing' : 'awaiting';
-      var dur = sessionDuration(Date.now() - s.startedAt);
-      var idle = state === 'awaiting' ? sessionDuration(idleMs) : '';
-      var proj = sessionProj(s);
-      var collapsed = _collapsedSessions.has(s.id) ? ' collapsed' : '';
-      html += '<div class="session-card ' + state + collapsed + '" data-sid="' + s.id + '">';
-      html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
-      html += '<div class="session-header" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
-      html += '<span class="session-collapse-indicator">\\u25BC</span>';
-      html += '<span class="session-header-left"><b>' + escapeHtml(s.account) + '</b> \\u00b7 ' + escapeHtml(proj) + '</span>';
-      html += '<span class="session-header-right"><span>' + dur + '</span>';
-      if (state === 'awaiting') {
-        html += '<span class="session-awaiting">\\u23F8 input ' + idle + '</span>';
-      }
-      html += '</span>';
-      html += '</div>';
-      // Collapsed activity summary (visible only when collapsed)
-      if (s.currentActivity) {
-        var brailleC = state === 'processing' ? 'braille-spin' : 'braille-static';
-        html += '<div class="session-collapsed-activity"><span class="' + brailleC + '"></span>' + escapeHtml(s.currentActivity) + '</div>';
-      }
-      // Timeline
-      html += '<div class="session-timeline">';
-      s.timeline.forEach(function(e) {
-        if (e.type === 'input') html += '<div class="tl-input">' + escapeHtml(e.text) + '</div>';
-        else html += '<div class="tl-action">' + escapeHtml(e.text) + '</div>';
-      });
-      // Current activity
-      if (s.currentActivity) {
-        var brailleClass = state === 'processing' ? 'braille-spin' : 'braille-static';
-        html += '<div class="tl-current"><span class="' + brailleClass + '"></span>' + escapeHtml(s.currentActivity) + '</div>';
-      }
-      html += '</div>';
-      // Meta
-      html += '<div class="session-meta">';
-      html += '<span>' + s.requestCount + ' req</span>';
-      html += '<span>' + formatNum(s.totalInputTokens + s.totalOutputTokens) + ' tok</span>';
-      html += '</div>';
-      html += '</div>';
-    });
-  }
-
-  // Recent sessions
-  if (recent.length) {
-    html += '<div class="session-section-title">RECENT</div>';
-    recent.forEach(function(s) {
-      var ago = sessionTimeAgo(s.completedAt || s.startedAt);
-      var dur = sessionDuration(s.duration || 0);
-      var cost = sessionEstCost(s.totalInputTokens || 0, s.totalOutputTokens || 0, s.model);
-      var proj = sessionProj(s);
-      var collapsed = _collapsedSessions.has(s.id) ? ' collapsed' : '';
-      html += '<div class="session-card completed' + collapsed + '" data-sid="' + s.id + '">';
-      html += '<button class="session-copy-btn" onclick="copyTimeline(\\'' + s.id + '\\')">\\uD83D\\uDCCB</button>';
-      html += '<div class="session-header" onclick="toggleSessionCollapse(\\'' + s.id + '\\')">';
-      html += '<span class="session-collapse-indicator">\\u25BC</span>';
-      html += '<span class="session-header-left"><span>' + ago + '</span> \\u00b7 <b>' + escapeHtml(s.account) + '</b> \\u00b7 ' + escapeHtml(proj) + '</span>';
-      html += '<span class="session-header-right"><span>' + dur + ' \\u00b7 ~$' + cost + '</span></span>';
-      html += '</div>';
-      html += '<div class="session-timeline">';
-      (s.timeline || []).forEach(function(e) {
-        if (e.type === 'input') html += '<div class="tl-input">' + escapeHtml(e.text) + '</div>';
-        else html += '<div class="tl-action">' + escapeHtml(e.text) + '</div>';
-      });
-      html += '</div>';
-      html += '<div class="session-meta">';
-      html += '<span>' + (s.requestCount || 0) + ' req</span>';
-      html += '<span>' + formatNum((s.totalInputTokens || 0) + (s.totalOutputTokens || 0)) + ' tok</span>';
-      html += '</div>';
-      html += '</div>';
-    });
-  }
-
-  // Overhead footer
-  if (data.overhead) {
-    var oh = data.overhead.inputTokens + data.overhead.outputTokens;
-    if (oh > 0) {
-      html += '<div class="session-overhead">Summarizer overhead: ' + formatNum(oh) + ' tokens (Haiku)</div>';
-    }
-  }
-
+  if (activeNow.length) html += '<div class="sess-section-title">Active now (cache warm)</div>' + activeNow.map(sessionCard).join('');
+  if (earlier.length) html += '<div class="sess-section-title">Earlier (cache expired)</div>' + earlier.map(sessionLine).join('');
   el.innerHTML = html;
+  tickCountdowns();
 }
 
-function updateSessionsBadge(count) {
+function updateSessionsBadge(profiles) {
   var badge = document.getElementById('sessions-badge');
   if (!badge) return;
-  if (count > 0) {
-    badge.textContent = count;
-    badge.style.display = '';
-  } else {
-    badge.style.display = 'none';
-  }
+  var live = {};
+  (profiles || []).forEach(function(p) {
+    (p.sessions || []).forEach(function(s) { if (s.pinnedHere) live[s.id] = 1; });
+  });
+  var n = Object.keys(live).length;
+  badge.textContent = n;
+  badge.style.display = n ? '' : 'none';
+  badge.title = n + ' session' + (n === 1 ? '' : 's') + ' with a warm cache';
 }
 
-function sessionProj(s) {
-  if (s.branch) {
-    if (s.branch === 'main' || s.branch === 'master') return (s.repo || '') + '/' + s.branch;
-    var parts = s.branch.split('/');
-    return parts[parts.length - 1];
+// ── Artifacts ──
+
+var _artifacts = null;
+var _artifactsHash = '';
+var _artifactsError = '';
+var _artExpanded = {};
+var ART_ROWS = 8;
+
+async function refreshArtifactsTab() {
+  var tab = document.getElementById('tab-artifacts');
+  if (!tab || !tab.classList.contains('active')) return;
+  try {
+    var resp = await fetch('/api/artifacts');
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    var data = await resp.json();
+    _artifactsError = '';
+    var h = quickHash(data);
+    if (h !== _artifactsHash) { _artifactsHash = h; _artifacts = data; }
+  } catch (e) {
+    _artifactsError = 'Could not load artifacts (' + e.message + ').';
   }
-  return s.repo || s.cwd || 'unknown';
+  renderArtifacts();
 }
-function copyTimeline(sessionId) {
-  // Find session data from last render
-  fetch('/api/sessions').then(function(r) { return r.json(); }).then(function(data) {
-    var s = (data.active || []).find(function(a) { return a.id === sessionId; })
-         || (data.recent || []).find(function(a) { return a.id === sessionId; });
-    if (!s) { showToast('Session not found'); return; }
-    var proj = sessionProj(s);
-    var dur = sessionDuration(s.duration || (Date.now() - s.startedAt));
-    var tok = formatNum((s.totalInputTokens || 0) + (s.totalOutputTokens || 0));
-    var md = '## Session: ' + proj + ' (' + dur + ', ' + tok + ' tokens)\\n';
-    (s.timeline || []).forEach(function(e) {
-      if (e.type === 'input') md += '- \\u2192 ' + e.text + '\\n';
-      else md += '  - ' + e.text + '\\n';
-    });
-    navigator.clipboard.writeText(md).then(function() {
-      showToast('Timeline copied');
-    }).catch(function() {
-      showToast('Copy failed');
-    });
-  }).catch(function() { showToast('Failed to fetch session'); });
+
+async function refreshArtifactsNow() {
+  var btn = document.getElementById('art-refresh');
+  btn.disabled = true;
+  btn.textContent = 'Checking...';
+  try {
+    var resp = await fetch('/api/artifacts/refresh', { method: 'POST' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    _artifacts = await resp.json();
+    _artifactsHash = quickHash(_artifacts);
+    renderArtifacts();
+    var failed = _artifacts.accounts.filter(function(a) { return a.error; }).length;
+    showToast(failed ? 'Checked; ' + failed + ' account' + (failed === 1 ? '' : 's') + ' could not be read' : 'Artifact list is up to date');
+  } catch (e) { showToast('Check failed: ' + e.message); }
+  btn.disabled = false;
+  btn.textContent = 'Check now';
+}
+
+// A pasted link: the id part after /artifact/
+function artifactQueryId(q) {
+  var i = q.indexOf('/artifact/');
+  if (i === -1) return '';
+  return q.slice(i + 10).split(/[?#\\s]/)[0];
+}
+
+function artifactMatches(f, q, id) {
+  if (!q) return true;
+  if (id) return f.slug === id || (f.slug.length >= 8 && id.slice(-f.slug.length) === f.slug) || (id.length >= 8 && f.slug.slice(-id.length) === id);
+  return (f.title + ' ' + f.description + ' ' + f.slug).toLowerCase().indexOf(q) !== -1;
+}
+
+function toggleArtGroup(name) {
+  _artExpanded[name] = !_artExpanded[name];
+  renderArtifacts();
+}
+
+function renderArtifacts() {
+  var el = document.getElementById('artifacts-content');
+  var status = document.getElementById('art-status');
+  var data = _artifacts;
+  if (!data) {
+    el.innerHTML = _artifactsError ? '<div class="empty-state err-state">' + escHtml(_artifactsError) + '</div>' : '<div class="empty-state">Loading...</div>';
+    return;
+  }
+  status.innerHTML = (data.updatedAt ? 'Checked ' + agoSpan(data.updatedAt) : 'Not checked yet') + ' &middot; checks every ' + data.pollMinutes + ' min' +
+    (data.refreshing ? ' &middot; checking now...' : '') + (_artifactsError ? ' &middot; <span class="err-state">' + escHtml(_artifactsError) + '</span>' : '');
+  var raw = (document.getElementById('art-search').value || '').trim();
+  var q = raw.toLowerCase();
+  var id = artifactQueryId(raw);
+  var anyMatch = false;
+  var html = data.accounts.map(function(a) {
+    var frames = a.frames.filter(function(f) { return artifactMatches(f, q, id); });
+    if (q && !frames.length) return '';
+    if (frames.length) anyMatch = true;
+    var state = !a.fetchedAt
+      ? (a.error ? '<span class="art-err">could not check: ' + escHtml(a.error) + '</span>' : 'not checked yet')
+      : (a.error ? '<span class="art-err">last check failed (' + escHtml(a.error) + '), showing the list from ' + agoSpan(a.fetchedAt) + '</span> &middot; ' : '') +
+        (q ? frames.length + ' of ' : '') + a.frames.length + ' owned' + (a.shared ? ' &middot; ' + a.shared + ' shared' : '');
+    var head = '<div class="art-group-head" id="art-g-' + escHtml(a.name) + '"><span>' + escHtml(a.label) + '</span><span class="art-meta">' + state + '</span></div>';
+    var shown = (q || _artExpanded[a.name]) ? frames : frames.slice(0, ART_ROWS);
+    var rows = shown.map(function(f) {
+      var created = f.createdAt ? new Date(f.createdAt).toLocaleDateString([], { day: 'numeric', month: 'short', year: 'numeric' }) : '';
+      var meta = [created, f.audience ? 'visible to ' + f.audience : '', f.session ? 'from session ' + f.session.label : ''].filter(Boolean).join(' · ');
+      return '<div class="art-row"><a class="art-title" href="' + escHtml(f.url) + '" target="_blank" rel="noopener" title="' + escHtml(f.description || f.title) + '">' + escHtml(f.title || f.slug) + '</a>' +
+        '<span class="art-meta">' + escHtml(meta) + '</span></div>';
+    }).join('');
+    if (!frames.length) rows = '<div class="art-row"><span class="art-meta">' + (a.fetchedAt ? 'No artifacts' : 'Waiting for the first check') + '</span></div>';
+    if (!q && frames.length > ART_ROWS) {
+      var eName = a.name.replace(/'/g, "\\\\'");
+      rows += '<div class="art-row"><button class="link-btn" onclick="toggleArtGroup(\\'' + eName + '\\')">' + (_artExpanded[a.name] ? 'Show fewer' : 'Show all ' + frames.length) + '</button></div>';
+    }
+    return '<div class="art-group">' + head + rows + '</div>';
+  }).join('');
+  if (q && !anyMatch) {
+    html = '<div class="empty-state">None of your connected accounts owns an artifact matching "' + escHtml(raw) + '".' +
+      (data.updatedAt ? '' : ' The first check has not finished yet.') + '</div>';
+  }
+  el.innerHTML = html || '<div class="empty-state">No accounts.</div>';
+  tickCountdowns();
+}
+
+function openArtifactSearch(text) {
+  switchTab('artifacts');
+  document.getElementById('art-search').value = text || '';
+  renderArtifacts();
+}
+
+function openArtifactsFor(name) {
+  switchTab('artifacts');
+  document.getElementById('art-search').value = '';
+  setTimeout(function() {
+    renderArtifacts();
+    var g = document.getElementById('art-g-' + name);
+    if (g) g.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  }, 300);
 }
 </script>
 <footer style="text-align:center;padding:2rem 0 1rem;font-size:0.75rem;color:#9ca3af;line-height:1.8">
@@ -4432,13 +4237,25 @@ function updatePersistedState(fingerprint, data) {
     utilization7d: data.utilization7d || 0,
     resetAt: data.resetAt || 0,
     resetAt7d: data.resetAt7d || 0,
+    utilization7dOI: data.utilization7dOI ?? null,
+    resetAt7dOI: data.resetAt7dOI || 0,
+    limitedUntil: data.limitedUntil || 0,
+    claim: data.claim || null,
+    modelLimits: data.modelLimits || undefined,
     updatedAt: Date.now(),
   };
   savePersistedState();
 }
 
+// Snapshot of an account's tracked state for account-state.json.
+function persistAccountState(token, fingerprint) {
+  const st = accountState.get(token);
+  if (st && fingerprint) updatePersistedState(fingerprint, st);
+}
+
 // Load on startup
 loadPersistedState();
+
 
 // Prune history entries that predate a known window reset
 (function pruneStaleHistory() {
@@ -4465,6 +4282,9 @@ const _sparkCache = {};
 
 function updateAccountState(token, name, headers, fingerprint) {
   accountState.update(token, name, headers);
+  // Responses without unified headers (errors, other endpoints) carry no limit info
+  const rl = parseRateLimitHeaders(headers);
+  if (!rl.status && !rl.fiveH && !rl.sevenD && !rl.sevenDOI) return;
   if (fingerprint) {
     const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization'] || '0');
     const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization'] || '0');
@@ -4489,13 +4309,20 @@ function updateAccountState(token, name, headers, fingerprint) {
 
     utilizationHistory.record(fingerprint, u5h, u7d);
     weeklyHistory.record(fingerprint, u5h, u7d);
-    updatePersistedState(fingerprint, { utilization5h: u5h, utilization7d: u7d, resetAt: reset5h, resetAt7d: reset7d });
+    persistAccountState(token, fingerprint);
     saveHistoryToDisk();
   }
 }
 
 function markAccountLimited(token, name, retryAfterSec = 0) {
   accountState.markLimited(token, name, retryAfterSec);
+}
+
+// A 429 that says the account (or this model's bucket) is used up until a reset.
+function markAccountRejected(token, name, headers) {
+  const r = accountState.markRejected(token, name, headers);
+  persistAccountState(token, getFingerprintFromToken(token));
+  return r;
 }
 
 function markAccountExpired(token, name) {
@@ -4540,18 +4367,26 @@ function invalidateAccountsCache() {
   _accountsCacheAt = 0;
 }
 
+// Seed live state from disk so used-up / rejected accounts stay skipped across restarts.
+(function seedAccountState() {
+  for (const a of loadAllAccountTokens()) {
+    const ps = persistedState[getFingerprintFromToken(a.token)];
+    if (ps) accountState.restore(a.token, a.label || a.name, ps);
+  }
+})();
+
 // ── Account picker ──
 
-function isAccountAvailable(token, expiresAt) {
-  return _isAccountAvailable(token, expiresAt, accountState);
+function isAccountAvailable(token, expiresAt, model = null) {
+  return _isAccountAvailable(token, expiresAt, accountState, Date.now(), model);
 }
 
 function scoreAccount(token) {
   return _scoreAccount(token, accountState);
 }
 
-function pickBestAccount(excludeTokens = new Set()) {
-  return _pickBestAccount(loadAllAccountTokens(), accountState, excludeTokens);
+function pickBestAccount(excludeTokens = new Set(), model = null) {
+  return _pickBestAccount(loadAllAccountTokens(), accountState, excludeTokens, model);
 }
 
 // Fallback: pick any untried account even if marked limited (in case state is stale)
@@ -4569,12 +4404,7 @@ function buildForwardHeaders(originalHeaders, token) {
 
 function forwardToAnthropic(method, path, headers, body, timeout = PROXY_TIMEOUT) {
   return new Promise((resolve, reject) => {
-    const req = https.request({
-      hostname: 'api.anthropic.com',
-      port: 443,
-      path, method, headers,
-      timeout,
-    }, resolve);
+    const req = apiRequest({ path, method, headers, timeout }, resolve);
     req.on('timeout', () => { req.destroy(new Error('upstream timeout')); });
     req.on('error', reject);
     if (body.length) req.write(body);
@@ -4825,18 +4655,8 @@ function callRefreshEndpoint(refreshToken, scopes) {
  * Migrate all state from old fingerprint to new fingerprint after token refresh.
  */
 function migrateAccountState(oldToken, newToken, oldFp, newFp, name) {
-  // Migrate in-memory account state
-  const oldState = accountState.get(oldToken);
-  if (oldState) {
-    accountState.update(newToken, name, {
-      'anthropic-ratelimit-unified-status': oldState.limited ? 'limited' : 'ok',
-      'anthropic-ratelimit-unified-5h-utilization': String(oldState.utilization5h || 0),
-      'anthropic-ratelimit-unified-7d-utilization': String(oldState.utilization7d || 0),
-      'anthropic-ratelimit-unified-5h-reset': String(oldState.resetAt || 0),
-      'anthropic-ratelimit-unified-7d-reset': String(oldState.resetAt7d || 0),
-    });
-    accountState.remove(oldToken);
-  }
+  // Migrate in-memory account state (all of it: limits, per-model blocks, cooldowns)
+  accountState.transfer(oldToken, newToken);
 
   // Migrate utilization history (5h + weekly)
   const hist5h = utilizationHistory.getHistory(oldFp);
@@ -5158,16 +4978,22 @@ function _balanceCooledTokens(allAccounts, now = Date.now()) {
 /**
  * Acquire a per-account concurrency slot for balance mode.
  *
- * Picks the least-loaded available account; if it's under the cap, acquires and
- * returns immediately. If every available account is at the cap, waits up to
- * `balanceWaitMs` for a freed slot, then OVERFLOWS onto the least-loaded account
- * rather than ever dropping the request. Returns the chosen account with the slot
+ * Picks the least-loaded available account (in-flight requests plus warm session lanes
+ * pinned there, skipping accounts whose windows for this model are used up); if it's
+ * under the cap, acquires and returns immediately. If every available account is at the
+ * cap, waits up to `balanceWaitMs` for a freed slot, then OVERFLOWS onto the least-loaded
+ * account rather than ever dropping the request. Returns the chosen account with the slot
  * already acquired, or null when no account is available at all (genuine exhaustion).
+ *
+ * opts.only: a session lane's pinned account  - wait for a slot on that account (then
+ *   overflow onto it) instead of moving the lane and losing its prompt cache. Returns
+ *   null when that account can't take the request.
+ * opts.prefer: the session's home account for a new lane (subagent next to its parent).
  *
  * The wait/overflow/wakeup mechanics live in `balanceLimiter` (createBalanceLimiter,
  * unit-tested in lib.mjs). Here we only supply the live candidate picker.
  */
-async function acquireBalanceSlot(allAccounts, excludeTokens = new Set()) {
+async function acquireBalanceSlot(allAccounts, excludeTokens = new Set(), { model = null, prefer = null, only = null } = {}) {
   const cap = settings.maxConcurrentPerAccount || 8;
   const waitMs = settings.balanceWaitMs ?? 10_000;
   // Merge in accounts that are in transient-429 cooldown so they're skipped too.
@@ -5178,17 +5004,31 @@ async function acquireBalanceSlot(allAccounts, excludeTokens = new Set()) {
     for (const t of cooled) merged.add(t);
     return merged;
   };
+  const usable = (a) => !withCooldown().has(a.token) && isAccountAvailable(a.token, a.expiresAt, model);
+  if (only) {
+    // A pinned lane ignores burst cooldowns: moving it would rebuild its cache, and a
+    // burst 429 on its own request is waited out on the same account instead.
+    const pinnedUsable = () => !excludeTokens.has(only.token) && isAccountAvailable(only.token, only.expiresAt, model);
+    if (!pinnedUsable()) return null;
+    const result = await balanceLimiter.acquire(
+      () => (pinnedUsable() ? { key: only.name, inflight: balanceLimiter.get(only.name), account: only } : null),
+      { cap, waitMs },
+    );
+    if (!result) return null;
+    if (result.overflow) log('balance', `${only.label || only.name} over cap (${cap})  - kept for session affinity`);
+    return { account: result.account, overflow: result.overflow };
+  }
   // Single account: capping/waiting can't spread load anywhere, so never block —
   // acquire immediately (best effort) if it's available, else report exhausted.
   if (allAccounts.length <= 1) {
-    const excl = withCooldown();
-    const only = allAccounts.find(a => !excl.has(a.token) && isAccountAvailable(a.token, a.expiresAt));
-    if (!only) return null;
-    balanceLimiter.inflight.acquire(only.name);
-    return { account: only, overflow: false };
+    const only1 = allAccounts.find(usable);
+    if (!only1) return null;
+    balanceLimiter.inflight.acquire(only1.name);
+    return { account: only1, overflow: false };
   }
+  const extraLoad = settings.sessionAffinity !== false ? sessionStore.warmLoad() : null;
   const result = await balanceLimiter.acquire(() => {
-    const pick = _pickLeastLoaded(allAccounts, balanceLimiter.inflight, accountState, cap, withCooldown());
+    const pick = _pickLeastLoaded(allAccounts, balanceLimiter.inflight, accountState, cap, withCooldown(), Date.now(), { model, extraLoad, prefer });
     return pick ? { key: pick.account.name, inflight: pick.inflight, account: pick.account } : null;
   }, { cap, waitMs });
   if (!result) return null;                        // no available account → caller runs exhausted path
@@ -5201,743 +5041,601 @@ async function acquireBalanceSlot(allAccounts, excludeTokens = new Set()) {
 }
 
 // ─────────────────────────────────────────────────
-// [BETA] Token Usage Extractor (SSE Transform Stream)
+// Token usage tap (passes bytes through, reads `usage`)
 // ─────────────────────────────────────────────────
 
-function createUsageExtractor() {
-  let inputTokens = 0;
-  let outputTokens = 0;
-  let model = '';
-  let lineBuffer = '';
-  let nextEventType = '';
+const USAGE_JSON_MAX = 4 * 1024 * 1024; // don't buffer huge non-streamed bodies
 
-  const extractor = new Transform({
+function createUsageTap(kind) {
+  const decoder = new StringDecoder('utf8');
+  const sse = kind === 'sse' ? createSSEUsageParser() : null;
+  let jsonBuf = '';
+  let jsonTooBig = false;
+  const tap = new Transform({
     transform(chunk, encoding, callback) {
-      // Pass through bytes unchanged
       this.push(chunk);
-
-      // Scan for usage data in SSE events
-      const text = chunk.toString('utf8');
-      lineBuffer += text;
-
-      const lines = lineBuffer.split('\n');
-      // Keep the last (potentially incomplete) line in the buffer
-      lineBuffer = lines.pop() || '';
-
-      for (const line of lines) {
-        const trimmed = line.trim();
-        if (trimmed.startsWith('event:')) {
-          nextEventType = trimmed.slice(6).trim();
-        } else if (trimmed.startsWith('data:') && nextEventType) {
-          try {
-            const data = JSON.parse(trimmed.slice(5).trim());
-            if (nextEventType === 'message_start' && data.message) {
-              if (data.message.usage) {
-                inputTokens = data.message.usage.input_tokens || 0;
-              }
-              if (data.message.model) {
-                model = data.message.model;
-              }
-            } else if (nextEventType === 'message_delta' && data.usage) {
-              outputTokens = data.usage.output_tokens || 0;
-            }
-          } catch { /* not JSON or malformed — skip */ }
-          nextEventType = '';
+      try {
+        const text = decoder.write(chunk);
+        if (sse) sse.feed(text);
+        else if (!jsonTooBig) {
+          jsonBuf += text;
+          if (jsonBuf.length > USAGE_JSON_MAX) { jsonTooBig = true; jsonBuf = ''; }
         }
-      }
-
-      callback();
-    },
-    flush(callback) {
+      } catch { /* never break the stream over accounting */ }
       callback();
     },
   });
-
-  extractor.getUsage = () => ({
-    inputTokens,
-    outputTokens,
-    model,
-    ts: Date.now(),
-  });
-
-  return extractor;
+  tap.result = () => {
+    if (sse) return sse.result();
+    if (jsonTooBig) return null;
+    return parseJsonUsage(jsonBuf + decoder.end());
+  };
+  return tap;
 }
 
 // ─────────────────────────────────────────────────
-// [BETA] Session Monitor — server-side functions
+// Session affinity runtime
 // ─────────────────────────────────────────────────
 
-// FNV-1a hash (32-bit) — fast, deterministic, good distribution
-function _fnv1a(str) {
-  let h = 0x811c9dc5;
-  for (let i = 0; i < str.length; i++) {
-    h ^= str.charCodeAt(i);
-    h = (h * 0x01000193) >>> 0;
-  }
-  return h.toString(16);
+const sessionStore = createSessionStore();
+try {
+  if (existsSync(SESSIONS_FILE)) sessionStore.load(JSON.parse(readFileSync(SESSIONS_FILE, 'utf8')));
+} catch { /* corrupt file  - start fresh */ }
+
+let _sessionsDirty = false;
+function markSessionsDirty() { _sessionsDirty = true; }
+
+function saveSessions(force = false) {
+  if (!_sessionsDirty && !force) return;
+  _sessionsDirty = false;
+  sessionStore.prune();
+  try {
+    writeFileSync(SESSIONS_FILE + '.tmp', JSON.stringify(sessionStore.toJSON()));
+    renameSync(SESSIONS_FILE + '.tmp', SESSIONS_FILE);
+  } catch (e) { log('error', `Failed to save sessions.json: ${e.message}`); }
+}
+setInterval(saveSessions, 30_000);
+
+function accountByName(name) {
+  return loadAllAccountTokens().find(a => a.name === name) || null;
 }
 
-// Simple string hash for turn detection
-function _simpleHash(str) {
-  let h = 0;
-  for (let i = 0; i < str.length; i++) {
-    h = ((h << 5) - h + str.charCodeAt(i)) | 0;
-  }
-  return h.toString(36);
+function accountDisplay(name) {
+  const a = accountByName(name);
+  return (a && (a.label || a.name)) || name;
 }
 
-function extractCwd(bodyObj) {
-  // Search system prompt for working directory
-  const sysContent = bodyObj.system;
-  let searchText = '';
-  if (typeof sysContent === 'string') {
-    searchText = sysContent;
-  } else if (Array.isArray(sysContent)) {
-    searchText = sysContent.map(b => typeof b === 'string' ? b : b.text || '').join(' ');
+// Log a lane move. Warm moves rebuild the lane's prompt cache, so they also go
+// to the activity log.
+function noteMove(sid, move) {
+  if (!move) return;
+  markSessionsDirty();
+  const label = sessionLabel(sessionStore.get(sid)?.meta, sid);
+  const lane = move.agent === 'main' ? '' : ` [${String(move.agent).slice(0, 8)}]`;
+  log('affinity', `${label}${lane}: ${accountDisplay(move.from)} → ${accountDisplay(move.to)} (${move.reason}${move.warm ? ', cache lost' : ', cache cold'})`);
+  if (move.warm) {
+    logActivity('session-moved', { session: label, from: accountDisplay(move.from), to: accountDisplay(move.to), reason: move.reason });
   }
-  const match = searchText.match(/working directory:\s*(.+)/i);
-  if (match) return match[1].trim().split('\n')[0].trim();
-  // Fallback: hash first 200 chars of system prompt
-  return '_sys_' + _fnv1a(searchText.slice(0, 200));
 }
 
-function deriveSessionId(cwd, account) {
-  return _fnv1a(cwd + '::' + account);
+// ── Session names: Claude Code's live registry + transcript ──
+
+let _registry = new Map();   // sessionId → { name, nameSource, cwd, status }
+
+// ~/.claude/sessions/<pid>.json: Claude Code's list of running sessions (name, cwd, status).
+// Refreshed in the background; readers get the last snapshot.
+async function refreshSessionRegistry() {
+  const map = new Map();
+  const dir = join(CLAUDE_DIR, 'sessions');
+  let files = [];
+  try { files = (await readdir(dir)).filter(f => f.endsWith('.json')); } catch { /* no registry */ }
+  for (const f of files) {
+    try {
+      const j = JSON.parse(await readFile(join(dir, f), 'utf8'));
+      if (j && j.sessionId) map.set(j.sessionId, { name: j.name, nameSource: j.nameSource, cwd: j.cwd, status: j.status });
+    } catch { /* being rewritten  - skip */ }
+  }
+  _registry = map;
+}
+refreshSessionRegistry().catch(() => {});
+setInterval(() => refreshSessionRegistry().catch(() => {}), 15_000);
+
+function readSessionRegistry() {
+  return _registry;
 }
 
-function detectNewTurn(bodyObj, session) {
-  const msgs = bodyObj.messages || [];
-  // Find last user message
-  let lastUserText = '';
-  let assistantContext = '';
-  const toolUses = [];
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const m = msgs[i];
-    if (m.role === 'user' && !lastUserText) {
-      if (typeof m.content === 'string') lastUserText = m.content;
-      else if (Array.isArray(m.content)) {
-        lastUserText = m.content.filter(b => b.type === 'text').map(b => b.text).join(' ');
-      }
-    }
-    if (m.role === 'assistant' && !assistantContext) {
-      if (typeof m.content === 'string') assistantContext = m.content;
-      else if (Array.isArray(m.content)) {
-        for (const b of m.content) {
-          if (b.type === 'text') assistantContext = (assistantContext || '') + b.text;
-          if (b.type === 'tool_use') toolUses.push(b);
-        }
-      }
-    }
-    if (lastUserText && assistantContext) break;
-  }
-  if (!lastUserText) return null;
-  // Clean inputs before summarisation
-  lastUserText = lastUserText.replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '').trim();
-  assistantContext = assistantContext
-    .replace(/<system-reminder>[\s\S]*?<\/system-reminder>/g, '')
-    .replace(/```[\s\S]*?```/g, '')           // strip code blocks
-    .replace(/`[^`]+`/g, '')                  // strip inline code
-    .replace(/^I'll [^\n]*/gm, '')            // strip "I'll do X" preambles
-    .replace(/^Let me [^\n]*/gm, '')          // strip "Let me..." preambles
-    .replace(/\n{2,}/g, '\n').trim();
-  const hash = _simpleHash(lastUserText);
-  if (hash === session.lastUserHash) return null;
-  session.lastUserHash = hash;
-  return { userText: lastUserText, assistantContext, toolUses };
-}
+const _transcriptPaths = new Map(); // sessionId → transcript path, or { missAt } when not found
+const TRANSCRIPT_TAIL_BYTES = 256 * 1024;
+const TRANSCRIPT_MISS_RETRY_MS = 10 * 60 * 1000;
 
-function formatCurrentActivity(bodyObj) {
-  const msgs = bodyObj.messages || [];
-  // Scan from end for last assistant tool_use (skip user messages — tool_result
-  // content is raw tool output and not useful as an activity label)
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const m = msgs[i];
-    if (m.role === 'assistant' && Array.isArray(m.content)) {
-      for (let j = m.content.length - 1; j >= 0; j--) {
-        const b = m.content[j];
-        if (b.type === 'tool_use') {
-          const name = b.name || 'unknown';
-          let arg = '';
-          if (b.input) {
-            if (b.input.command) arg = b.input.command.replace(/\n/g, ' ');
-            else if (b.input.file_path) arg = b.input.file_path;
-            else if (b.input.pattern) arg = b.input.pattern;
-            else if (b.input.query) arg = b.input.query.replace(/\n/g, ' ');
-          }
-          const text = arg ? `${name} ${arg}` : name;
-          return text.length > 60 ? text.slice(0, 57) + '...' : text;
-        }
-      }
-    }
+async function findTranscript(sessionId) {
+  const hit = _transcriptPaths.get(sessionId);
+  if (typeof hit === 'string') return hit;
+  if (hit && Date.now() - hit.missAt < TRANSCRIPT_MISS_RETRY_MS) return null; // e.g. claude -p without a transcript
+  const root = join(CLAUDE_DIR, 'projects');
+  let dirs = [];
+  try { dirs = await readdir(root); } catch { /* no projects dir */ }
+  for (const d of dirs) {
+    const p = join(root, d, `${sessionId}.jsonl`);
+    try { await access(p); _transcriptPaths.set(sessionId, p); return p; } catch { /* not here */ }
   }
+  _transcriptPaths.set(sessionId, { missAt: Date.now() });
   return null;
 }
 
-function extractFilesModified(toolUses) {
-  const files = new Set();
-  for (const tu of toolUses) {
-    if (!tu.input) continue;
-    if (tu.name === 'Edit' || tu.name === 'Write') {
-      const fp = tu.input.file_path;
-      if (fp) files.add(basename(fp));
-    }
-    if (tu.name === 'Bash' && typeof tu.input.command === 'string') {
-      // Heuristic: detect common file-modifying patterns
-      const cmd = tu.input.command;
-      const editMatch = cmd.match(/(?:sed|awk|tee|>)\s+["']?([^\s"'|;]+)/);
-      if (editMatch) files.add(basename(editMatch[1]));
-    }
-  }
-  return [...files];
-}
-
-async function callHaikuSummary(userText, assistantContext, toolUses) {
-  // Check backoff
-  if (_haikuBackoffUntil > Date.now()) return null;
-
-  // Skip if no meaningful content to summarize
-  const trimmedUser = userText.trim();
-  const trimmedCtx = (assistantContext || '').trim();
-  if (!trimmedUser && !trimmedCtx && !toolUses.length) return null;
-
-  const toolList = toolUses.map(t => {
-    const name = t.name || 'unknown';
-    let arg = '';
-    if (t.input) {
-      if (t.input.command) arg = t.input.command.replace(/\n/g, ' ').slice(0, 60);
-      else if (t.input.file_path) arg = `${basename(t.input.file_path)}`;
-      else if (t.input.pattern) arg = t.input.pattern.slice(0, 40);
-    }
-    return arg ? `${name} ${arg}` : name;
-  }).slice(0, 10).join(', ');
-
-  const sysMsg = 'You summarize coding activity for a monitoring dashboard. Output ONLY 2-3 plain-text sentences. Past tense. No code, no markdown, no bullets, no preamble. Never quote code snippets or commands. Never start with "The user" or "I\'ll". Focus on what was decided, found, or changed. Skip verification steps, test runs, and routine checks.';
-  const userMsg = `${trimmedUser.slice(0, 500)}${trimmedCtx ? '\n' + trimmedCtx.slice(0, 300) : ''}${toolList ? '\nTools: ' + toolList : ''}`;
-
-  let token;
-  try { token = getActiveToken(); } catch { return null; }
-  if (!token) return null;
-
-  const reqBody = JSON.stringify({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 300,
-    system: sysMsg,
-    messages: [{ role: 'user', content: userMsg }],
-  });
-
+// ~/.claude/projects/<dir>/<sessionId>.jsonl: read the tail for branch, cwd and titles.
+async function readTranscriptMeta(sessionId) {
+  const file = await findTranscript(sessionId);
+  if (!file) return null;
+  let text = '';
+  let fh;
   try {
-    const res = await forwardToAnthropic('POST', '/v1/messages', {
-      'host': 'api.anthropic.com',
-      'authorization': `Bearer ${token}`,
-      'content-type': 'application/json',
-      'content-length': String(Buffer.byteLength(reqBody)),
-      'anthropic-version': '2023-06-01',
-      'anthropic-beta': 'oauth-2025-04-20',
-    }, Buffer.from(reqBody), HAIKU_TIMEOUT);
-
-    const buf = await drainResponse(res);
-    if (res.statusCode !== 200) {
-      _haikuFailCount++;
-      if (_haikuFailCount >= 3) _haikuBackoffUntil = Date.now() + HAIKU_BACKOFF_MS;
-      return null;
-    }
-
-    _haikuFailCount = 0;
-    const data = JSON.parse(buf.toString('utf8'));
-
-    // Track overhead tokens
-    if (data.usage) {
-      _summarizerOverhead.inputTokens += data.usage.input_tokens || 0;
-      _summarizerOverhead.outputTokens += data.usage.output_tokens || 0;
-    }
-
-    // Parse response — split into sentences, first = input, rest = actions
-    const raw = (data.content?.[0]?.text || '').replace(/<[^>]+>/g, '').trim();
-    if (!raw) return null;
-    // Split on sentence boundaries (period/exclamation/question followed by space or end)
-    const isMeta = s => /^(The user |I'll |I don't |I can't |However|Please share|Since there|This appears|You've provided|Let me )/i.test(s);
-    const sentences = raw.split(/(?<=[.!?])\s+/)
-      .map(s => s.replace(/^[\s*\-•>]+/, '').trim())
-      .filter(s => s && !isMeta(s));
-    if (!sentences.length) return null;
-    const input = sentences[0].slice(0, 200);
-    const actions = sentences.slice(1, 4).map(s => s.slice(0, 200));
-
-    if (input || actions.length) {
-      return { input, actions };
-    }
-    return null;
-  } catch {
-    _haikuFailCount++;
-    if (_haikuFailCount >= 3) _haikuBackoffUntil = Date.now() + HAIKU_BACKOFF_MS;
-    return null;
-  }
-}
-
-function formatTurnFallback(userText, toolUses) {
-  // Rule-based: truncate user text as input, format tool names as actions
-  const input = userText.slice(0, 60).replace(/\n/g, ' ').trim();
-  const actions = toolUses.slice(0, 3).map(t => {
-    const name = t.name || 'unknown';
-    let arg = '';
-    if (t.input) {
-      if (t.input.file_path) arg = basename(t.input.file_path);
-      else if (t.input.command) arg = t.input.command.replace(/\n/g, ' ').slice(0, 40);
-    }
-    return arg ? `${name}: ${arg}` : name;
-  });
-  return { input: input || 'working...', actions };
-}
-
-function updateSessionTimeline(bodyObj, acctName, usage, token) {
-  const cwd = extractCwd(bodyObj);
-  const sessionId = deriveSessionId(cwd, acctName);
-  const model = bodyObj.model || '';
-
-  // Detect repo/branch from cwd
-  let repo = '', branch = '';
-  const cwdStr = typeof cwd === 'string' && !cwd.startsWith('_sys_') ? cwd : '';
-  if (cwdStr) {
-    repo = basename(cwdStr);
-    // Sanitize for shell: reject paths with characters that could escape double quotes
-    if (!/["$`\\]/.test(cwdStr)) {
+    fh = await open(file, 'r');
+    const { size } = await fh.stat();
+    const start = Math.max(0, size - TRANSCRIPT_TAIL_BYTES);
+    const buf = Buffer.alloc(size - start);
+    await fh.read(buf, 0, buf.length, start);
+    text = buf.toString('utf8');
+    if (start > 0) text = text.slice(text.indexOf('\n') + 1); // drop the partial first line
+  } catch { return null; } finally { if (fh) await fh.close().catch(() => {}); }
+  const meta = {};
+  const lines = text.split('\n');
+  for (let i = lines.length - 1; i >= 0; i--) {
+    const line = lines[i];
+    if (!line) continue;
+    if (!meta.customTitle && line.includes('"custom-title"')) {
+      try { meta.customTitle = JSON.parse(line).customTitle; } catch {}
+    } else if (!meta.autoTitle && line.includes('"ai-title"')) {
+      try { meta.autoTitle = JSON.parse(line).aiTitle; } catch {}
+    } else if ((!meta.branch || !meta.cwd) && line.includes('"gitBranch"')) {
       try {
-        branch = execSync(`git -C "${cwdStr}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 2000 }).trim();
+        const j = JSON.parse(line);
+        if (!meta.branch && j.gitBranch) meta.branch = j.gitBranch;
+        if (!meta.cwd && j.cwd) meta.cwd = j.cwd;
       } catch {}
     }
+    if (meta.customTitle && meta.autoTitle && meta.branch && meta.cwd) break;
   }
-
-  // Create or retrieve session
-  let session = monitoredSessions.get(sessionId);
-  if (!session) {
-    // Enforce max active sessions
-    if (monitoredSessions.size >= SESSION_MAX_ACTIVE) {
-      // Expire oldest
-      let oldestId = null, oldestTs = Infinity;
-      for (const [id, s] of monitoredSessions) {
-        if (s.lastActiveAt < oldestTs) { oldestTs = s.lastActiveAt; oldestId = id; }
-      }
-      if (oldestId) {
-        persistCompletedSession(monitoredSessions.get(oldestId));
-        monitoredSessions.delete(oldestId);
-      }
-    }
-    session = {
-      id: sessionId,
-      account: acctName,
-      model,
-      cwd: cwdStr || cwd,
-      repo,
-      branch,
-      timeline: [],
-      currentActivity: null,
-      filesModified: [],
-      requestCount: 0,
-      totalInputTokens: 0,
-      totalOutputTokens: 0,
-      lastUserHash: null,
-      pendingHaiku: false,
-      queuedTurns: [],
-      startedAt: Date.now(),
-      lastActiveAt: Date.now(),
-      status: 'active',
-      completedAt: null,
-    };
-    monitoredSessions.set(sessionId, session);
-  }
-
-  // Update session metadata
-  session.lastActiveAt = Date.now();
-  session.requestCount++;
-  if (model) session.model = model;
-  if (usage) {
-    session.totalInputTokens += usage.inputTokens || 0;
-    session.totalOutputTokens += usage.outputTokens || 0;
-  }
-
-  // Update current activity (no AI)
-  const activity = formatCurrentActivity(bodyObj);
-  if (activity) session.currentActivity = activity;
-
-  // Detect new turn
-  const turn = detectNewTurn(bodyObj, session);
-  if (!turn) return;
-
-  // Extract files modified from tool uses
-  const newFiles = extractFilesModified(turn.toolUses);
-  for (const f of newFiles) {
-    if (!session.filesModified.includes(f)) {
-      session.filesModified.push(f);
-      if (session.filesModified.length > SESSION_FILES_MAX) session.filesModified.shift();
-    }
-  }
-
-  // Batch turns: accumulate for 10s, then summarise together
-  session.queuedTurns.push(turn);
-  if (session.queuedTurns.length > 10) session.queuedTurns.splice(0, session.queuedTurns.length - 5);
-  if (session._batchTimer || session.pendingHaiku) return;
-  session._batchTimer = setTimeout(() => {
-    session._batchTimer = null;
-    const batch = session.queuedTurns.splice(0);
-    if (!batch.length) return;
-    // Merge batch: combine user texts and tool uses, use latest assistant context
-    const mergedUser = batch.map(t => t.userText).join(' | ');
-    const mergedContext = batch[batch.length - 1].assistantContext;
-    const mergedTools = batch.flatMap(t => t.toolUses);
-    session.pendingHaiku = true;
-    callHaikuSummary(mergedUser, mergedContext, mergedTools).then(result => {
-      const summary = result || formatTurnFallback(mergedUser, mergedTools);
-      if (summary.input) {
-        session.timeline.push({ type: 'input', text: summary.input });
-      }
-      for (const action of (summary.actions || [])) {
-        session.timeline.push({ type: 'action', text: action });
-      }
-      while (session.timeline.length > SESSION_TIMELINE_MAX) session.timeline.shift();
-      session.pendingHaiku = false;
-      // If more turns arrived while we were waiting, kick off another batch
-      if (session.queuedTurns.length > 0) {
-        session._batchTimer = setTimeout(() => {
-          session._batchTimer = null;
-          // Re-trigger by pushing a synthetic empty turn check
-          const next = session.queuedTurns.splice(0);
-          if (!next.length) return;
-          const mu = next.map(t => t.userText).join(' | ');
-          const mc = next[next.length - 1].assistantContext;
-          const mt = next.flatMap(t => t.toolUses);
-          const fb = formatTurnFallback(mu, mt);
-          if (fb.input) session.timeline.push({ type: 'input', text: fb.input });
-          for (const a of fb.actions) session.timeline.push({ type: 'action', text: a });
-          while (session.timeline.length > SESSION_TIMELINE_MAX) session.timeline.shift();
-        }, 10000);
-      }
-    }).catch(() => {
-      const fb = formatTurnFallback(mergedUser, mergedTools);
-      if (fb.input) session.timeline.push({ type: 'input', text: fb.input });
-      for (const a of fb.actions) session.timeline.push({ type: 'action', text: a });
-      while (session.timeline.length > SESSION_TIMELINE_MAX) session.timeline.shift();
-      session.pendingHaiku = false;
-      session.queuedTurns.splice(0);
-    });
-  }, 10000);
+  return meta;
 }
 
-function persistCompletedSession(session) {
-  if (!session) return;
-  session.status = 'completed';
-  session.completedAt = session.completedAt || Date.now();
-  sessionHistory.unshift({
-    id: session.id,
-    account: session.account,
-    model: session.model,
-    cwd: session.cwd,
-    repo: session.repo,
-    branch: session.branch,
-    timeline: session.timeline.slice(0, SESSION_TIMELINE_MAX),
-    requestCount: session.requestCount,
-    totalInputTokens: session.totalInputTokens,
-    totalOutputTokens: session.totalOutputTokens,
-    startedAt: session.startedAt,
-    completedAt: session.completedAt,
-    duration: session.completedAt - session.startedAt,
+function gitAsync(cwd, args) {
+  return new Promise((resolve) => {
+    execFile('git', ['-C', cwd, ...args], { timeout: 3000, encoding: 'utf8' }, (err, out) => resolve(err ? null : String(out).trim()));
   });
-  if (sessionHistory.length > SESSION_HISTORY_MAX) sessionHistory.length = SESSION_HISTORY_MAX;
-  try { writeFileSync(SESSION_HISTORY_FILE, JSON.stringify(sessionHistory, null, 2)); } catch {}
 }
 
-function getFileConflicts() {
-  const fileToSessions = new Map(); // file → [{ id, account }]
-  for (const [, session] of monitoredSessions) {
-    if (session.status !== 'active') continue;
-    for (const f of session.filesModified) {
-      if (!fileToSessions.has(f)) fileToSessions.set(f, []);
-      fileToSessions.get(f).push({ id: session.id, account: session.account });
-    }
-  }
-  const conflicts = [];
-  for (const [file, sessions] of fileToSessions) {
-    // Deduplicate by session ID (same session can only count once)
-    const uniqueById = new Map();
-    for (const s of sessions) uniqueById.set(s.id, s.account);
-    if (uniqueById.size >= 2) {
-      const accounts = [...new Set(uniqueById.values())];
-      conflicts.push({ file, accounts, count: uniqueById.size });
-    }
-  }
-  return conflicts;
-}
+const _repoRootCache = new Map(); // cwd → main repo root (worktrees resolve to their parent repo)
 
-// Session expiry timer — check every 30s
-setInterval(() => {
-  const now = Date.now();
-  for (const [id, session] of monitoredSessions) {
-    if (session.status === 'active' && now - session.lastActiveAt > SESSION_INACTIVITY_MS) {
-      persistCompletedSession(session);
-      monitoredSessions.delete(id);
-    }
-  }
-}, 30000);
-
-// ─────────────────────────────────────────────────
-// [BETA] Ensure prepare-commit-msg hook in repos with local core.hooksPath
-// ─────────────────────────────────────────────────
-
-const _hookedRepoPaths = new Set(); // avoid re-checking the same repo
-
-function ensureLocalCommitHook(cwd) {
-  try {
-    if (!settings.commitTokenUsage) return;
-    // Check for local core.hooksPath override
-    let localHooksPath;
-    try {
-      localHooksPath = execSync(`git -C "${cwd}" config --local core.hooksPath 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-    } catch { return; } // no local override
-    if (!localHooksPath) return;
-
-    // Resolve relative paths
-    let repoRoot;
-    try {
-      repoRoot = execSync(`git -C "${cwd}" rev-parse --show-toplevel 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-    } catch { return; }
-
-    const resolvedLocal = localHooksPath.startsWith('/') ? localHooksPath : join(repoRoot, localHooksPath);
-
-    // Skip if already checked this repo
-    if (_hookedRepoPaths.has(resolvedLocal)) return;
-    _hookedRepoPaths.add(resolvedLocal);
-
-    // Check for global hooks path
-    let globalHooksPath;
-    try {
-      globalHooksPath = execSync('git config --global core.hooksPath 2>/dev/null', { encoding: 'utf8', timeout: 3000 }).trim();
-    } catch { return; }
-    if (!globalHooksPath) return;
-    globalHooksPath = globalHooksPath.replace(/^~/, process.env.HOME || '');
-
-    // If local == global, no problem
-    if (resolvedLocal === globalHooksPath) return;
-
-    // Read the global hook content
-    const globalHookFile = join(globalHooksPath, 'prepare-commit-msg');
-    if (!existsSync(globalHookFile)) return;
-    const globalHookContent = readFileSync(globalHookFile, 'utf8');
-    if (!globalHookContent.includes('vdm-token-usage')) return;
-
-    // Check if local hook already has our marker
-    const localHookFile = join(resolvedLocal, 'prepare-commit-msg');
-    if (existsSync(localHookFile)) {
-      const existing = readFileSync(localHookFile, 'utf8');
-      if (existing.includes('vdm-token-usage')) return; // already installed
-      // Back up existing hook
-      try { renameSync(localHookFile, localHookFile + '.vdm-original'); } catch {}
-    }
-
-    // Copy global hook to local hooks dir
-    mkdirSync(resolvedLocal, { recursive: true });
-    writeFileSync(localHookFile, globalHookContent);
-    try { execSync(`chmod +x "${localHookFile}"`, { timeout: 2000 }); } catch {}
-    log('tokens', `Installed commit hook in ${resolvedLocal} (local hooksPath override detected)`);
-  } catch { /* silent — best effort */ }
-}
-
-// ─────────────────────────────────────────────────
-// [BETA] Token Usage Ring Buffer
-// ─────────────────────────────────────────────────
-
-const recentUsage = []; // { ts, inputTokens, outputTokens, model, account, claimed }
-const RECENT_USAGE_MAX = 2000;
-
-function recordUsage(usage, account) {
-  if (!usage || (!usage.inputTokens && !usage.outputTokens)) return;
-  recentUsage.push({
-    ts: usage.ts || Date.now(),
-    inputTokens: usage.inputTokens,
-    outputTokens: usage.outputTokens,
-    model: usage.model,
-    account,
-    claimed: false,
-  });
-  while (recentUsage.length > RECENT_USAGE_MAX) recentUsage.shift();
-}
-
-function claimUsageInRange(startTs, endTs) {
-  const claimed = [];
-  for (const entry of recentUsage) {
-    if (!entry.claimed && entry.ts >= startTs && entry.ts <= endTs) {
-      entry.claimed = true;
-      claimed.push(entry);
-    }
-  }
-  return claimed;
+async function resolveRepoRoot(cwd) {
+  if (_repoRootCache.has(cwd)) return _repoRootCache.get(cwd);
+  let root = await gitAsync(cwd, ['rev-parse', '--path-format=absolute', '--git-common-dir']);
+  root = root ? root.replace(/\/\.git\/?$/, '') : (await gitAsync(cwd, ['rev-parse', '--show-toplevel'])) || '';
+  _repoRootCache.set(cwd, root);
+  return root;
 }
 
 /**
- * When inside a Claude Code git worktree, the checked-out branch is an
- * auto-generated name like `worktree-jolly-dazzling-dolphin`.  Resolve it
- * back to the real feature branch so token usage is attributed correctly.
+ * In a Claude Code worktree the checked-out branch is an auto-generated name like
+ * `worktree-jolly-dazzling-dolphin`. Resolve it back to the real feature branch.
  */
-function _resolveWorktreeBranch(cwd, detectedBranch) {
-  if (!detectedBranch.startsWith('worktree-')) return detectedBranch;
-  try {
-    // Confirm we're actually in a worktree (git-dir != git-common-dir)
-    const gitDir = execSync(`git -C "${cwd}" rev-parse --path-format=absolute --git-dir 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-    const commonDir = execSync(`git -C "${cwd}" rev-parse --path-format=absolute --git-common-dir 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-    if (gitDir === commonDir) return detectedBranch;
-  } catch { return detectedBranch; }
-
-  // Strategy 1: find a non-worktree branch at the exact same commit
-  try {
-    const candidates = execSync(`git -C "${cwd}" branch --points-at HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 })
-      .trim().split('\n')
-      .map(b => b.replace(/^[*+]?\s+/, '').trim())
-      .filter(b => b && !b.startsWith('worktree-'));
-    if (candidates.length === 1) return candidates[0];
-    if (candidates.length > 1) return candidates.find(b => b.includes('/')) || candidates[0];
-  } catch { /* ignore */ }
-
-  // Strategy 2: walk recent commits for the closest decorated non-worktree branch
-  try {
-    const lines = execSync(`git -C "${cwd}" log --format=%D --max-count=30 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim().split('\n');
-    for (const line of lines) {
-      if (!line.trim()) continue;
-      const refs = line.split(',').map(r => r.trim())
-        .filter(r => r && !r.startsWith('HEAD') && !r.startsWith('worktree-') && !r.startsWith('origin/') && !r.startsWith('tag:'));
-      if (refs.length > 0) return refs.find(r => r.includes('/')) || refs[0];
-    }
-  } catch { /* ignore */ }
-
-  return detectedBranch;
+async function resolveWorktreeBranch(cwd, branch) {
+  if (!branch || !branch.startsWith('worktree-')) return branch;
+  const pointsAt = await gitAsync(cwd, ['branch', '--points-at', 'HEAD']);
+  const candidates = (pointsAt || '').split('\n').map(b => b.replace(/^[*+]?\s+/, '').trim()).filter(b => b && !b.startsWith('worktree-'));
+  if (candidates.length) return candidates.find(b => b.includes('/')) || candidates[0];
+  const decorated = await gitAsync(cwd, ['log', '--format=%D', '--max-count=30']);
+  for (const line of (decorated || '').split('\n')) {
+    const refs = line.split(',').map(r => r.trim())
+      .filter(r => r && !r.startsWith('HEAD') && !r.startsWith('worktree-') && !r.startsWith('origin/') && !r.startsWith('tag:'));
+    if (refs.length) return refs.find(r => r.includes('/')) || refs[0];
+  }
+  return branch;
 }
 
-// ─────────────────────────────────────────────────
-// [BETA] Session Tracking
-// ─────────────────────────────────────────────────
+const _metaRefreshedAt = new Map(); // sessionId → last refresh (ms)
+const SESSION_META_REFRESH_MS = 60_000;
 
-const pendingSessions = new Map(); // session_id → { repo, branch, commitHash, cwd, startedAt }
-
-// Claim and persist usage for a session (used by auto-claim and stale pruning)
-function _autoClaimSession(sessionId, session) {
-  // Re-read branch before persisting (handles worktree branch switches)
-  if (session.cwd) {
-    try {
-      const cur = _resolveWorktreeBranch(session.cwd, execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
-      if (cur && cur !== session.branch) {
-        session.branch = cur;
-        session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-      }
-    } catch { /* ignore */ }
+// Refresh a session's display info (name, cwd, repo, branch). Off the hot path and
+// throttled to once a minute per session.
+async function refreshSessionMeta(sid, body) {
+  const now = Date.now();
+  if (now - (_metaRefreshedAt.get(sid) || 0) < SESSION_META_REFRESH_MS) return;
+  _metaRefreshedAt.set(sid, now);
+  if (_metaRefreshedAt.size > 2000) {
+    for (const [k, t] of _metaRefreshedAt) if (now - t > SESSION_META_REFRESH_MS) _metaRefreshedAt.delete(k);
   }
-  const claimed = claimUsageInRange(session.startedAt, Date.now());
-  for (const entry of claimed) {
-    appendTokenUsage({
-      ts: entry.ts,
-      repo: session.repo,
-      branch: session.branch,
-      commitHash: session.commitHash,
-      model: entry.model,
-      inputTokens: entry.inputTokens,
-      outputTokens: entry.outputTokens,
-      account: entry.account,
+  const reg = readSessionRegistry().get(sid);
+  const tr = (await readTranscriptMeta(sid)) || {};
+  let cwd = reg?.cwd || tr.cwd || '';
+  let branch = tr.branch || '';
+  if ((!cwd || !branch) && body) {
+    // Claude Code puts the working directory and git branch in the system prompt
+    const head = body.subarray(0, Math.min(body.length, 256 * 1024)).toString('utf8');
+    if (!cwd) cwd = (head.match(/working directory:\s*([^\n\\"]+)/i) || [])[1]?.trim() || '';
+    if (!branch) branch = (head.match(/Current branch:\s*([^\n\\"]+)/) || [])[1]?.trim() || '';
+  }
+  let repo = '';
+  if (cwd && await access(cwd).then(() => true, () => false)) {
+    repo = await resolveRepoRoot(cwd);
+    if (branch.startsWith('worktree-')) branch = await resolveWorktreeBranch(cwd, branch);
+  }
+  const meta = { cwd, branch, repo, live: !!reg, status: reg?.status || null };
+  if (reg) { meta.name = reg.name || null; meta.nameSource = reg.nameSource || null; }
+  if (tr.customTitle) meta.customTitle = tr.customTitle;
+  if (tr.autoTitle) meta.autoTitle = tr.autoTitle;
+  sessionStore.setMeta(sid, meta);
+  markSessionsDirty();
+}
+
+// Live flag drifts once a session ends: re-check against the registry when listing.
+function isSessionLive(sid) {
+  return readSessionRegistry().has(sid);
+}
+
+// Compact per-session view for one account's card.
+function accountSessions(name, now = Date.now()) {
+  const dayAgo = now - 24 * 60 * 60 * 1000;
+  const out = [];
+  for (const s of sessionStore.all()) {
+    const here = s.accounts[name];
+    const lanesHere = Object.values(s.lanes).filter(l => l.account === name);
+    const warmHere = lanesHere.some(l => now - l.lastAt < l.ttlMs);
+    if (!warmHere && (!here || here.lastAt < dayAgo)) continue;
+    const aff = sessionAffinity(s, now);
+    out.push({
+      id: s.id,
+      label: sessionLabel(s.meta, s.id),
+      title: s.meta.autoTitle || s.meta.name || '',
+      repo: s.meta.repo ? basename(s.meta.repo) : '',
+      branch: s.meta.branch || '',
+      live: isSessionLive(s.id),
+      pinnedHere: warmHere,
+      requests: here?.requests || 0,
+      lastAt: here?.lastAt || s.lastAt,
+      affinity: aff.level,
+      cacheHit: aff.cacheHit,
+      warmMoves1h: aff.warmMoves1h,
+      share: aff.share,
     });
   }
-  if (claimed.length > 0) {
-    log('tokens', `Auto-claimed ${claimed.length} entries for session ${sessionId.slice(0, 8)}…`);
-  }
+  out.sort((a, b) => (b.pinnedHere - a.pinnedHere) || (b.lastAt - a.lastAt));
+  return out;
 }
 
-// Periodically auto-persist unclaimed usage so the Tokens tab shows data
-// even for long-running sessions that haven't called session-stop yet.
-const TOKEN_AUTO_PERSIST_INTERVAL = 2 * 60 * 1000; // every 2 minutes
-setInterval(() => {
-  // For each active session, claim any unclaimed entries and persist them.
-  // Update startedAt so we don't double-count on next interval.
-  for (const [id, session] of pendingSessions) {
-    const now = Date.now();
-    // Re-read branch before persisting (handles worktree branch switches)
-    if (session.cwd) {
+// Full session list for the Sessions tab.
+function listSessions(hours = 24, now = Date.now()) {
+  const since = now - hours * 60 * 60 * 1000;
+  return sessionStore.all()
+    .filter(s => s.lastAt >= since)
+    .sort((a, b) => b.lastAt - a.lastAt)
+    .map(s => {
+      const aff = sessionAffinity(s, now);
+      const accounts = Object.entries(s.accounts)
+        .map(([name, a]) => ({ name, label: accountDisplay(name), ...a }))
+        .sort((x, y) => y.requests - x.requests);
+      // warm = used within its cache TTL (also right after a manual switch released the pin)
+      const lanes = Object.entries(s.lanes)
+        .filter(([, l]) => l.account || l.prevAccount)
+        .map(([agent, l]) => {
+          const account = l.account || l.prevAccount;
+          return { agent, account, pinned: !!l.account, label: accountDisplay(account), warm: now - l.lastAt < l.ttlMs, lastAt: l.lastAt, ttlMs: l.ttlMs };
+        });
+      return {
+        id: s.id,
+        label: sessionLabel(s.meta, s.id),
+        meta: { ...s.meta, repoName: s.meta.repo ? basename(s.meta.repo) : '' },
+        live: isSessionLive(s.id),
+        model: s.model,
+        firstAt: s.firstAt,
+        lastAt: s.lastAt,
+        requests: s.requests,
+        home: sessionStore.home(s.id),
+        homeLabel: accountDisplay(sessionStore.home(s.id) || ''),
+        affinity: aff,
+        accounts,
+        lanes,
+        moves: s.moves.slice(-10).reverse().map(m => ({ ...m, fromLabel: accountDisplay(m.from), toLabel: accountDisplay(m.to) })),
+        artifacts: s.artifacts,
+      };
+    });
+}
+
+// ─────────────────────────────────────────────────
+// Usage store: hourly rollups, one JSON file per UTC day in usage/
+// ─────────────────────────────────────────────────
+
+const _usageDays = new Map(); // 'YYYY-MM-DD' → { data, dirty, touchedAt }
+
+function usageDayFile(day) { return join(USAGE_DIR, `${day}.json`); }
+
+function usageDay(day) {
+  let d = _usageDays.get(day);
+  if (!d) {
+    let file = {};
+    try { file = JSON.parse(readFileSync(usageDayFile(day), 'utf8')) || {}; } catch { /* new day */ }
+    d = { data: createUsageDay(file.rows || []), dirty: false, touchedAt: Date.now(), legacyImported: !!file.legacyImported };
+    _usageDays.set(day, d);
+  }
+  d.touchedAt = Date.now();
+  return d;
+}
+
+function recordUsage(rec) {
+  const d = usageDay(utcDay(rec.ts));
+  d.data.add(rec);
+  d.dirty = true;
+}
+
+function flushUsage() {
+  const today = utcDay(Date.now());
+  for (const [day, d] of _usageDays) {
+    if (d.dirty) {
       try {
-        const cur = _resolveWorktreeBranch(session.cwd, execSync(`git -C "${session.cwd}" rev-parse --abbrev-ref HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim());
-        if (cur && cur !== session.branch) {
-          log('tokens', `Periodic: session ${id.slice(0, 8)}… branch updated: ${session.branch} → ${cur}`);
-          session.branch = cur;
-          session.commitHash = execSync(`git -C "${session.cwd}" rev-parse --short HEAD 2>/dev/null`, { encoding: 'utf8', timeout: 3000 }).trim();
-        }
-      } catch { /* ignore */ }
+        mkdirSync(USAGE_DIR, { recursive: true });
+        const out = { v: 1, day, rows: d.data.rows() };
+        if (d.legacyImported) out.legacyImported = true;
+        writeFileSync(usageDayFile(day) + '.tmp', JSON.stringify(out));
+        renameSync(usageDayFile(day) + '.tmp', usageDayFile(day));
+        d.dirty = false;
+      } catch (e) { log('error', `Failed to write usage/${day}.json: ${e.message}`); }
     }
-    const claimed = claimUsageInRange(session.startedAt, now);
-    for (const entry of claimed) {
-      appendTokenUsage({
-        ts: entry.ts,
-        repo: session.repo,
-        branch: session.branch,
-        commitHash: session.commitHash,
-        model: entry.model,
-        inputTokens: entry.inputTokens,
-        outputTokens: entry.outputTokens,
-        account: entry.account,
+    // Keep today hot; drop other days from memory once idle
+    if (!d.dirty && day !== today && Date.now() - d.touchedAt > 10 * 60 * 1000) _usageDays.delete(day);
+  }
+}
+setInterval(flushUsage, 30_000);
+
+function loadUsageRows(since, until = Date.now()) {
+  const rows = [];
+  const first = utcDay(since), last = utcDay(until);
+  const days = new Set(_usageDays.keys());
+  try { for (const f of readdirSync(USAGE_DIR)) if (/^\d{4}-\d{2}-\d{2}\.json$/.test(f)) days.add(f.slice(0, 10)); } catch {}
+  for (const day of [...days].sort()) {
+    if (day < first || day > last) continue;
+    for (const r of usageDay(day).data.rows()) rows.push(r);
+  }
+  return rows;
+}
+
+// One-time import of the pre-v4 per-request log (token-usage.json) into rollups.
+// Repeat-safe: each day file is marked as holding the imported rows in the same atomic
+// write, so a crash before the final rename never imports a day twice.
+(function importLegacyTokenUsage() {
+  if (!existsSync(LEGACY_TOKEN_USAGE_FILE)) return;
+  try {
+    const entries = JSON.parse(readFileSync(LEGACY_TOKEN_USAGE_FILE, 'utf8'));
+    let n = 0;
+    const skip = new Set();
+    for (const e of Array.isArray(entries) ? entries : []) {
+      if (!e || !e.ts) continue;
+      const day = utcDay(e.ts);
+      if (skip.has(day)) continue;
+      const d = usageDay(day);
+      if (d.legacyImported && !d.importing) { skip.add(day); continue; }
+      d.legacyImported = true;
+      d.importing = true;
+      d.data.add({
+        ts: e.ts, account: e.account, model: e.model, repo: e.repo || '', branch: e.branch || '',
+        usage: { input: e.inputTokens || 0, output: e.outputTokens || 0 },
       });
+      d.dirty = true;
+      n++;
     }
-    if (claimed.length > 0) {
-      session.startedAt = now; // advance so we don't re-claim
-      log('tokens', `Periodic persist: ${claimed.length} entries for session ${id.slice(0, 8)}…`);
-    }
-  }
-  // Unclaimed entries outside any session's time range are left in the ring
-  // buffer — they'll be claimed by session-stop, or age out naturally.
-  // No (unknown) attribution: better to lose data than misattribute it.
-}, TOKEN_AUTO_PERSIST_INTERVAL);
-
-// ─────────────────────────────────────────────────
-// [BETA] Token Usage Storage (token-usage.json)
-// ─────────────────────────────────────────────────
-
-const TOKEN_USAGE_MAX_ENTRIES = 50_000;
-const TOKEN_USAGE_MAX_AGE = 90 * 24 * 60 * 60 * 1000; // 90 days
-let _tokenUsageCache = null;
-
-function loadTokenUsage() {
-  if (_tokenUsageCache) return _tokenUsageCache;
-  try {
-    if (existsSync(TOKEN_USAGE_FILE)) {
-      const raw = readFileSync(TOKEN_USAGE_FILE, 'utf8');
-      _tokenUsageCache = JSON.parse(raw);
-      return _tokenUsageCache;
-    }
-  } catch { /* corrupt file */ }
-  _tokenUsageCache = [];
-  return _tokenUsageCache;
-}
-
-function appendTokenUsage(entry) {
-  const usage = loadTokenUsage();
-  usage.push(entry);
-  // Prune old entries
-  const cutoff = Date.now() - TOKEN_USAGE_MAX_AGE;
-  const pruned = usage.filter(e => e.ts >= cutoff);
-  const final = pruned.length > TOKEN_USAGE_MAX_ENTRIES
-    ? pruned.slice(pruned.length - TOKEN_USAGE_MAX_ENTRIES)
-    : pruned;
-  _tokenUsageCache = final;
-  try {
-    writeFileSync(TOKEN_USAGE_FILE, JSON.stringify(final, null, 2));
+    for (const d of _usageDays.values()) delete d.importing;
+    flushUsage();
+    renameSync(LEGACY_TOKEN_USAGE_FILE, LEGACY_TOKEN_USAGE_FILE.replace(/\.json$/, '.imported.json'));
+    console.log(`[usage] Imported ${n} legacy token-usage entries into usage/`);
   } catch (e) {
-    log('error', `Failed to write token-usage.json: ${e.message}`);
+    console.log(`[usage] Legacy token-usage import failed: ${e.message}`);
   }
+})();
+
+// Book one proxied request: per-session stats and the usage rollup.
+function recordProxyUsage({ sid, agent, acct, model, usage, ttlMs }) {
+  if (!usage) return;
+  const cost = usageCost(usage, model);
+  let repo = '', branch = '';
+  if (sid) {
+    sessionStore.recordRequest(sid, agent, acct?.name || 'unknown', { ...usage, cost }, { model, ttlMs });
+    const meta = sessionStore.get(sid)?.meta || {};
+    repo = meta.repo || '';
+    branch = meta.branch || '';
+    markSessionsDirty();
+  }
+  recordUsage({ ts: Date.now(), account: acct?.label || acct?.name || 'unknown', model, repo, branch, usage });
+}
+
+// Rolling 30-day prompt-cache efficiency (per account / per model, daily trend).
+// Memoized for a minute: /api/profiles asks for it every 5 seconds.
+let _cache30d = { at: 0, data: null };
+function cacheReport30d() {
+  const now = Date.now();
+  if (_cache30d.data && now - _cache30d.at < 60_000) return _cache30d.data;
+  const since = Math.floor((now - 29 * 86400000) / 86400000) * 86400000; // 30 UTC days incl. today
+  _cache30d = { at: now, data: cacheEfficiency(loadUsageRows(since, now), { since, until: now }) };
+  return _cache30d.data;
+}
+
+// Usage tab report: current period vs previous period, plus plan value per account.
+function usageReport(params) {
+  const days = Math.min(Math.max(parseInt(params.get('days') || '7', 10) || 7, 1), 400);
+  const filter = {};
+  for (const k of ['repo', 'branch', 'model', 'account']) if (params.get(k)) filter[k] = params.get(k);
+  const now = Date.now();
+  const since = now - days * 86400000;
+  const rows = loadUsageRows(since - days * 86400000, now);
+  const bucketMs = days <= 2 ? 3600000 : 86400000;
+  const cur = summarizeUsage(rows, { since, filter, bucketMs });
+  const prev = summarizeUsage(rows, { since: since - days * 86400000, until: since, filter }).totals;
+
+  // Plan value: each Max account's prorated subscription vs the API price of what it used.
+  const MONTH_DAYS = 30.4375;
+  const plans = loadAllAccountTokens().map(a => {
+    const o = a.creds?.claudeAiOauth || {};
+    const monthly = planMonthlyUsd(o.subscriptionType, o.rateLimitTier);
+    const key = a.label || a.name;
+    const used = cur.byAccount[key];
+    return {
+      name: a.name, label: key, monthly,
+      tier: (String(o.rateLimitTier || '').match(/(\d+)x/) || [])[1] ? `Max ${String(o.rateLimitTier).match(/(\d+)x/)[1]}x` : (o.subscriptionType || 'unknown'),
+      planCost: monthly ? monthly * days / MONTH_DAYS : null,
+      apiCost: used?.cost || 0,
+      requests: used?.requests || 0,
+    };
+  }).filter(p => !filter.account || p.label === filter.account);
+  const planDaily = plans.reduce((sum, p) => sum + (p.monthly ? p.monthly / MONTH_DAYS : 0), 0);
+  // A plan covers all of an account's usage: comparing it to one repo/branch/model is meaningless
+  const planComparable = !filter.repo && !filter.branch && !filter.model;
+
+  return { days, since, bucketMs, filter, ...cur, prevTotals: prev, plans, planDaily, planComparable, cache30d: cacheReport30d() };
 }
 
 // ─────────────────────────────────────────────────
-// [BETA] Pipe helper — waits for stream to complete
+// Artifact tracker: which account owns which claude.ai artifact
+// ─────────────────────────────────────────────────
+//
+// Claude Code publishes artifacts straight to the API with its own login (the
+// account in the keychain), not through this proxy  - so the owner can differ from
+// the account a session's messages were routed to. The tracker asks each account
+// for the artifacts it owns (the same listing `/artifacts` in Claude Code uses).
+
+const ARTIFACT_POLL_MS = 15 * 60 * 1000;
+let artifactIndex = { updatedAt: 0, accounts: {}, links: {} };
+try {
+  if (existsSync(ARTIFACTS_FILE)) {
+    const raw = JSON.parse(readFileSync(ARTIFACTS_FILE, 'utf8'));
+    artifactIndex = { updatedAt: raw.updatedAt || 0, accounts: raw.accounts || {}, links: raw.links || {} };
+  }
+} catch { /* corrupt file  - start fresh */ }
+let _artifactsRefreshing = null;
+let _artifactLinksDirty = false;
+
+function saveArtifacts() {
+  try {
+    writeFileSync(ARTIFACTS_FILE + '.tmp', JSON.stringify(artifactIndex));
+    renameSync(ARTIFACTS_FILE + '.tmp', ARTIFACTS_FILE);
+  } catch (e) { log('error', `Failed to save artifacts.json: ${e.message}`); }
+}
+
+function fetchArtifactFrames(token) {
+  return new Promise((resolve) => {
+    const req = apiRequest({
+      path: '/api/frame/frames?limit=200',
+      method: 'GET',
+      headers: {
+        'Authorization': `Bearer ${token}`,
+        'anthropic-beta': 'oauth-2025-04-20',
+        'User-Agent': `claude-code/${CLAUDE_CODE_VERSION} (external, cli)`,
+        'Accept': 'application/json',
+        'X-Frame-CP': 'go',
+        'X-Frame-Surface': 'code',
+        'X-Frame-Platform': 'cli',
+        'X-Frame-Client-Version': CLAUDE_CODE_VERSION,
+      },
+      timeout: 15000,
+    }, (res) => {
+      let data = '';
+      res.on('data', c => { if (data.length < 8 * 1024 * 1024) data += c; });
+      res.on('end', () => {
+        if (res.statusCode !== 200) return resolve({ ok: false, error: `HTTP ${res.statusCode}` });
+        try {
+          const j = JSON.parse(data);
+          resolve({ ok: true, frames: Array.isArray(j.frames) ? j.frames : [] });
+        } catch { resolve({ ok: false, error: 'unexpected response' }); }
+      });
+    });
+    req.on('error', (e) => resolve({ ok: false, error: e.message }));
+    req.on('timeout', () => { req.destroy(); resolve({ ok: false, error: 'timeout' }); });
+    req.end();
+  });
+}
+
+async function refreshArtifacts(reason = 'poll') {
+  if (_artifactsRefreshing) return _artifactsRefreshing;
+  _artifactsRefreshing = (async () => {
+    const accounts = loadAllAccountTokens();
+    const names = new Set(accounts.map(a => a.name));
+    for (const name of Object.keys(artifactIndex.accounts)) if (!names.has(name)) delete artifactIndex.accounts[name];
+    for (const a of accounts) {
+      const prev = artifactIndex.accounts[a.name];
+      if (a.expiresAt && a.expiresAt < Date.now()) {
+        artifactIndex.accounts[a.name] = { ...(prev || { frames: [] }), label: a.label || a.name, error: 'token expired' };
+        continue;
+      }
+      const r = await fetchArtifactFrames(a.token);
+      if (!r.ok) {
+        artifactIndex.accounts[a.name] = { ...(prev || { frames: [] }), label: a.label || a.name, error: r.error };
+        continue;
+      }
+      const frames = r.frames
+        .filter(f => f && f.slug && f.rel !== 'shared' && !f.softDeleted)
+        .map(f => ({
+          slug: f.slug, title: f.title || '', description: f.description || '',
+          createdAt: f.created_at || null, updatedAt: f.updatedAt || null,
+          audience: f.audience || null, ownerEmail: f.owner_email || null,
+        }));
+      artifactIndex.accounts[a.name] = { label: a.label || a.name, fetchedAt: Date.now(), error: null, frames, shared: r.frames.filter(f => f?.rel === 'shared').length };
+    }
+    artifactIndex.updatedAt = Date.now();
+    saveArtifacts();
+    log('artifacts', `Artifact index refreshed (${reason}): ${Object.values(artifactIndex.accounts).reduce((n, a) => n + (a.frames || []).length, 0)} artifacts across ${accounts.length} accounts`);
+  })().finally(() => { _artifactsRefreshing = null; });
+  return _artifactsRefreshing;
+}
+
+setTimeout(() => refreshArtifacts('startup').catch(() => {}), 20_000);
+setInterval(() => refreshArtifacts('poll').catch(() => {}), ARTIFACT_POLL_MS);
+
+// A session's messages mention an artifact link (e.g. the Artifact tool's result):
+// remember which session it came from.
+function noteArtifactRefs(sid, refs, routedAccount) {
+  for (const ref of refs) {
+    if (!sessionStore.addArtifact(sid, ref)) continue;
+    if (!artifactIndex.links[ref]) {
+      artifactIndex.links[ref] = { sessionId: sid, seenAt: Date.now(), routedAccount: routedAccount || null };
+      _artifactLinksDirty = true;
+    }
+    markSessionsDirty();
+  }
+}
+setInterval(() => { if (_artifactLinksDirty) { _artifactLinksDirty = false; saveArtifacts(); } }, 30_000);
+
+function artifactsView() {
+  const linkFor = (slug) => {
+    for (const [ref, link] of Object.entries(artifactIndex.links)) {
+      if (artifactRefMatches(ref, slug)) return link;
+    }
+    return null;
+  };
+  const accounts = loadAllAccountTokens().map(a => {
+    const entry = artifactIndex.accounts[a.name] || {};
+    const frames = (entry.frames || []).map(f => {
+      const link = linkFor(f.slug);
+      const s = link ? sessionStore.get(link.sessionId) : null;
+      return {
+        ...f,
+        url: `https://claude.ai/code/artifact/${f.slug}`,
+        session: link ? { id: link.sessionId, label: s ? sessionLabel(s.meta, s.id) : String(link.sessionId).slice(0, 8) } : null,
+      };
+    }).sort((x, y) => String(y.createdAt || '').localeCompare(String(x.createdAt || '')));
+    return { name: a.name, label: a.label || a.name, fetchedAt: entry.fetchedAt || 0, error: entry.error || null, shared: entry.shared || 0, frames };
+  });
+  return { updatedAt: artifactIndex.updatedAt, refreshing: !!_artifactsRefreshing, pollMinutes: ARTIFACT_POLL_MS / 60000, accounts };
+}
+
+// ─────────────────────────────────────────────────
+// Pipe helper — waits for stream to complete
 // ─────────────────────────────────────────────────
 
-function pipeAndWait(src, dst) {
+// stream.pipeline settles on completion and on an error anywhere. A client that is
+// already gone makes pipeline throw synchronously: drop the upstream response instead.
+function pipeAndWait(...streams) {
   return new Promise(resolve => {
-    let resolved = false;
-    const done = () => { if (!resolved) { resolved = true; resolve(); } };
-    src.on('end', done);
-    src.on('error', done);
-    dst.on('close', done);
-    dst.on('error', done);
-    src.pipe(dst);
+    const dst = streams[streams.length - 1];
+    const abandon = () => { for (const st of streams) st.destroy(); resolve(); };
+    if (dst.destroyed || dst.writableEnded) return abandon();
+    try { pipeline(...streams, () => resolve()); } catch { abandon(); }
   });
 }
 
@@ -6091,12 +5789,13 @@ async function handleProxyRequest(clientReq, clientRes) {
     return;
   }
 
-  const maxAttempts = allAccounts.length + 2; // +1 for refresh retry, +1 for minimal-header retry
+  const maxAttempts = allAccounts.length + 3; // +1 refresh retry, +1 minimal-header retry, +1 same-account burst retry
   const triedTokens = new Set();
   const billingMarkedTokens = new Set(); // tokens marked billing-unavailable this request
   const refreshAttempted = new Set(); // track refresh attempts to prevent infinite loops
   let _bulkRefreshAttempted = false;   // per-request: tried force-refreshing all tokens?
   let _minimalHeaderRetried = false;   // per-request: tried minimal-header last resort?
+  let _sameAccountRetried = false;     // per-request: waited out a burst 429 on the pinned account?
 
   // ── Balance-mode concurrency slot ──
   // heldKey = the account name whose in-flight slot we currently hold (null = none).
@@ -6114,12 +5813,58 @@ async function handleProxyRequest(clientReq, clientRes) {
   // The clientGone flag also catches a disconnect that lands *during* a slot wait — a
   // slot acquired after the (already-fired, once-only) close listener would otherwise leak.
   clientRes.once('close', () => { clientGone = true; releaseHeld(); });
+
+  // ── Session affinity ──
+  // A Claude Code session (one lane per agent: main loop, each subagent) stays on one
+  // account while its prompt cache is warm. Moving it re-writes the whole cache on the
+  // new account (1.25-2x input price) instead of reading it (~0.1x). Applies whenever the
+  // proxy chooses accounts (auto-switch or balance); a cold lane is free to re-place.
+  const model = extractModel(body);
+  const ttlMs = cacheTtlFromBody(body);
+  const sid = extractSessionId(clientReq.headers, body);
+  const agent = String(clientReq.headers['x-claude-code-agent-id'] || 'main').slice(0, 64);
+  const affinityOn = !!sid && settings.sessionAffinity !== false && (balanceMode || settings.autoSwitch);
+  let laneWarm = false;
+  let pinned = null;          // the lane's account, when it can take this request
+  let prevLaneAccount = null; // where the lane was (cold or unusable)  - preferred if it fits
+  let pinReason = 'assign';   // recorded when the lane lands on a different account
+  // Names/branch lookup reads small files: keep it off this request's path
+  if (sid) setImmediate(() => refreshSessionMeta(sid, body).catch(() => {}));
+  if (affinityOn) {
+    const r = sessionStore.route(sid, agent);
+    if (r) {
+      laneWarm = r.warm;
+      const acct = allAccounts.find(a => a.name === r.account);
+      if (!acct) pinReason = 'account-removed';
+      else if (!isAccountAvailable(acct.token, acct.expiresAt, model)) pinReason = 'unavailable';
+      else if (!r.warm) { pinReason = 'idle'; prevLaneAccount = acct.name; }
+      else pinned = acct;
+    }
+  }
+  const pinLane = (acct, reason) => {
+    if (!affinityOn || !acct) return;
+    noteMove(sid, sessionStore.pin(sid, agent, acct.name, { reason, ttlMs }));
+  };
+  // Retry target outside balance mode: a session follows the active (keychain) account
+  // when it can take the request, else the least-used available account.
+  const pickNext = () => {
+    if (affinityOn) {
+      const active = allAccounts.find(a => a.token === getActiveToken());
+      if (active && !triedTokens.has(active.token) && isAccountAvailable(active.token, active.expiresAt, model)) return active;
+    }
+    return pickBestAccount(triedTokens, model) || pickAnyUntried(triedTokens);
+  };
+  // The keychain account is Claude Code's own login and where new sessions start. Only
+  // move it when the failing account IS the keychain account  - a pinned session failing
+  // elsewhere must not drag every other session along.
+  const failedIsActive = () => !affinityOn || token === getActiveToken();
+
   // Switch accounts in balance mode: release the current slot, then acquire one on a
   // different (untried) account. Returns the new account, or null when exhausted/aborted.
   const balanceSwitch = async (excludeTokens) => {
     releaseHeld();
     // Reload fresh (mirrors pickBestAccount) so post-refresh tokens/expiry are current.
-    const slot = await acquireBalanceSlot(loadAllAccountTokens(), excludeTokens);
+    const slot = await acquireBalanceSlot(loadAllAccountTokens(), excludeTokens, { model });
     if (!slot) return null;
     heldKey = slot.account.name;
     if (clientGone) { releaseHeld(); return null; } // client left during the wait — don't leak
@@ -6131,19 +5876,31 @@ async function handleProxyRequest(clientReq, clientRes) {
   const activeAcct = allAccounts.find(a => a.token === token);
 
   if (balanceMode) {
-    // Spread load across accounts by least in-flight count; no keychain write
-    // (the active pointer stays stable). If no account is available, fall through
-    // with the keychain token — the retry loop's exhausted path handles it.
-    const slot = await acquireBalanceSlot(allAccounts, new Set());
+    // Spread sessions across accounts by load; no keychain write (the active pointer
+    // stays stable). A warm lane waits for a slot on its own account. If no account is
+    // available, fall through with the keychain token  - the retry loop's exhausted path
+    // handles it.
+    let slot = pinned ? await acquireBalanceSlot(allAccounts, new Set(), { model, only: pinned }) : null;
+    if (pinned && !slot) pinReason = 'unavailable';
+    if (!slot) {
+      const prefer = affinityOn ? (prevLaneAccount || sessionStore.home(sid)) : null;
+      slot = await acquireBalanceSlot(allAccounts, new Set(), { model, prefer });
+    }
     if (slot) {
       token = slot.account.token;
       heldKey = slot.account.name;
       if (clientGone) releaseHeld(); // client left during the wait — release the slot
-      const nm = slot.account.label || slot.account.name;
-      if (!activeAcct || slot.account.name !== activeAcct.name) {
-        log('balance', `→ ${nm} (${balanceLimiter.get(slot.account.name)}/${settings.maxConcurrentPerAccount || 8} in-flight)`);
+      if (slot.account !== pinned) {
+        pinLane(slot.account, pinReason);
+        const nm = slot.account.label || slot.account.name;
+        if (!activeAcct || slot.account.name !== activeAcct.name) {
+          log('balance', `→ ${nm} (${balanceLimiter.get(slot.account.name)}/${settings.maxConcurrentPerAccount || 8} in-flight)`);
+        }
       }
     }
+  } else if (settings.autoSwitch && pinned) {
+    // Warm session lane: stay on its account. No strategy run, no keychain write.
+    token = pinned.token;
   } else if (settings.autoSwitch) {
     const { account: strategyPick, rotated } = _pickByStrategy({
       strategy: settings.rotationStrategy || 'conserve',
@@ -6153,9 +5910,21 @@ async function handleProxyRequest(clientReq, clientRes) {
       accounts: allAccounts,
       stateManager: accountState,
       excludeTokens: new Set(),
+      model,
     });
 
-    if (strategyPick) {
+    // The active account only lacks room for this model (e.g. its Fable bucket is used
+    // up): route this request elsewhere, but keep the keychain  - everyone else is fine.
+    const activeOnlyLacksModel = activeAcct && isAccountAvailable(activeAcct.token, activeAcct.expiresAt)
+      && !isAccountAvailable(activeAcct.token, activeAcct.expiresAt, model);
+    if (strategyPick && activeOnlyLacksModel && strategyPick.name !== activeAcct.name) {
+      token = strategyPick.token;
+      const key = `${activeAcct.name}:${model}`;
+      if (Date.now() - (_modelRouteLogged.get(key) || 0) > 5 * 60 * 1000) {
+        _modelRouteLogged.set(key, Date.now());
+        log('proactive', `${activeAcct.label || activeAcct.name} has no ${model} capacity left → ${strategyPick.label || strategyPick.name} for ${model} requests`);
+      }
+    } else if (strategyPick) {
       const oldName = activeAcct?.label || activeAcct?.name || 'none';
       const pickName = strategyPick.label || strategyPick.name;
       const isSameAccount = activeAcct && strategyPick.name === activeAcct.name;
@@ -6186,6 +5955,14 @@ async function handleProxyRequest(clientReq, clientRes) {
       clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: 'No active account in keychain' } }));
       return;
     }
+    pinLane(allAccounts.find(a => a.token === token), pinReason);
+  }
+  if (affinityOn) sessionStore.touch(sid, agent, { ttlMs }); // concurrent requests see the lane warm
+
+  // Artifact links in this session's messages (e.g. the Artifact tool's results)
+  if (sid && body.indexOf('/artifact/') !== -1) {
+    const refs = extractArtifactRefs(body);
+    if (refs.size) noteArtifactRefs(sid, refs, allAccounts.find(a => a.token === token)?.name);
   }
 
   // Guard: never forward a null/empty token (causes 400 with no body)
@@ -6204,6 +5981,7 @@ async function handleProxyRequest(clientReq, clientRes) {
     if (preAcct && preAcct.expiresAt && preAcct.expiresAt < Date.now() && !isDeadlineExceeded()) {
       log('refresh-preflight', `${preAcct.label || preAcct.name}: token expired, refreshing before forwarding...`);
       const preAcctName = preAcct.label || preAcct.name;
+      const wasActive = preAcct.token === getActiveToken();
       try {
         const result = await refreshAccountToken(preAcct.name);
         if (result.ok && result.skipped) {
@@ -6217,10 +5995,10 @@ async function handleProxyRequest(clientReq, clientRes) {
           const refreshed = loadAllAccountTokens().find(a => a.name === preAcct.name);
           if (refreshed) {
             token = refreshed.token;
-            // In balance mode, don't clobber the keychain active pointer — forward
-            // the refreshed token in-memory (heldKey is the stable account name, so
-            // the held slot is unaffected by the token change).
-            if (!balanceMode) {
+            // In balance mode, or for a pinned session on a non-active account, don't
+            // touch the keychain active pointer  - forward the refreshed token in-memory
+            // (heldKey / lane pins are keyed by the stable account name).
+            if (!balanceMode && wasActive) {
               try {
                 await withSwitchLock(() => {
                   writeKeychain(refreshed.creds);
@@ -6259,7 +6037,8 @@ async function handleProxyRequest(clientReq, clientRes) {
     }
 
     triedTokens.add(token);
-    const acct = allAccounts.find(a => a.token === token);
+    // After a refresh the token is new: fall back to a fresh read of the accounts
+    const acct = allAccounts.find(a => a.token === token) || loadAllAccountTokens().find(a => a.token === token);
     const acctName = acct?.label || acct?.name || 'unknown';
 
     let proxyRes;
@@ -6291,12 +6070,10 @@ async function handleProxyRequest(clientReq, clientRes) {
     // Network failure after retry  - try switching to another account before giving up
     if (lastNetworkError) {
       if (settings.autoSwitch || balanceMode) {
-        const next = balanceMode
-          ? await balanceSwitch(triedTokens)
-          : (pickBestAccount(triedTokens) || pickAnyUntried(triedTokens));
+        const next = balanceMode ? await balanceSwitch(triedTokens) : pickNext();
         if (next) {
           log(balanceMode ? 'balance' : 'switch', `  → network error on ${acctName}, switching to ${next.label || next.name}`);
-          if (!balanceMode) {
+          if (!balanceMode && failedIsActive()) {
             try {
               await withSwitchLock(() => {
                 writeKeychain(next.creds);
@@ -6307,6 +6084,7 @@ async function handleProxyRequest(clientReq, clientRes) {
             }
           }
           token = next.token;
+          pinLane(next, 'network-error');
           logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: 'network-error' });
           continue;
         }
@@ -6323,23 +6101,45 @@ async function handleProxyRequest(clientReq, clientRes) {
     // ── 429: Rate limited → auto-switch (if enabled) ──
     if (status === 429) {
       const retryAfter = parseInt(proxyRes.headers['retry-after'] || '0', 10);
+      // Unified status "rejected" = a usage window is used up (5h, weekly, or this model's
+      // bucket) until its reset. Without it, a short retry-after is a transient burst limit
+      // ("Server is temporarily limiting requests").
+      const rl = parseRateLimitHeaders(proxyRes.headers);
+      const transient = rl.status !== 'rejected' && retryAfter < 60;
+      // Returns { what, modelOnly }: which limit hit, and whether only this model's bucket did.
+      const markLimit = () => {
+        if (rl.status === 'rejected') {
+          const r = markAccountRejected(token, acctName, proxyRes.headers);
+          return { what: rl.claim || 'limit', modelOnly: r.scope === 'model' };
+        }
+        markAccountLimited(token, acctName, retryAfter);
+        return { what: 'retry-after', modelOnly: false };
+      };
 
       // ── Balance mode: absorb the 429 instead of surfacing it ──
-      // This is the "Server is temporarily limiting requests" error. Sideline this
-      // account briefly and retry on another, so the client rarely sees the 429.
       if (balanceMode) {
+        // A warm session lane hitting a short burst: wait it out once on the same account
+        // rather than moving the conversation and rebuilding its cache elsewhere.
+        const waitSec = Math.max(retryAfter, 1);
+        if (transient && affinityOn && laneWarm && !_sameAccountRetried && waitSec <= 10 && Date.now() + waitSec * 1000 < deadline) {
+          _sameAccountRetried = true;
+          await drainResponse(proxyRes);
+          log('balance', `${acctName} → 429 transient — waiting ${waitSec}s on the same account (session affinity)`);
+          await new Promise(r => setTimeout(r, waitSec * 1000));
+          triedTokens.delete(token);
+          continue;
+        }
         const coolName = heldKey || acct?.name;
-        const transient = retryAfter < 60;
         if (transient) {
           // Transient burst — lightweight backoff, no global rate-limit state pollution.
           balanceCoolDown(coolName, Math.max(retryAfter, BALANCE_MIN_COOLDOWN_SEC));
           logEvent('balance-cooldown', { account: acctName, retryAfter });
           log('balance', `${acctName} → 429 transient (retry-after ${retryAfter}s) — backing off, switching account`);
         } else {
-          // Genuine rate limit — mark limited so the UI/telemetry reflect it.
-          markAccountLimited(token, acctName, retryAfter);
-          logEvent('rate-limited', { account: acctName, retryAfter });
-          log('balance', `${acctName} → 429 rate limited (retry-after ${retryAfter}s) — switching account`);
+          // Genuine rate limit — mark limited so the pickers/UI/telemetry reflect it.
+          const { what } = markLimit();
+          logEvent('rate-limited', { account: acctName, retryAfter, limit: what });
+          log('balance', `${acctName} → 429 ${what} used up — switching account`);
         }
         // Capture the upstream 429 before draining so we can replay it verbatim if
         // no other account is free (preserves retry-after for Claude Code's own retry).
@@ -6349,6 +6149,7 @@ async function handleProxyRequest(clientReq, clientRes) {
         const next = await balanceSwitch(triedTokens);
         if (next) {
           token = next.token;
+          pinLane(next, transient ? '429-burst' : '429-limit');
           continue;
         }
         if (transient) {
@@ -6375,18 +6176,17 @@ async function handleProxyRequest(clientReq, clientRes) {
       }
 
       // Transient burst 429s (short retry-after) are normal — Claude Code
-      // retries on its own.  Pass through silently without noisy logging,
-      // marking the account as limited, or sending notifications.
-      const isTransient = retryAfter < 60;
-
-      if (!isTransient) {
-        markAccountLimited(token, acctName, retryAfter);
-        logEvent('rate-limited', { account: acctName, retryAfter });
+      // retries on its own (on the same pinned account).  Pass through silently
+      // without noisy logging, marking the account as limited, or sending notifications.
+      let what = 'transient', modelOnly = false;
+      if (!transient) {
+        ({ what, modelOnly } = markLimit());
+        logEvent('rate-limited', { account: acctName, retryAfter, limit: what });
       }
-      log('switch', `${acctName} → 429 ${isTransient ? 'transient' : 'rate limited'} (retry-after: ${retryAfter}s)`);
+      log('switch', `${acctName} → 429 ${transient ? 'transient' : what + ' used up'} (retry-after: ${retryAfter}s)`);
 
-      if (!settings.autoSwitch || isTransient) {
-        if (!isTransient) log('switch', '  → auto-switch OFF, returning 429 as-is');
+      if (!settings.autoSwitch || transient) {
+        if (!transient) log('switch', '  → auto-switch OFF, returning 429 as-is');
         clientRes.writeHead(proxyRes.statusCode, proxyRes.headers);
         proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
         clientRes.on('close', () => { proxyRes.destroy(); });
@@ -6397,19 +6197,23 @@ async function handleProxyRequest(clientReq, clientRes) {
       await drainResponse(proxyRes);
 
       // Try next best account
-      const next = pickBestAccount(triedTokens) || pickAnyUntried(triedTokens);
+      const next = pickNext();
       if (next) {
         log('switch', `  → switching to ${next.label || next.name}`);
-        try {
-          await withSwitchLock(() => {
-            writeKeychain(next.creds);
-            invalidateTokenCache();
-            invalidateAccountsCache();
-          });
-        } catch (e) {
-          log('warn', `Keychain write failed during 429 switch: ${e.message}`);
+        // A model-only limit (Fable bucket) leaves the account fine for everyone else.
+        if (failedIsActive() && !modelOnly) {
+          try {
+            await withSwitchLock(() => {
+              writeKeychain(next.creds);
+              invalidateTokenCache();
+              invalidateAccountsCache();
+            });
+          } catch (e) {
+            log('warn', `Keychain write failed during 429 switch: ${e.message}`);
+          }
         }
         token = next.token;
+        pinLane(next, '429-limit');
         logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '429' });
         notify('Account Switched', `${acctName} rate-limited → ${next.label || next.name}`);
         continue;
@@ -6476,12 +6280,10 @@ async function handleProxyRequest(clientReq, clientRes) {
         return;
       }
 
-      const next = balanceMode
-        ? await balanceSwitch(triedTokens)
-        : (pickBestAccount(triedTokens) || pickAnyUntried(triedTokens));
+      const next = balanceMode ? await balanceSwitch(triedTokens) : pickNext();
       if (next) {
         log(balanceMode ? 'balance' : 'switch', `  → switching to ${next.label || next.name}`);
-        if (!balanceMode) {
+        if (!balanceMode && failedIsActive()) {
           try {
             await withSwitchLock(() => {
               writeKeychain(next.creds);
@@ -6492,6 +6294,7 @@ async function handleProxyRequest(clientReq, clientRes) {
           }
         }
         token = next.token;
+        pinLane(next, '401');
         logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '401' });
         notify('Account Switched', `${acctName} token expired → ${next.label || next.name}`);
         continue;
@@ -6656,12 +6459,10 @@ async function handleProxyRequest(clientReq, clientRes) {
 
       // ── Strategy 3: Switch to another account ──
       if (settings.autoSwitch || balanceMode) {
-        const next = balanceMode
-          ? await balanceSwitch(triedTokens)
-          : (pickBestAccount(triedTokens) || pickAnyUntried(triedTokens));
+        const next = balanceMode ? await balanceSwitch(triedTokens) : pickNext();
         if (next) {
           log(balanceMode ? 'balance' : 'switch', `  → 400 on ${acctName}, switching to ${next.label || next.name}`);
-          if (!balanceMode) {
+          if (!balanceMode && failedIsActive()) {
             try {
               await withSwitchLock(() => {
                 writeKeychain(next.creds);
@@ -6672,6 +6473,7 @@ async function handleProxyRequest(clientReq, clientRes) {
             }
           }
           token = next.token;
+          pinLane(next, '400');
           logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '400-error' });
           notify('Account Switched', `${acctName} → 400 error → ${next.label || next.name}`);
           continue;
@@ -6786,39 +6588,19 @@ async function handleProxyRequest(clientReq, clientRes) {
     proxyRes.on('error', () => { try { clientRes.end(); } catch {} });
     clientRes.on('close', () => { proxyRes.destroy(); });
 
-    // [BETA] Extract token usage from SSE streaming responses
+    // Token usage: read `usage` from Messages responses as they stream through
     const contentType = proxyRes.headers['content-type'] || '';
-    if (contentType.includes('text/event-stream')) {
-      const extractor = createUsageExtractor();
-      proxyRes.pipe(extractor).pipe(clientRes);
-      await new Promise(resolve => {
-        let done = false;
-        const finish = () => { if (!done) { done = true; resolve(); } };
-        extractor.on('end', finish);
-        extractor.on('error', finish);
-        clientRes.on('close', finish);
-      });
-      recordUsage(extractor.getUsage(), acctName);
-      // [BETA] Session Monitor — extract timeline from completed request
-      setImmediate(() => {
-        try {
-          if (!settings.sessionMonitor) return;
-          if (body.length > SESSION_BODY_MAX) {
-            // For oversized bodies, extract cwd via regex on raw string to keep session alive
-            const rawPrefix = body.toString('utf8', 0, Math.min(body.length, 4096));
-            const cwdMatch = rawPrefix.match(/working directory:\s*(.+)/i);
-            if (cwdMatch) {
-              const cwd = cwdMatch[1].trim().split('\\n')[0].trim();
-              const sid = deriveSessionId(cwd, acctName);
-              const s = monitoredSessions.get(sid);
-              if (s) s.lastActiveAt = Date.now();
-            }
-            return;
-          }
-          const bodyObj = JSON.parse(body.toString('utf8'));
-          updateSessionTimeline(bodyObj, acctName, extractor.getUsage(), token);
-        } catch {}
-      });
+    const isMessages = clientReq.method === 'POST' && /^\/v1\/messages(\?|$)/.test(clientReq.url || '');
+    const tapKind = !isMessages ? null
+      : contentType.includes('text/event-stream') ? 'sse'
+      : contentType.includes('application/json') ? 'json' : null;
+    if (tapKind) {
+      const tap = createUsageTap(tapKind);
+      await pipeAndWait(proxyRes, tap, clientRes);
+      try {
+        const r = tap.result();
+        if (r?.usage) recordProxyUsage({ sid, agent, acct, model: r.model || model, usage: r.usage, ttlMs });
+      } catch (e) { log('error', `Usage accounting failed: ${e.message}`); }
     } else {
       await pipeAndWait(proxyRes, clientRes);
     }
@@ -6879,11 +6661,10 @@ function getProxyStatus() {
 
 function shutdown(signal) {
   log('info', `Received ${signal}, shutting down...`);
-  // Persist all active monitored sessions before exit
-  for (const [id, session] of monitoredSessions) {
-    persistCompletedSession(session);
-    monitoredSessions.delete(id);
-  }
+  // Persist usage rollups, session pins and artifact links before exit
+  try { flushUsage(); } catch {}
+  try { saveSessions(true); } catch {}
+  if (_artifactLinksDirty) try { saveArtifacts(); } catch {}
   proxyServer.close();
   server.close();
   process.exit(0);

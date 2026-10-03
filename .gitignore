@@ -9,6 +9,11 @@ account-state.json
 utilization-history.json
 probe-log.json
 token-usage.json
+token-usage.imported.json
+session-history.json
+sessions.json
+artifacts.json
+usage/
 .dashboard.pid
 
 # Logs

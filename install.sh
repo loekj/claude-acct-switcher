@@ -131,11 +131,15 @@ else
   echo '    # END claude-account-switcher'
 fi
 
-# ── [BETA] Install token tracking hooks ──
+# ── Remove hooks older versions installed (no longer needed) ──
 
 if [[ -f "$INSTALL_DIR/install-hooks.sh" ]]; then
   source "$INSTALL_DIR/install-hooks.sh"
-  install_beta_hooks && echo -e "  ${GREEN}✓${NC} [BETA] Token tracking hooks installed" || true
+  if has_legacy_hooks; then
+    remove_legacy_hooks && echo -e "  ${GREEN}✓${NC} Removed old token-tracking hooks" || true
+  else
+    remove_legacy_hooks 2>/dev/null || true
+  fi
 fi
 
 echo ""

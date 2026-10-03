@@ -55,8 +55,9 @@ describe('/api/refresh  - mock OAuth server', () => {
       let body = '';
       req.on('data', c => body += c);
       req.on('end', () => {
-        const params = new URLSearchParams(body);
-        const refreshToken = params.get('refresh_token');
+        // buildRefreshRequestBody sends JSON
+        let refreshToken = null;
+        try { refreshToken = JSON.parse(body).refresh_token; } catch {}
 
         if (refreshToken === 'valid-rt') {
           res.writeHead(200, { 'Content-Type': 'application/json' });
@@ -143,7 +144,7 @@ describe('Refresh flow end-to-end (pure functions)', () => {
   it('full refresh cycle: build request → parse response → compute expiry → build creds', () => {
     // 1. Build request
     const body = buildRefreshRequestBody('old-refresh-token');
-    assert.ok(body.includes('refresh_token=old-refresh-token'));
+    assert.equal(JSON.parse(body).refresh_token, 'old-refresh-token');
 
     // 2. Simulate successful response
     const responseBody = JSON.stringify({
