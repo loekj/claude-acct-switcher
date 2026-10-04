@@ -106,6 +106,11 @@ const DEFAULT_SETTINGS = {
   maxConcurrentPerAccount: 8, // balance mode: max concurrent in-flight requests per account
   balanceWaitMs: 10000,       // balance mode: wait for a freed slot before overflowing
   sessionAffinity: true,      // keep each Claude Code session on one account while its prompt cache is warm
+  sessionHistory: false,      // save sessions to history/ (browse, search, continue later); off until turned on
+  historyRetentionDays: 0,    // delete saved sessions this old (0 = keep forever)
+  historyExclude: [],         // folders whose sessions are never saved
+  claudeCommand: 'claude',    // how `vdm history continue|resume` and copied commands start Claude Code
+  hotTokensPer5m: 25_000_000, // account charts: above this many tokens per 5 minutes the line turns red
 };
 
 // Settings of features removed in v4 (commit token trailers, AI session monitor).
@@ -129,7 +134,33 @@ function clampSettings(s) {
   const n = (v, def, lo, hi) => (typeof v === 'number' && isFinite(v) ? Math.min(Math.max(v, lo), hi) : def);
   s.maxConcurrentPerAccount = Math.floor(n(s.maxConcurrentPerAccount, 8, 1, 50));
   s.balanceWaitMs = n(s.balanceWaitMs, 10000, 0, 30000);
+  s.hotTokensPer5m = Math.round(n(s.hotTokensPer5m, 25_000_000, 100_000, 10_000_000_000));
+  s.sessionHistory = s.sessionHistory === true;
+  s.historyRetentionDays = Math.floor(n(s.historyRetentionDays, 0, 0, 3650));
+  const excludeAsked = (typeof s.historyExclude === 'string' ? s.historyExclude.split(/\r?\n/) : Array.isArray(s.historyExclude) ? s.historyExclude : [])
+    .filter(x => typeof x === 'string' && x.trim());
+  s.historyExclude = cleanExcludeList(s.historyExclude);
+  if (s.historyExclude.length < excludeAsked.length) {
+    console.error(`[config] historyExclude: ignored ${excludeAsked.length - s.historyExclude.length} folder(s) that are not full paths (use / or ~/)`);
+  }
+  s.claudeCommand = cleanClaudeCommand(s.claudeCommand) || 'claude';
   return s;
+}
+
+/** Folders never saved by session history: `~` expanded, only absolute paths. */
+function cleanExcludeList(v) {
+  if (typeof v === 'string') v = v.split(/\r?\n/);
+  if (!Array.isArray(v)) return [];
+  return v.filter(x => typeof x === 'string' && x.trim())
+    .map(x => x.trim().replace(/^~(?=\/|$)/, process.env.HOME || '~').replace(/\/+$/, ''))
+    .filter(x => x.startsWith('/'))
+    .slice(0, 50);
+}
+
+/** A launch command for Claude Code: one line, not empty, not huge. */
+function cleanClaudeCommand(v) {
+  const c = typeof v === 'string' ? v.trim() : '';
+  return c && c.length <= 300 && !/[\r\n\0]/.test(c) ? c : '';
 }
 
 function saveSettings(settings) {
@@ -210,7 +241,10 @@ function writeKeychain(creds) {
 }
 
 import https from 'node:https';
-import { execFile } from 'node:child_process';
+import { execFile, fork } from 'node:child_process';
+import { setPriority } from 'node:os';
+import { createReadStream } from 'node:fs';
+import zlib from 'node:zlib';
 import http from 'node:http';
 import {
   getFingerprint,
@@ -256,6 +290,11 @@ import {
   createPerAccountLock,
   ROTATION_STRATEGIES,
   ROTATION_INTERVALS,
+  createThroughputStore,
+  throughputFromRollups,
+  throughputLine,
+  totalTokens,
+  THROUGHPUT_BUCKET_MS,
   isLoopbackAddr,
   isLocalHost,
   originAllowed,
@@ -397,6 +436,7 @@ async function autoDiscoverAccount() {
         try { savedEmail = (await readFile(join(ACCOUNTS_DIR, `${savedName}.label`), 'utf8')).trim(); } catch {}
         if (savedEmail === email) {
           writeFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(creds, null, 2));
+          rememberAccountEmail(savedName, email);
           // Migrate persisted state / history from old fingerprint to new
           const oldFp = getFingerprint(saved);
           migrateAccountState(saved.claudeAiOauth?.accessToken, token, oldFp, fp, savedName);
@@ -429,6 +469,7 @@ async function autoDiscoverAccount() {
 
   if (email) {
     writeFileSync(join(ACCOUNTS_DIR, `${name}.label`), email);
+    writeFileSync(join(ACCOUNTS_DIR, `${name}.email`), email);
   }
 
   const displayName = email || name;
@@ -469,7 +510,6 @@ function recordProbe() { probeTracker.record(); saveProbeLogToDisk(); }
 function getProbeStats() { return probeTracker.getStats(); }
 
 const utilizationHistory = createUtilizationHistory(); // 24h window, ~2 min intervals
-const weeklyHistory = createUtilizationHistory(7 * 24 * 60 * 60 * 1000, 15 * 60 * 1000); // 7d window, ~15 min intervals
 
 const HISTORY_FILE = join(__dirname, 'utilization-history.json');
 
@@ -482,21 +522,38 @@ function loadHistoryFromDisk() {
         utilizationHistory.load(fp, entries);
       }
     }
-    if (data.weekly) {
-      for (const [fp, entries] of Object.entries(data.weekly)) {
-        weeklyHistory.load(fp, entries);
-      }
-    }
+
   } catch {}
 }
 
-function saveHistoryToDisk() {
+function writeHistoryFile() {
+  _historyDirty = false;
   try {
-    writeFileSync(HISTORY_FILE, JSON.stringify({ fiveH: utilizationHistory.toJSON(), weekly: weeklyHistory.toJSON() }));
+    writeFileSync(HISTORY_FILE + '.tmp', JSON.stringify({ v: 2, fiveH: utilizationHistory.toJSON() }));
+    renameSync(HISTORY_FILE + '.tmp', HISTORY_FILE);
   } catch {}
 }
+
+// Usage history changes on every response: mark it and write at most every 30 s (and on exit).
+let _historyDirty = false;
+function saveHistoryToDisk() { _historyDirty = true; }
+setInterval(() => { if (_historyDirty) writeHistoryFile(); }, 30_000).unref?.();
 
 loadHistoryFromDisk();
+
+// Tokens per account (by email) in 5-minute buckets by model family (account-card charts), kept 26 h.
+const THROUGHPUT_FILE = join(__dirname, 'throughput.json');
+const throughput = createThroughputStore();
+try { throughput.load(JSON.parse(readFileSync(THROUGHPUT_FILE, 'utf8'))); } catch { /* none yet */ }
+let _throughputDirty = false;
+function writeThroughputFile() {
+  _throughputDirty = false;
+  try {
+    writeFileSync(THROUGHPUT_FILE + '.tmp', JSON.stringify(throughput.toJSON()));
+    renameSync(THROUGHPUT_FILE + '.tmp', THROUGHPUT_FILE);
+  } catch (e) { log('error', `Failed to save throughput.json: ${e.message}`); }
+}
+setInterval(() => { if (_throughputDirty) writeThroughputFile(); }, 30_000).unref?.();
 
 // ── macOS desktop notifications ──
 
@@ -693,6 +750,7 @@ async function loadProfiles() {
       let email = '';
       if (oauth.accessToken) {
         email = await getEmailForToken(oauth.accessToken, fp);
+        rememberAccountEmail(name, email);
       }
       if (!email) {
         try { email = (await readFile(join(ACCOUNTS_DIR, `${name}.label`), 'utf8')).trim(); } catch {}
@@ -767,6 +825,7 @@ async function loadProfiles() {
       profiles.push({
         name,
         label: email || name,
+        id: (loadAllAccountTokens().find(a => a.name === name) || {}).id || email || name,
         subscriptionType: subType,
         rateLimitTier: rlTier,
         expiresAt,
@@ -802,6 +861,7 @@ async function loadProfiles() {
       try {
         unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.json`));
         try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.label`)); } catch {}
+        try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.email`)); } catch {}
         sessionStore.renameAccount(loser.name, keepNew ? p.name : prevP.name);
         markSessionsDirty();
         log('dedup', `Removed duplicate account "${loser.name}" (same email as "${keepNew ? p.name : prevP.name}")`);
@@ -839,20 +899,21 @@ async function loadStats() {
 async function handleAPI(req, res) {
   const url = new URL(req.url, `http://localhost:${PORT}`);
 
+  if (url.pathname === '/api/history' || url.pathname.startsWith('/api/history/')) return handleHistoryAPI(req, res, url);
+
   if (url.pathname === '/api/profiles' && req.method === 'GET') {
     const profiles = await loadProfiles();
     // Attach utilization history + velocity to each profile
     for (const p of profiles) {
-      p.utilizationHistory = utilizationHistory.getHistory(p.fingerprint);
-      p.weeklyHistory = weeklyHistory.getHistory(p.fingerprint);
-      p.velocity5h = utilizationHistory.getVelocity(p.fingerprint);
-      p.minutesToLimit = utilizationHistory.predictMinutesToLimit(p.fingerprint);
+      p.throughput = accountThroughput(p);
+      p.velocity5h = utilizationHistory.getVelocity(p.id);
+      p.minutesToLimit = utilizationHistory.predictMinutesToLimit(p.id);
       p.inflight = balanceLimiter.get(p.name); // balance-mode concurrent in-flight (0 in other modes)
       p.sessions = accountSessions(p.name);
       p.artifactCount = (artifactIndex.accounts[p.name]?.frames || []).length;
       p.blocked = blockedInfo(p.name);
       p.modelBlocks = modelBlocks(p.name);
-      const c30 = cacheReport30d().byAccount[p.label] || cacheReport30d().byAccount[p.name];
+      const c30 = cacheReport30d().byAccount[p.id];
       p.cache30d = c30 ? { hit: c30.hit, rebuild: c30.rebuild } : null;
     }
     const stats = await loadStats();
@@ -865,7 +926,7 @@ async function handleAPI(req, res) {
     json(res, {
       profiles, stats, probeStats, allExhausted, earliestReset,
       rotationStrategy: settings.rotationStrategy, balanceCap: settings.maxConcurrentPerAccount || 8,
-      sessionAffinity: settings.sessionAffinity !== false, queueStats: getQueueStats(),
+      sessionAffinity: settings.sessionAffinity !== false, sessionHistory: settings.sessionHistory === true, hotTokensPer5m: settings.hotTokensPer5m, queueStats: getQueueStats(),
     });
     return true;
   }
@@ -933,6 +994,7 @@ async function handleAPI(req, res) {
       // Delete account files
       await unlink(file);
       try { await unlink(join(ACCOUNTS_DIR, `${name}.label`)); } catch {}
+      try { await unlink(join(ACCOUNTS_DIR, `${name}.email`)); } catch {}
       sessionStore.unpinAccount(name);
       markSessionsDirty();
       logActivity('account-removed', { name });
@@ -984,13 +1046,28 @@ async function handleAPI(req, res) {
   }
 
   if (url.pathname === '/api/settings' && req.method === 'GET') {
-    json(res, settings);
+    json(res, { ...settings, claudeCommandEnv: process.env.VDM_CLAUDE_CMD || null });
     return true;
   }
 
   if (url.pathname === '/api/settings' && req.method === 'POST') {
     const body = await readBody(req);
     const patch = JSON.parse(body);
+    if (typeof patch.historyExclude === 'string') patch.historyExclude = patch.historyExclude.split(/\r?\n/);
+    // Refusals first, so a rejected request changes nothing
+    if (Array.isArray(patch.historyExclude) &&
+        cleanExcludeList(patch.historyExclude).length !== patch.historyExclude.filter(x => typeof x === 'string' && x.trim()).length) {
+      json(res, { error: 'Use full folder paths (starting with / or ~/)' }, 400);
+      return true;
+    }
+    if (patch.claudeCommand !== undefined && !isLoopbackAddr(req.socket.remoteAddress)) {
+      json(res, { error: 'Only this computer can change the launch command' }, 403);
+      return true;
+    }
+    if (patch.claudeCommand !== undefined && !cleanClaudeCommand(patch.claudeCommand)) {
+      json(res, { error: 'Launch command must be one line (max 300 characters)' }, 400);
+      return true;
+    }
     if (typeof patch.autoSwitch === 'boolean') settings.autoSwitch = patch.autoSwitch;
     if (typeof patch.proxyEnabled === 'boolean') {
       const wasEnabled = settings.proxyEnabled;
@@ -1038,7 +1115,18 @@ async function handleAPI(req, res) {
       settings.balanceWaitMs = patch.balanceWaitMs;
     }
     if (typeof patch.sessionAffinity === 'boolean') settings.sessionAffinity = patch.sessionAffinity;
+    if (typeof patch.hotTokensPer5m === 'number' && patch.hotTokensPer5m >= 100_000 && patch.hotTokensPer5m <= 10_000_000_000) {
+      settings.hotTokensPer5m = Math.round(patch.hotTokensPer5m);
+    }
+    const historyBefore = JSON.stringify(historyConfig());
+    if (typeof patch.sessionHistory === 'boolean') settings.sessionHistory = patch.sessionHistory;
+    if (typeof patch.historyRetentionDays === 'number' && patch.historyRetentionDays >= 0 && patch.historyRetentionDays <= 3650) {
+      settings.historyRetentionDays = Math.floor(patch.historyRetentionDays);
+    }
+    if (Array.isArray(patch.historyExclude)) settings.historyExclude = cleanExcludeList(patch.historyExclude);
+    if (patch.claudeCommand !== undefined) settings.claudeCommand = cleanClaudeCommand(patch.claudeCommand);
     saveSettings(settings);
+    if (JSON.stringify(historyConfig()) !== historyBefore) applyHistorySettings();
     logActivity('settings-changed', {
       autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
       rotationStrategy: settings.rotationStrategy, rotationIntervalMin: settings.rotationIntervalMin,
@@ -1365,6 +1453,10 @@ function renderHTML() {
   }
   .tab-content { display: none; }
   .tab-content.active { display: block; }
+  @media (max-width: 720px) {
+    .tabs { overflow-x: auto; scrollbar-width: none; }
+    .tab { flex: 0 0 auto; padding: 0.5rem 0.75rem; white-space: nowrap; }
+  }
 
   /* ── Account cards ── */
   .accounts { display: flex; flex-direction: column; gap: 0.625rem; }
@@ -1688,6 +1780,110 @@ function renderHTML() {
   .art-meta { font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
   .art-err { font-size: 0.75rem; font-weight: 500; color: var(--red); }
 
+
+  /* ── History ── */
+  .hist-toolbar { display: flex; gap: 0.5rem; align-items: center; margin-bottom: 0.625rem; flex-wrap: wrap; }
+  .hist-search { flex: 1 1 100%; min-width: 0; cursor: text; }
+  .hist-check { display: inline-flex; align-items: center; gap: 0.375rem; font-size: 0.8125rem; color: var(--muted); cursor: pointer; }
+  .hist-status { font-size: 0.8125rem; color: var(--muted); margin-bottom: 0.75rem; display: flex; gap: 0.5rem; flex-wrap: wrap; align-items: center; }
+  .hist-status b { color: var(--foreground); font-weight: 600; }
+  .hist-status .warn { color: hsl(32 80% 38%); }
+  .hist-progress { display: inline-block; width: 120px; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; vertical-align: middle; }
+  .hist-progress > div { height: 100%; background: var(--primary); transition: width 0.4s; }
+  .hist-day { font-size: 0.6875rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 1rem 0 0.375rem; }
+  .hist-day:first-child { margin-top: 0; }
+  .hist-row {
+    background: var(--card); border: 1px solid var(--border); border-radius: var(--radius-sm);
+    padding: 0.625rem 0.875rem; margin-bottom: 0.375rem; cursor: pointer; transition: border-color 0.15s, box-shadow 0.15s;
+  }
+  .hist-row:hover, .hist-row:focus-visible { border-color: var(--primary); outline: none; }
+  .hist-row.sel { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
+  .hist-top { display: flex; align-items: center; gap: 0.5rem; }
+  .hist-title { flex: 1; min-width: 0; font-weight: 600; font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hist-cost { font-size: 0.75rem; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
+  .hist-sub { font-size: 0.75rem; color: var(--muted); margin-top: 0.125rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hist-text { font-size: 0.8125rem; margin-top: 0.375rem; line-height: 1.45; color: var(--foreground); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word; }
+  .hist-last { font-size: 0.75rem; color: var(--muted); margin-top: 0.25rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hist-text mark, .hm mark { background: var(--yellow-soft); color: inherit; border-radius: 2px; padding: 0 1px; box-shadow: 0 0 0 1px var(--yellow-border); }
+  .hist-chips { display: flex; gap: 0.25rem; flex-wrap: wrap; margin-top: 0.375rem; }
+  .hist-chip { font-size: 0.6875rem; padding: 0.0625rem 0.4375rem; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); background: var(--bg); white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
+  .hist-chip.acct { color: var(--primary); border-color: var(--blue-border); background: var(--blue-soft); }
+  .pill-saved { color: hsl(32 80% 38%); background: var(--yellow-soft); border: 1px solid var(--yellow-border); }
+  .pill-soft { color: var(--muted); background: var(--bg); border: 1px solid var(--border); }
+  .hist-more { display: block; margin: 0.75rem auto 0; }
+  .hist-off { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); box-shadow: var(--shadow); padding: 1.5rem 1.75rem; max-width: 640px; }
+  .hist-off h3 { margin: 0 0 0.5rem; font-size: 1.0625rem; }
+  .hist-off ul { margin: 0.5rem 0 1rem 1.125rem; padding: 0; font-size: 0.875rem; line-height: 1.6; color: var(--foreground); }
+  .hist-off p { font-size: 0.8125rem; color: var(--muted); line-height: 1.55; margin: 0.5rem 0; }
+  .hbtn {
+    font-family: inherit; font-size: 0.8125rem; font-weight: 500; padding: 0.4375rem 0.875rem; border-radius: var(--radius-sm);
+    border: 1px solid var(--border); background: var(--card); color: var(--foreground); cursor: pointer; text-decoration: none; display: inline-flex; align-items: center; gap: 0.375rem;
+  }
+  .hbtn:hover { border-color: var(--primary); color: var(--primary); }
+  .hbtn:disabled { opacity: 0.5; cursor: not-allowed; }
+  .hbtn-primary { background: var(--primary); border-color: var(--primary); color: #fff; }
+  .hbtn-primary:hover { color: #fff; filter: brightness(1.08); }
+  .hbtn-danger { color: var(--red); }
+  .hbtn-danger:hover { border-color: var(--red); color: var(--red); background: var(--red-soft); }
+  .hist-backdrop { position: fixed; inset: 0; background: rgba(15, 23, 42, 0.28); z-index: 60; display: none; }
+  .hist-backdrop.open { display: block; }
+  .hist-drawer {
+    position: fixed; top: 0; right: 0; bottom: 0; width: min(760px, 100vw); background: var(--bg); z-index: 61;
+    box-shadow: var(--shadow-lg); transform: translateX(105%); transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1);
+    display: flex; flex-direction: column;
+  }
+  .hist-drawer:not(.open) { visibility: hidden; transition: transform 0.22s cubic-bezier(0.4, 0, 0.2, 1), visibility 0s linear 0.22s; }
+  .hist-drawer.open { transform: none; }
+  .hd-scroll { overflow-y: auto; overflow-x: hidden; padding: 1.25rem 1.5rem 2rem; flex: 1; min-width: 0; }
+  .hd-scroll > * { min-width: 0; }
+  .hd-head { display: flex; align-items: flex-start; gap: 0.75rem; }
+  .hd-title { flex: 1; min-width: 0; font-size: 1.125rem; font-weight: 700; line-height: 1.3; word-break: break-word; }
+  .hd-close { border: none; background: none; font-size: 1.5rem; line-height: 1; color: var(--muted); cursor: pointer; padding: 0 0.25rem; }
+  .hd-close:hover { color: var(--foreground); }
+  .hd-sub { font-size: 0.8125rem; color: var(--muted); margin-top: 0.25rem; display: flex; gap: 0.375rem; flex-wrap: wrap; align-items: center; }
+  .hd-id { font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 0.75rem; }
+  .hd-actions { display: grid; grid-template-columns: minmax(0, 1fr) minmax(0, 1fr); gap: 0.75rem; margin-top: 1rem; }
+  .hd-act { background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 0.875rem 1rem; display: flex; flex-direction: column; gap: 0.5rem; min-width: 0; }
+  .hd-act.main { border-color: var(--blue-border); box-shadow: 0 0 0 3px var(--primary-soft); }
+  .hd-act-title { font-weight: 600; font-size: 0.875rem; }
+  .hd-act-desc { font-size: 0.75rem; color: var(--muted); line-height: 1.5; }
+  .hd-btns { display: flex; gap: 0.375rem; flex-wrap: wrap; margin-top: auto; }
+  .hd-cmd { display: block; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 0.6875rem; background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 0.3125rem 0.5rem; color: var(--muted); overflow-x: auto; white-space: nowrap; }
+  .hd-warn { font-size: 0.75rem; color: hsl(32 80% 38%); background: var(--yellow-soft); border: 1px solid var(--yellow-border); border-radius: 6px; padding: 0.375rem 0.5rem; line-height: 1.45; word-break: break-word; }
+  .hd-facts { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 0.3125rem 1rem; font-size: 0.8125rem; margin-top: 1.125rem; background: var(--card); border: 1px solid var(--border); border-radius: var(--radius); padding: 0.875rem 1rem; }
+  .hd-facts dt { color: var(--muted); }
+  .hd-facts dd { margin: 0; min-width: 0; word-break: break-word; }
+  .hd-files { font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 0.75rem; line-height: 1.6; }
+  .hd-conv-head { display: flex; align-items: center; gap: 0.5rem; margin: 1.25rem 0 0.5rem; }
+  .hd-conv-head b { flex: 1; font-size: 0.875rem; }
+  .hd-conv-head select { max-width: 60%; }
+  .hm { margin-bottom: 0.5rem; border-radius: var(--radius-sm); padding: 0.5rem 0.75rem; font-size: 0.8125rem; line-height: 1.5; scroll-margin-top: 1rem; }
+  .hm-who { font-size: 0.6875rem; font-weight: 600; color: var(--muted); margin-bottom: 0.125rem; text-transform: uppercase; letter-spacing: 0.04em; }
+  .hm-user { background: var(--blue-soft); border: 1px solid var(--blue-border); }
+  .hm-claude { background: var(--card); border: 1px solid var(--border); }
+  .hm-text { white-space: pre-wrap; word-break: break-word; }
+  .hm-text.clamp { max-height: 16em; overflow: hidden; -webkit-mask-image: linear-gradient(180deg, #000 70%, transparent); mask-image: linear-gradient(180deg, #000 70%, transparent); }
+  .hm-recap { font-style: italic; color: var(--muted); border-left: 3px solid var(--border); border-radius: 0; padding: 0.25rem 0.75rem; }
+  .hm-cmd { font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 0.75rem; color: var(--muted); padding: 0.125rem 0.75rem; }
+  .hm-tools { margin: 0 0 0.5rem; font-size: 0.75rem; color: var(--muted); }
+  .hm-tools summary { cursor: pointer; padding: 0.125rem 0.75rem; list-style: none; }
+  .hm-tools summary::before { content: '▸ '; }
+  .hm-tools[open] summary::before { content: '▾ '; }
+  .hm-tool { font-family: 'SF Mono', Monaco, Consolas, monospace; padding: 0.0625rem 0.75rem 0.0625rem 1.75rem; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .hm-compact { margin: 0.75rem 0; border: 1px dashed var(--purple-border); background: var(--purple-soft); border-radius: var(--radius-sm); font-size: 0.8125rem; }
+  .hm-compact summary { cursor: pointer; padding: 0.375rem 0.75rem; color: var(--purple); font-weight: 600; font-size: 0.75rem; }
+  .hm-compact .hm-text { padding: 0 0.75rem 0.5rem; }
+  .hm.focus { box-shadow: 0 0 0 2px var(--yellow); }
+  .hm-pager { display: flex; justify-content: center; margin: 0.5rem 0; }
+  .hd-foot { display: flex; gap: 0.5rem; justify-content: space-between; margin-top: 1.25rem; padding-top: 1rem; border-top: 1px solid var(--border); flex-wrap: wrap; }
+  .hd-input { width: 100%; font-family: 'SF Mono', Monaco, Consolas, monospace; font-size: 0.75rem; }
+  @media (max-width: 720px) {
+    .hd-actions { grid-template-columns: minmax(0, 1fr); }
+    .hd-scroll { padding: 1rem 1rem 2rem; }
+    .hd-facts { grid-template-columns: minmax(0, 1fr); }
+    .hd-facts dt { margin-top: 0.375rem; }
+  }
+
   /* ── Plan value ── */
   .plan-table { width: 100%; border-collapse: collapse; font-size: 0.8125rem; font-variant-numeric: tabular-nums; }
   .plan-table th {
@@ -1984,6 +2180,8 @@ function renderHTML() {
     width: 100%;
   }
   .sparkline-svg { display: block; width: 100%; height: auto; }
+  .spark-legend { display: flex; flex-wrap: wrap; gap: 0.125rem 0.625rem; font-size: 0.625rem; color: var(--muted); margin-top: 0.125rem; font-variant-numeric: tabular-nums; }
+  .spark-hot { color: var(--red); font-weight: 600; }
   .velocity-badge {
     font-size: 0.6875rem;
     font-weight: 500;
@@ -2331,6 +2529,7 @@ function renderHTML() {
   <div class="tabs">
     <button class="tab active" onclick="switchTab('accounts')">Accounts</button>
     <button class="tab" onclick="switchTab('sessions')">Sessions<span id="sessions-badge" class="tab-badge" style="display:none"></span></button>
+    <button class="tab" onclick="switchTab('history')">History</button>
     <button class="tab" onclick="switchTab('artifacts')">Artifacts</button>
     <button class="tab" onclick="switchTab('usage')">Usage</button>
     <button class="tab" onclick="switchTab('activity')">Activity</button>
@@ -2413,6 +2612,41 @@ function renderHTML() {
       <span class="sess-meta" id="sess-counts"></span>
     </div>
     <div id="sessions-content"><div class="empty-state">Loading...</div></div>
+  </div>
+
+
+  <div id="tab-history" class="tab-content">
+    <div id="hist-off" class="hist-off" style="display:none">
+      <h3>Session history is off</h3>
+      <p>Claude Code deletes old sessions after 30 days. With history on, vdm keeps them, so you can:</p>
+      <ul>
+        <li>search everything said in any session (your prompts, Claude's replies, files, commands)</li>
+        <li>continue an old session in a new one: copy one prompt, paste it in, done</li>
+        <li>resume a session exactly, even after Claude Code deleted it</li>
+      </ul>
+      <p>No AI is used for this, and nothing leaves this computer. While Claude Code still has a session, the saved copy uses no extra disk (it is a hard link). Only text is indexed for search.</p>
+      <div style="display:flex;gap:0.5rem;align-items:center;margin-top:1rem">
+        <button class="hbtn hbtn-primary" onclick="histTurnOn()">Turn on session history</button>
+        <span class="sess-meta" id="hist-off-note"></span>
+      </div>
+    </div>
+    <div id="hist-main">
+      <div class="hist-toolbar">
+        <input class="config-select hist-search" id="hist-q" placeholder='Search all sessions, e.g. vat portugal file:app.js branch:fix "exact words"' aria-label="Search sessions" oninput="histQueryChanged()" onkeydown="histSearchKey(event)">
+        <select class="config-select" id="hist-project" onchange="histFilterChanged()" aria-label="Project"><option value="">All projects</option></select>
+        <select class="config-select" id="hist-account" onchange="histFilterChanged()" aria-label="Account"><option value="">All accounts</option></select>
+        <select class="config-select" id="hist-days" onchange="histFilterChanged()" aria-label="Period">
+          <option value="0">Any time</option><option value="1">Today</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option>
+        </select>
+        <label class="hist-check" title="Sessions started by scripts (claude -p, SDK)"><input type="checkbox" id="hist-auto" onchange="histFilterChanged()"> Automated</label>
+      </div>
+      <div class="hist-status" id="hist-status"></div>
+      <div id="hist-list"><div class="empty-state">Loading...</div></div>
+    </div>
+    <div class="hist-backdrop" id="hist-backdrop" onclick="histClose()"></div>
+    <aside class="hist-drawer" id="hist-drawer" role="dialog" aria-modal="true" aria-label="Session details">
+      <div class="hd-scroll" id="hist-detail"></div>
+    </aside>
   </div>
 
   <div id="tab-artifacts" class="tab-content">
@@ -2501,6 +2735,54 @@ function renderHTML() {
         </div>
       </div>
 
+
+      <div class="config-section">
+        <div class="config-section-title">Account Charts</div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Hot line</div>
+            <div class="config-desc">Above this many tokens per 5 minutes (all models, incl. cache reads) an account's chart line turns red.</div>
+          </div>
+          <select class="config-select" id="sel-hot" onchange="saveHotLine(Number(this.value))">
+            <option value="5000000">5M</option><option value="10000000">10M</option><option value="25000000">25M</option><option value="50000000">50M</option><option value="100000000">100M</option>
+          </select>
+        </div>
+      </div>
+
+      <div class="config-section">
+        <div class="config-section-title">Session History</div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Save sessions</div>
+            <div class="config-desc">Keep Claude Code sessions after Claude Code deletes them (30 days), so you can search them and continue them later. See the History tab.</div>
+          </div>
+          <input type="checkbox" class="sw" id="toggle-history" aria-label="Save sessions" onchange="toggleSetting('sessionHistory', this.checked)">
+        </div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Launch command</div>
+            <div class="config-desc" id="claude-cmd-desc">How copied commands and <code>vdm history continue</code> start Claude Code. Use the full command, not a shell alias, e.g. <code>claude --dangerously-skip-permissions</code>.</div>
+          </div>
+          <input class="config-select hd-input" id="inp-claude-cmd" style="max-width:280px" aria-label="Launch command" spellcheck="false" onchange="saveClaudeCommand(this.value)">
+        </div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Keep saved sessions</div>
+            <div class="config-desc">Older saved sessions are deleted (only ones Claude Code no longer has).</div>
+          </div>
+          <select class="config-select" id="sel-history-keep" onchange="saveHistoryKeep(Number(this.value))">
+            <option value="0">Forever</option><option value="90">90 days</option><option value="180">180 days</option><option value="365">1 year</option><option value="730">2 years</option>
+          </select>
+        </div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Never save these folders</div>
+            <div class="config-desc">One folder per line. Sessions started in these folders (or below) are skipped.</div>
+          </div>
+          <textarea class="config-select hd-input" id="inp-history-exclude" rows="2" style="max-width:280px;resize:vertical" aria-label="Folders to skip" spellcheck="false" onchange="saveHistoryExclude(this.value)"></textarea>
+        </div>
+      </div>
+
       <div class="config-section">
         <div class="config-section-title">Notifications</div>
         <div class="config-row">
@@ -2561,6 +2843,7 @@ function switchTab(id) {
   if (id === 'usage') refreshTokens(true);
   if (id === 'sessions') refreshSessions();
   if (id === 'artifacts') refreshArtifactsTab();
+  if (id === 'history') refreshHistory();
   if (id === 'config') loadSettingsUI(); // may have changed via vdm or another tab
   if (id === 'logs') connectLogStream();
   const url = new URL(location);
@@ -2722,15 +3005,29 @@ function renderProbeStats(ps) {
  * @param {number} windowMs - fixed x-axis span in ms (24h or 7d)
  * @param {string} mode - 'hours' or 'days'  - controls label generation
  */
-function renderSparkline(hist, key, windowMs, mode) {
-  const W = 320, H = 44, padL = 1, padR = 1, padT = 1, padB = 12;
+var HOT_TOKENS = 25000000;            // from settings (hotTokensPer5m)
+var CHART_SCALE = { day: 0, week: 0 };  // shared y-scale of all account charts
+var _chartSeq = 0;
+
+function fmtTokens(n) {
+  if (n >= 1e9) return (n / 1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + 'M';
+  if (n >= 1e3) return Math.round(n / 1e3) + 'K';
+  return String(Math.round(n));
+}
+
+/**
+ * Total tokens through one account per 5 minutes: a line through one dot per 5 minutes (24 h)
+ * or per hour (7 days, as that hour's 5-minute average). Same scale on every card (yMax).
+ * Above the hot line (settings: hotTokensPer5m) the line and its dots turn red.
+ */
+function renderUsageChart(series, windowMs, mode, yMax, idBase) {
+  const W = 320, H = 58, padL = 1, padR = 1, padT = 1, padB = 12;
   const chartW = W - padL - padR;
   const chartH = H - padT - padB;
   const now = Date.now();
-
   const windowEnd = now;
   const windowStart = windowEnd - windowMs;
-
   // Generate real-time labels
   let svg = '';
   if (mode === 'hours') {
@@ -2765,53 +3062,53 @@ function renderSparkline(hist, key, windowMs, mode) {
     }
   }
 
-  // Binary activity area: ON (utilization > 0) vs OFF, with shaded fill
-  if (hist && hist.length >= 1) {
-    var pts = hist.filter(function(h) { return h.ts >= windowStart && h.ts <= windowEnd; });
-    // Insert synthetic OFF points when gap between consecutive points > 10 min
-    // This prevents the step function from holding ON state across long idle periods
-    var GAP_THRESHOLD = 10 * 60 * 1000; // 10 minutes
-    var filled = [];
-    for (var gi = 0; gi < pts.length; gi++) {
-      filled.push(pts[gi]);
-      if (gi < pts.length - 1 && (pts[gi + 1].ts - pts[gi].ts) > GAP_THRESHOLD) {
-        filled.push({ ts: pts[gi].ts + GAP_THRESHOLD, u5h: 0, u7d: 0 });
-      }
-    }
-    pts = filled;
-    if (pts.length) {
-      var yOn = padT, yOff = padT + chartH;
-      var d = 'M' + (padL + ((pts[0].ts - windowStart) / windowMs) * chartW).toFixed(1) + ',' + yOff;
-      for (var pi = 0; pi < pts.length; pi++) {
-        var x = padL + ((pts[pi].ts - windowStart) / windowMs) * chartW;
-        var on = (pts[pi][key] || 0) > 0;
-        d += ' L' + x.toFixed(1) + ',' + (on ? yOn : yOff).toFixed(1);
-        // Step to next point (hold value until next timestamp)
-        if (pi < pts.length - 1) {
-          var xNext = padL + ((pts[pi + 1].ts - windowStart) / windowMs) * chartW;
-          d += ' L' + xNext.toFixed(1) + ',' + (on ? yOn : yOff).toFixed(1);
-        }
-      }
-      // Close path back to baseline
-      var xLast = padL + ((pts[pts.length - 1].ts - windowStart) / windowMs) * chartW;
-      d += ' L' + xLast.toFixed(1) + ',' + yOff + ' Z';
-      svg += '<path d="' + d + '" fill="var(--primary)" opacity="0.25" />';
-      // Top edge line for clarity
-      var edge = '';
-      for (var ei = 0; ei < pts.length; ei++) {
-        var ex = padL + ((pts[ei].ts - windowStart) / windowMs) * chartW;
-        var eOn = (pts[ei][key] || 0) > 0;
-        edge += (ei === 0 ? 'M' : ' L') + ex.toFixed(1) + ',' + (eOn ? yOn : yOff).toFixed(1);
-        if (ei < pts.length - 1) {
-          var exNext = padL + ((pts[ei + 1].ts - windowStart) / windowMs) * chartW;
-          edge += ' L' + exNext.toFixed(1) + ',' + (eOn ? yOn : yOff).toFixed(1);
-        }
-      }
-      svg += '<path d="' + edge + '" fill="none" stroke="var(--primary)" stroke-width="1" />';
-    }
+  var values = (series && series.values) || [];
+  var span = mode === 'hours' ? 'last 24 hours' : 'last 7 days';
+  var total = 0, peakV = 0, peakI = -1, hotSlots = 0;
+  values.forEach(function(v, i) {
+    if (v > peakV) { peakV = v; peakI = i; }
+    if (v > HOT_TOKENS) hotSlots++;
+  });
+  total = (series && series.total) || 0;
+  if (!peakV) {
+    svg += '<text x="' + (W / 2) + '" y="' + (padT + chartH / 2 + 2) + '" fill="var(--muted)" font-size="6.5" text-anchor="middle" font-family="inherit">No requests through this account in the ' + span + '</text>';
+    return '<div class="sparkline-wrap"><svg class="sparkline-svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="No requests in the ' + span + '">' + svg + '</svg></div>';
   }
-
-  return '<svg class="sparkline-svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '">' + svg + '</svg>';
+  var top = Math.max(yMax || 0, peakV, 1);
+  var xOf = function(i) { return padL + ((series.start + (i + 0.5) * series.step - windowStart) / windowMs) * chartW; };
+  var yOf = function(v) { return padT + chartH * (1 - Math.min(v / top, 1)); };
+  var yHot = yOf(HOT_TOKENS);
+  var line = '', blueDots = '', redDots = '';
+  values.forEach(function(v, i) {
+    var x = xOf(i);
+    if (x < padL - 0.5) return;
+    var y = yOf(v);
+    line += (line ? ' L' : 'M') + x.toFixed(2) + ',' + y.toFixed(2);
+    if (v > 0) {
+      var r = mode === 'hours' ? 0.85 : 1;
+      var dot = 'M' + (x - r).toFixed(2) + ',' + y.toFixed(2) + 'a' + r + ',' + r + ' 0 1,0 ' + 2 * r + ',0a' + r + ',' + r + ' 0 1,0 ' + -2 * r + ',0';
+      if (v > HOT_TOKENS) redDots += dot; else blueDots += dot;
+    }
+  });
+  var id = idBase || ('hot' + (++_chartSeq));
+  svg += '<defs><clipPath id="' + id + '-above"><rect x="0" y="0" width="' + W + '" height="' + yHot.toFixed(2) + '"/></clipPath>' +
+    '<clipPath id="' + id + '-below"><rect x="0" y="' + yHot.toFixed(2) + '" width="' + W + '" height="' + (H - yHot).toFixed(2) + '"/></clipPath></defs>';
+  svg += '<line x1="' + padL + '" x2="' + (W - padR) + '" y1="' + yHot.toFixed(2) + '" y2="' + yHot.toFixed(2) + '" stroke="var(--red)" stroke-width="0.5" stroke-dasharray="2 2" opacity="0.7" />';
+  svg += '<text x="' + (W - padR - 1) + '" y="' + (yHot - 1.5).toFixed(2) + '" fill="var(--red)" font-size="5" text-anchor="end" font-family="inherit" opacity="0.85" stroke="var(--card)" stroke-width="2" paint-order="stroke">hot ' + fmtTokens(HOT_TOKENS) + '</text>';
+  svg += '<path d="' + line + '" fill="none" stroke="var(--primary)" stroke-width="1" stroke-linejoin="round" clip-path="url(#' + id + '-below)" />';
+  svg += '<path d="' + line + '" fill="none" stroke="var(--red)" stroke-width="1.25" stroke-linejoin="round" clip-path="url(#' + id + '-above)" />';
+  if (blueDots) svg += '<path d="' + blueDots + '" fill="var(--primary)" />';
+  if (redDots) svg += '<path d="' + redDots + '" fill="var(--red)" />';
+  svg += '<text x="' + (padL + 2) + '" y="' + (padT + 6) + '" fill="var(--muted)" font-size="5.5" font-family="inherit" stroke="var(--card)" stroke-width="2" paint-order="stroke">' + fmtTokens(top) + ' / 5 min</text>';
+  var pd = new Date(series.start + peakI * series.step);
+  var peakWhen = mode === 'hours' ? pd.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : pd.toLocaleDateString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' });
+  var hotText = hotSlots ? (mode === 'hours' ? hotSlots * 5 + ' min hot' : hotSlots + ' h hot') : '';
+  var tip = 'Total tokens through this account (all models, incl. cache reads), ' + span + ', per 5 minutes' +
+    (mode === 'hours' ? '' : ' (hourly averages)') + '. Total ' + fmtTokens(total) + '. Peak ' + fmtTokens(peakV) + ' per 5 min (' + peakWhen + ').' +
+    ' Red: above ' + fmtTokens(HOT_TOKENS) + ' per 5 min (Config). Same scale on every account.';
+  return '<div class="sparkline-wrap" title="' + escHtml(tip) + '"><svg class="sparkline-svg" width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" role="img" aria-label="' + escHtml(tip) + '">' + svg + '</svg>' +
+    '<div class="spark-legend"><span>' + fmtTokens(total) + ' tokens</span><span>peak ' + fmtTokens(peakV) + '/5 min</span>' +
+    (hotText ? '<span class="spark-hot">' + hotText + '</span>' : '') + '</div></div>';
 }
 
 function formatEta(minutes) {
@@ -2850,13 +3147,15 @@ function quickHash(obj) {
 async function refresh() {
   try {
     const resp = await fetch('/api/profiles');
-    const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy, balanceCap, sessionAffinity, queueStats } = await resp.json();
+    const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy, balanceCap, sessionAffinity, sessionHistory, hotTokensPer5m, queueStats } = await resp.json();
+    HIST.enabled = !!sessionHistory;
+    if (hotTokensPer5m) HOT_TOKENS = hotTokensPer5m;
     _cachedProfiles = profiles;
     updateSessionsBadge(profiles);
     const balanceMode = rotationStrategy === 'balance';
     const cap = balanceCap || 8;
     // Fold balance context into the hash so strategy/cap flips also force a re-render.
-    const ph = quickHash({ profiles, balanceMode, cap });
+    const ph = quickHash({ profiles, balanceMode, cap, hot: HOT_TOKENS, hist: HIST.enabled });
     if (ph !== _lastProfilesHash) {
       _lastProfilesHash = ph;
       renderAccounts(profiles, _firstRender, balanceMode, cap);
@@ -2920,6 +3219,16 @@ var _cardHtml = {};
 
 function renderAccounts(profiles, animate, balanceMode, balanceCap) {
   var el = document.getElementById('accounts');
+  // One scale for all account charts, so a busy account stands out next to a quiet one.
+  // Never below the hot line, so the hot line always shows.
+  var peak = function(k) {
+    return profiles.reduce(function(m, p) {
+      var v = (p.throughput && p.throughput[k] && p.throughput[k].values) || [];
+      return Math.max(m, v.reduce(function(a, b) { return Math.max(a, b); }, 0));
+    }, 0);
+  };
+  CHART_SCALE.day = Math.max(peak('day'), HOT_TOKENS * 1.25);
+  CHART_SCALE.week = Math.max(peak('week'), HOT_TOKENS * 1.25);
   if (!profiles.length) {
     el.innerHTML = '<div class="empty-state">No accounts yet. Run <code>/login</code> in Claude Code: accounts are picked up automatically.</div>';
     el.dataset.names = '';
@@ -2963,8 +3272,9 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
   var barsHtml = '';
   if (p.rateLimits) {
     var rl = p.rateLimits;
-    var spark5h = '<div class="sparkline-wrap">' + renderSparkline(p.utilizationHistory || [], 'u5h', 24*60*60*1000, 'hours') + '</div>';
-    var spark7d = '<div class="sparkline-wrap">' + renderSparkline(p.weeklyHistory || [], 'u7d', 7*24*60*60*1000, 'days') + '</div>';
+    var tp = p.throughput || {};
+    var spark5h = renderUsageChart(tp.day, 24*60*60*1000, 'hours', CHART_SCALE.day, 'hot-' + i + '-d');
+    var spark7d = renderUsageChart(tp.week, 7*24*60*60*1000, 'days', CHART_SCALE.week, 'hot-' + i + '-w');
     // Fable has its own weekly bucket (only on accounts whose responses carry it)
     var fable = '';
     if (rl.sevenDOI) {
@@ -3173,6 +3483,29 @@ async function loadSettingsUI() {
     document.getElementById('sel-serialize-delay').value = s.serializeDelayMs || 200;
     document.getElementById('serialize-delay-ctrl').style.display = s.serializeRequests ? '' : 'none';
     document.getElementById('toggle-affinity').checked = s.sessionAffinity !== false;
+    document.getElementById('toggle-history').checked = s.sessionHistory === true;
+    var hot = document.getElementById('sel-hot');
+    var hotVal = String(s.hotTokensPer5m || 25000000);
+    if (![].some.call(hot.options, function(o) { return o.value === hotVal; })) {
+      var hotOpt = document.createElement('option');
+      hotOpt.value = hotVal; hotOpt.textContent = fmtTokens(Number(hotVal));
+      hot.appendChild(hotOpt);
+    }
+    hot.value = hotVal;
+    var cmdInput = document.getElementById('inp-claude-cmd');
+    if (document.activeElement !== cmdInput) cmdInput.value = s.claudeCommandEnv || s.claudeCommand || 'claude';
+    cmdInput.disabled = !!s.claudeCommandEnv;
+    cmdInput.title = s.claudeCommandEnv ? 'Set by VDM_CLAUDE_CMD in the environment' : '';
+    var keep = document.getElementById('sel-history-keep');
+    var days = String(s.historyRetentionDays || 0);
+    if (![].some.call(keep.options, function(o) { return o.value === days; })) {
+      var opt = document.createElement('option');
+      opt.value = days; opt.textContent = days + ' days';
+      keep.appendChild(opt);
+    }
+    keep.value = days;
+    var ex = document.getElementById('inp-history-exclude');
+    if (document.activeElement !== ex) ex.value = (s.historyExclude || []).join(String.fromCharCode(10));
   } catch {}
 }
 
@@ -3211,7 +3544,9 @@ async function toggleSetting(key, value) {
       notifications: value ? 'Notifications enabled' : 'Notifications disabled',
       serializeRequests: value ? 'Request serialization enabled' : 'Request serialization disabled',
       sessionAffinity: value ? 'Session affinity on' : 'Session affinity off  - sessions follow the strategy per request',
+      sessionHistory: value ? 'Session history on: saving your sessions' : 'Session history off (saved sessions are kept)',
     };
+    if (key === 'sessionHistory') { HIST.enabled = value; setTimeout(function() { refreshHistory(); }, 600); }
     showToast(msgs[key] || (key + ' = ' + value));
     // Show/hide serialize delay control
     if (key === 'serializeRequests') {
@@ -3714,6 +4049,460 @@ function exportUsageCsv() {
   window.location = '/api/usage/export?' + q;
 }
 
+// ── History ──
+var HIST = { enabled: false, data: null, rows: [], offset: 0, timer: null, poll: null, open: null, detail: null, handoff: null, msgs: null, seq: 0 };
+var HM = String.fromCharCode(2), HM_END = String.fromCharCode(3);
+
+function histParams() {
+  var p = new URLSearchParams();
+  var q = document.getElementById('hist-q').value.trim();
+  if (q) p.set('q', q);
+  var project = document.getElementById('hist-project').value;
+  var account = document.getElementById('hist-account').value;
+  var days = document.getElementById('hist-days').value;
+  if (project) p.set('project', project);
+  if (account) p.set('account', account);
+  if (days && days !== '0') p.set('days', days);
+  if (document.getElementById('hist-auto').checked) p.set('automated', '1');
+  p.set('offset', String(HIST.offset));
+  p.set('limit', '50');
+  return p.toString();
+}
+
+async function refreshHistory(append) {
+  var seq = ++HIST.seq;
+  if (!append) HIST.offset = 0;
+  try {
+    var r = await fetch('/api/history?' + histParams());
+    var d = await r.json();
+    if (seq !== HIST.seq) return; // a newer search is running
+    HIST.enabled = !!d.enabled;
+    HIST.data = d;
+    HIST.rows = append ? HIST.rows.concat(d.sessions || []) : (d.sessions || []);
+    renderHistory();
+    histPollWhileBusy(d);
+  } catch (e) {
+    document.getElementById('hist-status').textContent = 'Could not load history: ' + e.message;
+  }
+}
+
+// While the first pass saves sessions, refresh every few seconds to show progress
+function histPollWhileBusy(d) {
+  clearTimeout(HIST.poll);
+  var busy = d && (d.backfill || d.state === 'starting' || d.state === 'restarting');
+  if (busy && document.getElementById('tab-history').classList.contains('active')) {
+    HIST.poll = setTimeout(function() { refreshHistory(); }, 3000);
+  }
+}
+
+function histQueryChanged() {
+  clearTimeout(HIST.timer);
+  HIST.timer = setTimeout(function() { refreshHistory(); }, 220);
+}
+
+function histFilterChanged() { refreshHistory(); }
+
+function histSearchKey(ev) {
+  if (ev.key === 'Escape') { ev.target.value = ''; refreshHistory(); }
+  if (ev.key === 'Enter') { clearTimeout(HIST.timer); refreshHistory(); }
+}
+
+function histFill(id, values, allLabel) {
+  var sel = document.getElementById(id);
+  var key = JSON.stringify(values);
+  if (sel.dataset.key === key || document.activeElement === sel) return;
+  var cur = sel.value;
+  sel.innerHTML = '<option value="">' + allLabel + '</option>' + values.map(function(v) {
+    return '<option value="' + escHtml(v.value) + '">' + escHtml(v.label) + '</option>';
+  }).join('');
+  sel.value = values.some(function(v) { return v.value === cur; }) ? cur : '';
+  sel.dataset.key = key;
+}
+
+function fmtBytes(n) {
+  if (!n) return '0 MB';
+  if (n < 1e9) return Math.max(0.1, n / 1e6).toFixed(n < 1e7 ? 1 : 0) + ' MB';
+  return (n / 1e9).toFixed(1) + ' GB';
+}
+
+function histSnippet(s) {
+  return escHtml(s).split(HM).join('<mark>').split(HM_END).join('</mark>');
+}
+
+function histDayLabel(t) {
+  if (!t) return 'Unknown date';
+  var d = new Date(t), now = new Date();
+  var day = function(x) { return new Date(x.getFullYear(), x.getMonth(), x.getDate()).getTime(); };
+  var diff = Math.round((day(now) - day(d)) / 86400000);
+  if (diff === 0) return 'Today';
+  if (diff === 1) return 'Yesterday';
+  return d.toLocaleDateString(undefined, { weekday: 'short', day: 'numeric', month: 'short', year: d.getFullYear() === now.getFullYear() ? undefined : 'numeric' });
+}
+
+function baseName(p) { var a = String(p || '').split('/'); return a[a.length - 1] || p; }
+
+function histRow(s) {
+  var where = [s.project, s.branch].filter(Boolean).join(' · ');
+  var badges = (s.live ? '<span class="pill pill-running" title="This Claude Code session is still open">running</span>' : '') +
+    (!s.original ? '<span class="pill pill-saved" title="Claude Code deleted its copy. vdm kept this one.">saved copy</span>' : '') +
+    (s.compactions ? '<span class="pill pill-soft" title="Compacted ' + s.compactions + ' times">compacted ×' + s.compactions + '</span>' : '');
+  var text = s.snippet ? histSnippet(s.snippet) : (s.firstPrompt ? '“' + escHtml(s.firstPrompt) + '”' : '<span style="color:var(--muted)">No messages</span>');
+  var last = !s.snippet && s.lastPrompt && s.lastPrompt !== s.firstPrompt ? '<div class="hist-last">Last: “' + escHtml(s.lastPrompt) + '”</div>' : '';
+  var chips = s.accounts.slice(0, 3).map(function(a) { return '<span class="hist-chip acct" title="' + a.requests + ' requests via the proxy">' + escHtml(a.label) + '</span>'; }).join('') +
+    s.topFiles.map(function(f) { return '<span class="hist-chip" title="' + escHtml(f) + '">' + escHtml(baseName(f)) + '</span>'; }).join('');
+  return '<div class="hist-row' + (HIST.open === s.id ? ' sel' : '') + '" tabindex="0" data-id="' + s.id + '" data-seq="' + (s.hitSeq == null ? '' : s.hitSeq) + '" onclick="histOpen(this.dataset.id, this.dataset.seq)" onkeydown="if (event.key === &quot;Enter&quot;) histOpen(this.dataset.id, this.dataset.seq)">' +
+    '<div class="hist-top"><span class="hist-title" title="' + escHtml(s.title) + '">' + escHtml(s.title) + '</span>' + badges +
+      '<span class="hist-cost" title="What this session would cost at API prices (incl. subagents)">' + formatCost(s.cost) + '</span></div>' +
+    '<div class="hist-sub">' + escHtml(where || s.cwd) + (where ? ' · ' : ' · ') + agoSpan(s.lastAt) + ' · ' + s.userTurns + (s.userTurns === 1 ? ' message' : ' messages') + (s.agents ? ' · ' + s.agents + ' subagents' : '') + '</div>' +
+    '<div class="hist-text">' + text + '</div>' + last +
+    (chips ? '<div class="hist-chips">' + chips + '</div>' : '') +
+  '</div>';
+}
+
+function renderHistory() {
+  var d = HIST.data || {};
+  var off = document.getElementById('hist-off');
+  var main = document.getElementById('hist-main');
+  var showOff = !d.enabled && !(d.count > 0);
+  off.style.display = showOff ? '' : 'none';
+  main.style.display = showOff ? 'none' : '';
+  document.getElementById('hist-off-note').textContent = d.module === false ? 'history.mjs is missing: run vdm upgrade' : '';
+  if (showOff) return;
+
+  var f = d.facets || { projects: [], accounts: [] };
+  histFill('hist-project', f.projects.map(function(p) { return { value: p, label: p }; }), 'All projects');
+  histFill('hist-account', f.accounts.map(function(a) { return { value: a.name, label: a.label }; }), 'All accounts');
+
+  var st = [];
+  if (d.module === false) st.push('<span class="warn">history.mjs is missing: run <code>vdm upgrade</code></span>');
+  if (!d.enabled) st.push('<span class="warn">History is off: showing sessions saved earlier.</span> <button class="link-btn" onclick="histTurnOn()">Turn on</button>');
+  else if (d.writer === false) st.push('<span class="warn">Read-only: another vdm process is saving sessions right now. This one takes over when it stops.</span>');
+  if (d.backfill) {
+    var pct = d.backfill.total ? Math.round(d.backfill.done / d.backfill.total * 100) : 0;
+    st.push('Saving your sessions… <span class="hist-progress"><div style="width:' + pct + '%"></div></span> ' + d.backfill.done + ' / ' + d.backfill.total);
+  } else if (d.state === 'starting' || d.state === 'restarting') st.push('Starting…');
+  var storage = d.storage || { own: 0, shared: 0 };
+  st.push('<b>' + (d.count || 0) + '</b> sessions saved · ' + fmtBytes(storage.own) + ' on disk' +
+    (storage.shared ? ' <span title="Hard links to files Claude Code still has: no extra space until Claude Code deletes them">(+' + fmtBytes(storage.shared) + ' shared with Claude Code)</span>' : ''));
+  if (d.search) st.push(d.total + ' found' + (d.search.partial ? ' (search stopped early: add words to narrow it)' : ''));
+  if (d.automatedHidden) st.push(d.automatedHidden + ' automated hidden');
+  if (d.error) st.push('<span class="warn">' + escHtml(d.error) + '</span>');
+  document.getElementById('hist-status').innerHTML = st.join(' <span style="opacity:0.4">|</span> ');
+
+  var list = document.getElementById('hist-list');
+  if (!HIST.rows.length) {
+    var q = document.getElementById('hist-q').value.trim();
+    list.innerHTML = '<div class="empty-state">' + (q ? 'No session mentions that. Try fewer words, or <code>file:</code> / <code>branch:</code>.' : (d.backfill ? 'Saving your sessions…' : 'No sessions saved yet.')) + '</div>';
+    return;
+  }
+  var html = '', lastDay = '';
+  var searching = !!(d.search);
+  HIST.rows.forEach(function(s) {
+    if (!searching) {
+      var day = histDayLabel(s.lastAt);
+      if (day !== lastDay) { html += '<div class="hist-day">' + escHtml(day) + '</div>'; lastDay = day; }
+    }
+    html += histRow(s);
+  });
+  if (HIST.rows.length < d.total) html += '<button class="hbtn hist-more" onclick="histMore()">Show more (' + (d.total - HIST.rows.length) + ' left)</button>';
+  list.innerHTML = html;
+}
+
+function histMore() { HIST.offset = HIST.rows.length; refreshHistory(true); }
+
+async function histTurnOn() {
+  await toggleSetting('sessionHistory', true);
+  var t = document.getElementById('toggle-history');
+  if (t) t.checked = true;
+}
+
+// ── History: detail drawer ──
+
+function histFact(label, value) {
+  return value ? '<dt>' + label + '</dt><dd>' + value + '</dd>' : '';
+}
+
+function fmtWhen(t) { return t ? new Date(t).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' }) : '?'; }
+
+function fmtDuration(ms) {
+  if (!ms || ms < 60000) return 'under a minute';
+  var m = Math.round(ms / 60000);
+  if (m < 120) return m + ' min';
+  var h = Math.round(m / 60);
+  return h < 48 ? h + ' h' : Math.round(h / 24) + ' days';
+}
+
+async function histOpen(id, seq) {
+  if (!HIST.open) HIST.returnFocus = document.activeElement;
+  HIST.open = id;
+  HIST.handoff = null;
+  document.querySelectorAll('.hist-row').forEach(function(r) { r.classList.toggle('sel', r.dataset.id === id); });
+  document.getElementById('hist-drawer').classList.add('open');
+  document.getElementById('hist-backdrop').classList.add('open');
+  var box = document.getElementById('hist-detail');
+  box.innerHTML = '<div class="empty-state">Loading...</div>';
+  box.scrollTop = 0;
+  var url = new URL(location);
+  url.searchParams.set('session', id);
+  history.replaceState(null, '', url);
+  try {
+    var r = await fetch('/api/history/' + encodeURIComponent(id));
+    var d = await r.json();
+    if (HIST.open !== id) return;
+    if (!r.ok) { box.innerHTML = '<div class="empty-state">' + escHtml(d.error || 'Not found') + '</div>'; return; }
+    HIST.open = d.id; // the URL may hold a short id
+    HIST.detail = d;
+    renderHistDetail(d);
+    var closeBtn = box.querySelector('.hd-close');
+    if (closeBtn) closeBtn.focus({ preventScroll: true });
+    histPrepareHandoff(d.id);
+    await histLoadMessages(seq !== undefined && seq !== '' && seq !== null ? { around: Number(seq) } : {});
+  } catch (e) { box.innerHTML = '<div class="empty-state">Could not load: ' + escHtml(e.message) + '</div>'; }
+}
+
+function histClose() {
+  var closingId = HIST.open;
+  HIST.open = null;
+  var back = HIST.returnFocus;
+  HIST.returnFocus = null;
+  if (!back || !document.contains(back)) back = document.querySelector('.hist-row[data-id="' + closingId + '"]');
+  if (back && back.focus) back.focus({ preventScroll: true });
+  document.getElementById('hist-drawer').classList.remove('open');
+  document.getElementById('hist-backdrop').classList.remove('open');
+  document.querySelectorAll('.hist-row.sel').forEach(function(r) { r.classList.remove('sel'); });
+  var url = new URL(location);
+  url.searchParams.delete('session');
+  history.replaceState(null, '', url);
+}
+
+document.addEventListener('keydown', function(ev) {
+  if (ev.key === 'Escape' && HIST.open) histClose();
+});
+
+function openHistoryFor(id) {
+  switchTab('history');
+  histOpen(id);
+}
+
+// Write the handoff as soon as the panel opens, so "Copy prompt" copies right on click
+async function histPrepareHandoff(id) {
+  try {
+    var r = await fetch('/api/history/' + id + '/handoff', { method: 'POST' });
+    var h = await r.json();
+    if (r.ok && HIST.open === id) HIST.handoff = h;
+  } catch (e) { /* tried again on click */ }
+}
+
+function renderHistDetail(d) {
+  var where = [d.project, d.branch].filter(Boolean).join(' · ');
+  var badges = (d.live ? '<span class="pill pill-running">running</span>' : '') +
+    (!d.original ? '<span class="pill pill-saved" title="Claude Code deleted its copy. vdm kept this one.">saved copy</span>' : '');
+  var resume;
+  if (!d.cwdExists) {
+    resume = '<div class="hd-warn">The folder of this session is gone: ' + escHtml(d.cwd || '?') + '.' +
+      (d.repoRoot && d.branch ? ' Recreate it with <code>git -C ' + escHtml(d.repoRoot) + ' worktree add ' + escHtml(d.cwd) + ' ' + escHtml(d.branch) + '</code>, or continue from the handoff instead.' : ' Continue from the handoff instead.') + '</div>';
+  } else if (d.needsRestore && !d.canResume) {
+    resume = '<div class="hd-warn">' + escHtml(d.rawNote || 'No full copy of this session was saved, only the text.') + '</div>';
+  } else {
+    resume = (d.needsRestore ? '<div class="hd-act-desc">Claude Code deleted its copy. This first puts the saved copy back.</div>' : '') +
+      '<div class="hd-btns"><button class="hbtn" onclick="histResume()">' + (d.needsRestore ? 'Restore session file' : 'Copy resume command') + '</button></div>' +
+      '<code class="hd-cmd" title="' + escHtml(d.commands.resume) + '">' + escHtml(d.commands.resume) + '</code>';
+  }
+  var accounts = d.accounts.map(function(a) { return escHtml(a.label) + ' <span style="color:var(--muted)">(' + a.requests + ' req)</span>'; }).join(', ');
+  var files = d.files.slice(0, 12).map(function(f) { return '<div title="' + escHtml(f[0]) + '">' + escHtml(f[0].replace(d.cwd + '/', '')) + (f[1] > 1 ? ' <span style="color:var(--muted)">×' + f[1] + '</span>' : '') + '</div>'; }).join('') +
+    (d.files.length > 12 ? '<div style="color:var(--muted)">+' + (d.files.length - 12) + ' more</div>' : '');
+  var links = (d.allLinks || []).map(function(l) { return '<a href="' + escHtml(l) + '" target="_blank" rel="noopener">' + escHtml(l.replace('https://', '')) + '</a>'; }).join('<br>');
+  var st = d.stats || {};
+  var models = (d.models || []).map(function(m) { return escHtml(shortModel(m)); }).join(', ');
+  var html = '<div class="hd-head"><div class="hd-title">' + escHtml(d.title) + '</div><button class="hd-close" onclick="histClose()" aria-label="Close">&times;</button></div>' +
+    '<div class="hd-sub">' + badges + (where ? '<span>' + escHtml(where) + '</span><span>·</span>' : '') +
+      '<span class="hd-id" title="Session id">' + d.id + '</span><button class="chip" onclick="histCopy(HIST.detail.id, &quot;Session id copied&quot;)">copy id</button></div>' +
+    '<div class="hd-actions">' +
+      '<div class="hd-act main"><div class="hd-act-title">Continue in a new session</div>' +
+        '<div class="hd-act-desc">vdm writes a handoff file from this session (no AI): the latest summary, the last messages and the files that changed. Paste the prompt into any new Claude session.</div>' +
+        '<div class="hd-btns"><button class="hbtn hbtn-primary" onclick="histCopyPrompt()">Copy prompt</button>' +
+        '<button class="hbtn" onclick="histCopy(HIST.detail.commands.continue, &quot;Command copied: run it in a terminal&quot;)" title="Opens a new Claude session in the right folder with the handoff loaded">Copy terminal command</button></div>' +
+        '<code class="hd-cmd">' + escHtml(d.commands.continue) + '</code></div>' +
+      '<div class="hd-act"><div class="hd-act-title">Resume exactly</div>' +
+        '<div class="hd-act-desc">Opens this same session with its full history (Claude Code --resume). Its prompt cache is gone, so the first message costs more.</div>' + resume + '</div>' +
+    '</div>' +
+    '<dl class="hd-facts">' +
+      histFact('Folder', escHtml(d.cwd || '?') + (d.cwdExists ? '' : ' <span class="pill pill-saved">gone</span>')) +
+      histFact('Branch', escHtml((d.branches || []).join(' → ') || d.branch || '')) +
+      histFact('When', fmtWhen(d.firstAt) + ' → ' + fmtWhen(d.lastAt) + ' <span style="color:var(--muted)">(' + fmtDuration((d.lastAt || 0) - (d.firstAt || 0)) + ')</span>') +
+      histFact('Size', d.userTurns + ' of your messages · ' + (st.claudeMsgs || 0) + ' replies · ' + (st.toolCalls || 0) + ' tool calls' + (d.compactions ? ' · compacted ×' + d.compactions : '')) +
+      histFact('Cost', formatCost(d.cost) + ' <span style="color:var(--muted)">at API prices (from the transcript' + (d.agents ? ', incl. ' + d.agents + ' subagents' : '') + ')</span>') +
+      histFact('Models', models) +
+      histFact('Accounts', accounts) +
+      histFact('Files changed', files ? '<div class="hd-files">' + files + '</div>' : '') +
+      histFact('Links', links) +
+    '</dl>' +
+    '<div class="hd-conv-head"><b>Conversation <span style="color:var(--muted);font-weight:400">(' + d.messages + ' entries)</span></b>' +
+      (d.prompts.length ? '<select class="config-select" id="hd-jump" onchange="histJump(this.value)" aria-label="Jump to one of your messages"><option value="">Jump to your message…</option>' +
+        d.prompts.map(function(p) { return '<option value="' + p.i + '">' + escHtml((p.t ? new Date(p.t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: '2-digit', minute: '2-digit' }) + ' · ' : '') + p.x) + '</option>'; }).join('') + '</select>' : '') +
+    '</div>' +
+    '<div id="hd-msgs"><div class="empty-state">Loading...</div></div>' +
+    '<div class="hd-foot"><a class="hbtn" href="/api/history/' + d.id + '/download" download>Download transcript (.jsonl)</a>' +
+      '<button class="hbtn hbtn-danger" onclick="histDelete()">Delete from archive</button></div>';
+  document.getElementById('hist-detail').innerHTML = html;
+}
+
+async function histLoadMessages(opts) {
+  var id = HIST.open;
+  var seq = HIST.msgSeq = (HIST.msgSeq || 0) + 1;
+  var p = new URLSearchParams();
+  if (opts.around != null && !isNaN(opts.around)) p.set('around', String(opts.around));
+  if (opts.from != null) p.set('from', String(opts.from));
+  p.set('limit', '200');
+  var box = document.getElementById('hd-msgs');
+  try {
+    var r = await fetch('/api/history/' + id + '/messages?' + p.toString());
+    var m = await r.json();
+    if (HIST.open !== id || !box || seq !== HIST.msgSeq) return;
+    if (!r.ok) { box.innerHTML = '<div class="empty-state">Could not load messages: ' + escHtml(m.error || r.status) + '</div>'; return; }
+    HIST.msgs = m;
+    box.innerHTML = renderHistMessages(m);
+    var focus = opts.around != null ? opts.around : opts.focus;
+    if (focus != null && !isNaN(focus)) {
+      var el = document.getElementById('hm-' + focus) || box.querySelector('[data-first="' + focus + '"]');
+      if (el) {
+        var group = el.tagName === 'DETAILS' ? el : (el.closest && el.closest('details'));
+        if (group) group.open = true;
+        el.classList.add('focus');
+        el.scrollIntoView({ block: 'center' });
+      }
+    }
+  } catch (e) { if (box) box.innerHTML = '<div class="empty-state">Could not load messages: ' + escHtml(e.message) + '</div>'; }
+}
+
+function histJump(seq) { if (seq !== '') histLoadMessages({ around: Number(seq) }); }
+
+function histText(x) {
+  var t = escHtml(x);
+  return x.length > 1400 ? '<div class="hm-text clamp">' + t + '</div><button class="link-btn" onclick="this.previousElementSibling.classList.remove(&quot;clamp&quot;); this.remove()">Show all</button>' : '<div class="hm-text">' + t + '</div>';
+}
+
+function renderHistMessages(m) {
+  var recs = m.records || [];
+  if (!recs.length) return '<div class="empty-state">No messages saved.</div>';
+  var out = [];
+  if (m.start > 0) out.push('<div class="hm-pager"><button class="hbtn" onclick="histLoadMessages({ from: ' + Math.max(0, recs[0].i - 200) + ', focus: ' + recs[0].i + ' })">Show earlier (' + m.start + ' more)</button></div>');
+  var tools = [];
+  var flush = function() {
+    if (!tools.length) return;
+    var counts = {};
+    tools.forEach(function(t) { counts[t.n || 'tool'] = (counts[t.n || 'tool'] || 0) + 1; });
+    var sum = Object.keys(counts).map(function(k) { return k + (counts[k] > 1 ? ' ×' + counts[k] : ''); }).join(', ');
+    out.push('<details class="hm-tools" data-first="' + tools[0].i + '"><summary>' + tools.length + (tools.length === 1 ? ' tool call' : ' tool calls') + ' · ' + escHtml(sum) + '</summary>' +
+      tools.map(function(t) { return '<div class="hm-tool" id="hm-' + t.i + '" title="' + escHtml(t.x) + '">' + escHtml(t.n || '') + ' · ' + escHtml(t.x) + '</div>'; }).join('') + '</details>');
+    tools = [];
+  };
+  recs.forEach(function(r) {
+    if (r.r === 'tool') { tools.push(r); return; }
+    flush();
+    var time = r.t ? new Date(r.t).toLocaleTimeString(undefined, { hour: '2-digit', minute: '2-digit' }) : '';
+    if (r.r === 'user') out.push('<div class="hm hm-user" id="hm-' + r.i + '"><div class="hm-who">You · ' + time + '</div>' + histText(r.x) + '</div>');
+    else if (r.r === 'claude') out.push('<div class="hm hm-claude" id="hm-' + r.i + '"><div class="hm-who">Claude</div>' + histText(r.x) + '</div>');
+    else if (r.r === 'compact') out.push('<details class="hm-compact" id="hm-' + r.i + '"><summary>Compacted' + (r.p ? ' at ' + formatNum(r.p) + ' tokens' : '') + ' · ' + time + ' · Claude Code’s summary</summary>' + histText(r.x) + '</details>');
+    else if (r.r === 'recap') out.push('<div class="hm hm-recap" id="hm-' + r.i + '">Recap: ' + escHtml(r.x) + '</div>');
+    else if (r.r === 'command') out.push('<div class="hm-cmd" id="hm-' + r.i + '">' + escHtml(r.x) + '</div>');
+  });
+  flush();
+  var last = recs[recs.length - 1];
+  if (m.start + recs.length < m.total) out.push('<div class="hm-pager"><button class="hbtn" onclick="histLoadMessages({ from: ' + (last.i + 1) + ', focus: ' + (last.i + 1) + ' })">Show later (' + (m.total - m.start - recs.length) + ' more)</button></div>');
+  return out.join('');
+}
+
+// Copy to the clipboard. Browsers can refuse (e.g. after a slow request): then show the text so
+// it can be copied by hand, and never claim it was copied.
+async function histCopy(text, msg) {
+  var ok = false;
+  var had = document.activeElement;
+  try { await navigator.clipboard.writeText(text); ok = true; }
+  catch (e) {
+    var ta = document.createElement('textarea');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select();
+    try { ok = document.execCommand('copy') === true; } catch (e2) { ok = false; }
+    ta.remove();
+    if (had && had.focus) had.focus({ preventScroll: true });
+  }
+  if (ok) showToast(msg || 'Copied');
+  else window.prompt('Your browser blocked copying. Copy this by hand (Cmd+C):', text);
+  return ok;
+}
+
+async function histCopyPrompt() {
+  var id = HIST.open;
+  if (!HIST.handoff || HIST.handoff.id !== id) {
+    try {
+      var r = await fetch('/api/history/' + id + '/handoff', { method: 'POST' });
+      var h = await r.json();
+      if (!r.ok) { showToast(h.error || 'Could not write the handoff'); return; }
+      HIST.handoff = h;
+    } catch (e) { showToast('Could not write the handoff'); return; }
+  }
+  histCopy(HIST.handoff.prompt, 'Prompt copied: paste it into a new Claude session');
+}
+
+async function histResume() {
+  var d = HIST.detail;
+  if (!d.needsRestore) { histCopy(d.commands.resume, 'Command copied: run it in a terminal'); return; }
+  // Restoring can take a while; the browser may then refuse a copy, so this click only restores
+  try {
+    var r = await fetch('/api/history/' + d.id + '/restore', { method: 'POST' });
+    var x = await r.json();
+    if (!r.ok) { showToast(x.error || 'Restore failed'); return; }
+  } catch (e) { showToast('Restore failed'); return; }
+  showToast('Restored. Now click “Copy resume command”.');
+  histOpen(d.id);
+}
+
+async function histDelete() {
+  var d = HIST.detail;
+  if (!confirm('Delete "' + d.title + '" from the vdm archive?' + String.fromCharCode(10, 10) + 'Claude Code’s own copy is not touched. vdm will not save this session again.')) return;
+  try {
+    var r = await fetch('/api/history/' + d.id + '/delete', { method: 'POST' });
+    var x = await r.json();
+    if (!r.ok) { showToast(x.error || 'Delete failed'); return; }
+    showToast('Deleted from the archive');
+    histClose();
+    refreshHistory();
+  } catch (e) { showToast('Delete failed'); }
+}
+
+async function saveHistorySetting(patch, msg) {
+  try {
+    var r = await fetch('/api/settings', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(patch) });
+    var x = await r.json();
+    showToast(r.ok ? msg : (x.error || 'Failed to update'));
+    if (!r.ok) {
+      // Put the saved value back, even in the field that still has focus
+      if (document.activeElement && document.activeElement.blur) document.activeElement.blur();
+      loadSettingsUI();
+    }
+  } catch (e) { showToast('Failed to update'); }
+}
+
+async function saveHotLine(v) {
+  HOT_TOKENS = v;
+  await saveHistorySetting({ hotTokensPer5m: v }, 'Hot line: ' + fmtTokens(v) + ' tokens per 5 minutes');
+  refresh();
+}
+
+function saveClaudeCommand(v) { saveHistorySetting({ claudeCommand: v }, 'Launch command saved'); }
+function saveHistoryKeep(days) { saveHistorySetting({ historyRetentionDays: days }, days ? 'Saved sessions kept for ' + days + ' days' : 'Saved sessions kept forever'); }
+function saveHistoryExclude(v) {
+  var list = v.split(String.fromCharCode(10)).map(function(x) { return x.trim(); }).filter(Boolean);
+  saveHistorySetting({ historyExclude: list }, list.length ? list.length + ' folders skipped' : 'No folders skipped');
+}
+
+// Open a session from the URL (?tab=history&session=<id>)
+(function() {
+  var sid = new URLSearchParams(location.search).get('session');
+  if (sid && new URLSearchParams(location.search).get('tab') === 'history') setTimeout(function() { histOpen(sid); }, 50);
+})();
+
 refresh();
 loadSettingsUI();
 setInterval(refresh, 5000);
@@ -3852,7 +4641,7 @@ async function refreshSessions() {
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     var data = await resp.json();
     _sessionsError = '';
-    var h = quickHash(data);
+    var h = quickHash({ d: data, hist: HIST.enabled });
     if (h === _sessionsHash) return;
     _sessionsHash = h;
     _sessions = data;
@@ -3901,6 +4690,7 @@ function sessionCard(s) {
     '<div class="sess-card-top">' +
       '<span class="sess-card-title" title="' + escHtml(s.id) + '">' + escHtml(s.label) + '</span>' +
       (s.live ? '<span class="pill pill-running" title="This Claude Code session is still open">running</span>' : '') +
+      (HIST.enabled ? '<button class="chip" data-id="' + escHtml(s.id) + '" onclick="openHistoryFor(this.dataset.id)" title="Search, read and continue this session">history</button>' : '') +
       '<span class="sess-meta">' + agoSpan(s.lastAt) + '</span></div>' +
     (sub ? '<div class="sess-sub" title="' + escHtml(sub) + '">' + escHtml(sub) + '</div>' : '') +
     '<div class="sess-aff-line">' + affBars(a.level, title) + '<span><b>' + (AFF_TEXT[a.level] || a.level) + '</b> &middot; ' + on + ' &middot; ' + cachePct(a.cacheHit) +
@@ -4148,6 +4938,7 @@ const server = createServer(async (req, res) => {
 
 server.listen(PORT, () => {
   console.log(`Dashboard running at http://localhost:${PORT}`);
+  onServerListening();
   // Discover any existing keychain token on startup so the dashboard
   // shows accounts immediately (don't wait for the first proxy request)
   autoDiscoverAccount().catch(() => {});
@@ -4292,28 +5083,6 @@ function persistAccountState(token, fingerprint) {
 loadPersistedState();
 
 
-// Prune history entries that predate a known window reset
-(function pruneStaleHistory() {
-  const nowSec = Math.floor(Date.now() / 1000);
-  for (const [fp, ps] of Object.entries(persistedState)) {
-    if (ps.resetAt && ps.resetAt < nowSec) {
-      const resetMs = ps.resetAt * 1000;
-      const hist = utilizationHistory.getHistory(fp);
-      const fresh = hist.filter(e => e.ts > resetMs);
-      utilizationHistory.load(fp, fresh);
-    }
-    if (ps.resetAt7d && ps.resetAt7d < nowSec) {
-      const resetMs = ps.resetAt7d * 1000;
-      const hist = weeklyHistory.getHistory(fp);
-      const fresh = hist.filter(e => e.ts > resetMs);
-      weeklyHistory.load(fp, fresh);
-    }
-  }
-  saveHistoryToDisk();
-})();
-
-// Server-side sparkline cache (cleared on window resets to force re-render)
-const _sparkCache = {};
 
 function updateAccountState(token, name, headers, fingerprint) {
   accountState.update(token, name, headers);
@@ -4321,32 +5090,22 @@ function updateAccountState(token, name, headers, fingerprint) {
   const rl = parseRateLimitHeaders(headers);
   if (!rl.status && !rl.fiveH && !rl.sevenD && !rl.sevenDOI) return;
   if (fingerprint) {
-    const u5h = parseFloat(headers['anthropic-ratelimit-unified-5h-utilization'] || '0');
-    const u7d = parseFloat(headers['anthropic-ratelimit-unified-7d-utilization'] || '0');
-    const reset7d = Number(headers['anthropic-ratelimit-unified-7d-reset'] || 0);
-    const reset5h = Number(headers['anthropic-ratelimit-unified-5h-reset'] || 0);
-
-    // Detect window resets using actual reset timestamps from API headers.
-    // Rolling windows advance the reset epoch by seconds on each request,
-    // so require a large jump (>1h) to distinguish a true window reset from
-    // normal rolling advancement.  Also require utilization to have dropped.
-    const RESET_JUMP = 3600; // 1 hour in seconds
-    const prevReset5h = persistedState[fingerprint]?.resetAt || 0;
-    if (reset5h > prevReset5h + RESET_JUMP && prevReset5h > 0 && u5h < (utilizationHistory.getHistory(fingerprint).slice(-1)[0]?.u5h ?? u5h)) {
-      utilizationHistory.load(fingerprint, []);
-      delete _sparkCache[fingerprint + '_5h'];
-    }
-    const prevReset7d = persistedState[fingerprint]?.resetAt7d || 0;
-    if (reset7d > prevReset7d + RESET_JUMP && prevReset7d > 0 && u7d < (weeklyHistory.getHistory(fingerprint).slice(-1)[0]?.u7d ?? u7d)) {
-      weeklyHistory.load(fingerprint, []);
-      delete _sparkCache[fingerprint + '_7d'];
-    }
-
-    utilizationHistory.record(fingerprint, u5h, u7d);
-    weeklyHistory.record(fingerprint, u5h, u7d);
+    // A missing header is "unknown" (the chart keeps the last value), never 0
+    const util = (h) => {
+      const v = parseFloat(headers[h]);
+      return Number.isFinite(v) ? v : null;
+    };
+    const key = historyKey(token, fingerprint);
+    utilizationHistory.record(key, util('anthropic-ratelimit-unified-5h-utilization'), util('anthropic-ratelimit-unified-7d-utilization'));
     persistAccountState(token, fingerprint);
     saveHistoryToDisk();
   }
+}
+
+/** Usage history is kept per account email (stable across token refreshes and re-logins). */
+function historyKey(token, fingerprint) {
+  const acct = loadAllAccountTokens().find(a => a.token === token);
+  return acct ? acct.id : fingerprint;
 }
 
 function markAccountLimited(token, name, retryAfterSec = 0) {
@@ -4383,10 +5142,11 @@ function loadAllAccountTokens() {
         const token = creds?.claudeAiOauth?.accessToken;
         if (!token) continue;
         const name = basename(file, '.json');
-        let label = '';
+        let label = '', email = '';
         try { label = readFileSync(join(ACCOUNTS_DIR, `${name}.label`), 'utf8').trim(); } catch {}
+        try { email = readFileSync(join(ACCOUNTS_DIR, `${name}.email`), 'utf8').trim(); } catch {}
         const expiresAt = creds.claudeAiOauth?.expiresAt || 0;
-        accounts.push({ name, label, token, creds, expiresAt });
+        accounts.push({ name, label, email, id: accountId({ name, label, email }), token, creds, expiresAt });
       } catch { /* skip corrupt */ }
     }
     _accountsCache = accounts;
@@ -4395,6 +5155,38 @@ function loadAllAccountTokens() {
   } catch {
     return _accountsCache || [];
   }
+}
+
+/**
+ * The key for data that spans days (usage, charts, saved sessions): the account's email, so
+ * a re-login, a re-added account or a new token keeps adding to the same history. Before the
+ * email is known: an email-looking label, else the account file name.
+ */
+function accountId({ name, label, email }) {
+  if (email) return email;
+  if (label && label.includes('@')) return label;
+  return name;
+}
+
+/** Remember an account's email in <name>.email (never edited by `vdm label`). */
+function rememberAccountEmail(name, email) {
+  if (!name || !email || !email.includes('@')) return;
+  const file = join(ACCOUNTS_DIR, `${name}.email`);
+  try { if (readFileSync(file, 'utf8').trim() === email) return; } catch { /* new */ }
+  try {
+    writeFileSync(file, email);
+    invalidateAccountsCache();
+  } catch (e) { log('warn', `Could not save the email of "${name}": ${e.message}`); }
+}
+
+/** Old usage rows may carry a label or file name: map them to the account's current id. */
+function accountAliases() {
+  const m = new Map();
+  for (const a of loadAllAccountTokens()) {
+    if (a.label) m.set(a.label, a.id);
+    m.set(a.name, a.id);
+  }
+  return m;
 }
 
 function invalidateAccountsCache() {
@@ -4408,6 +5200,22 @@ function invalidateAccountsCache() {
     const ps = persistedState[getFingerprintFromToken(a.token)];
     if (ps) accountState.restore(a.token, a.label || a.name, ps);
   }
+})();
+
+// Older versions keyed usage history by token fingerprint (or account file name), so a token
+// refresh or re-login started an empty chart. Move them to the account email; the rest age out.
+(function migrateHistoryKeys() {
+  for (const a of loadAllAccountTokens()) {
+    for (const old of [getFingerprintFromToken(a.token), a.name, a.label]) {
+      if (old && old !== a.id) {
+        utilizationHistory.rename(old, a.id);
+        throughput.rename(old, a.id);
+      }
+    }
+  }
+  utilizationHistory.prune();
+  writeHistoryFile();
+  _throughputDirty = true;
 })();
 
 // ── Account picker ──
@@ -4693,17 +5501,10 @@ function migrateAccountState(oldToken, newToken, oldFp, newFp, name) {
   // Migrate in-memory account state (all of it: limits, per-model blocks, cooldowns)
   accountState.transfer(oldToken, newToken);
 
-  // Migrate utilization history (5h + weekly)
-  const hist5h = utilizationHistory.getHistory(oldFp);
-  if (hist5h.length) {
-    utilizationHistory.load(newFp, hist5h);
-    utilizationHistory.load(oldFp, []); // clear old
-  }
-  const histWeekly = weeklyHistory.getHistory(oldFp);
-  if (histWeekly.length) {
-    weeklyHistory.load(newFp, histWeekly);
-    weeklyHistory.load(oldFp, []); // clear old
-  }
+  // Usage history is keyed by account name: an entry under the old fingerprint (a token
+  // seen before the account was saved) joins the account's history
+  const acct = loadAllAccountTokens().find(a => a.name === name);
+  if (acct) utilizationHistory.rename(oldFp, acct.id);
 
   // Migrate persisted state
   if (persistedState[oldFp]) {
@@ -5422,6 +6223,7 @@ function flushUsage() {
 setInterval(flushUsage, 30_000);
 
 function loadUsageRows(since, until = Date.now()) {
+  const alias = accountAliases();
   const rows = [];
   const first = utcDay(since), last = utcDay(until);
   const days = new Set(_usageDays.keys());
@@ -5430,7 +6232,8 @@ function loadUsageRows(since, until = Date.now()) {
     if (day < first || day > last) continue;
     for (const r of usageDay(day).data.rows()) rows.push(r);
   }
-  return rows;
+  // Rows saved under a label or file name count for the account email
+  return rows.map(r => (alias.has(r.account) && alias.get(r.account) !== r.account ? { ...r, account: alias.get(r.account) } : r));
 }
 
 // One-time import of the pre-v4 per-request log (token-usage.json) into rollups.
@@ -5467,8 +6270,32 @@ function loadUsageRows(since, until = Date.now()) {
 })();
 
 // Book one proxied request: per-session stats and the usage rollup.
+
+// Hourly token totals per account from the usage rollups: the 7-day chart, and the part of the
+// 24-hour chart from before the 5-minute store existed. Memoized: /api/profiles asks every 5 s.
+let _rollupThroughput = { at: 0, data: null };
+function rollupThroughput() {
+  const now = Date.now();
+  if (_rollupThroughput.data && now - _rollupThroughput.at < 60_000) return _rollupThroughput.data;
+  const rows = loadUsageRows(now - 7 * 86400000 - 3600000, now);
+  _rollupThroughput = { at: now, data: throughputFromRollups(rows, { since: now - 7 * 86400000 - 3600000 }) };
+  return _rollupThroughput.data;
+}
+
+/** Line-chart data for one account card: total tokens per 5 minutes over 24 h and 7 days. */
+function accountThroughput(p, now = Date.now()) {
+  const tp = rollupThroughput();
+  const hourly = tp[p.id] || [];
+  return {
+    day: throughputLine({ fine: throughput.series(p.id, now - 86400000, now), hourly, startedAt: throughput.startedAt, now, windowMs: 86400000, step: THROUGHPUT_BUCKET_MS }),
+    week: throughputLine({ hourly, now, windowMs: 7 * 86400000, step: 3600000 }),
+  };
+}
+
 function recordProxyUsage({ sid, agent, acct, model, usage, ttlMs }) {
   if (!usage) return;
+  throughput.add(acct?.id || acct?.name || 'unknown', model, totalTokens(usage));
+  _throughputDirty = true;
   const cost = usageCost(usage, model);
   let repo = '', branch = '';
   if (sid) {
@@ -5478,7 +6305,7 @@ function recordProxyUsage({ sid, agent, acct, model, usage, ttlMs }) {
     branch = meta.branch || '';
     markSessionsDirty();
   }
-  recordUsage({ ts: Date.now(), account: acct?.label || acct?.name || 'unknown', model, repo, branch, usage });
+  recordUsage({ ts: Date.now(), account: acct?.id || acct?.label || acct?.name || 'unknown', model, repo, branch, usage });
 }
 
 // Rolling 30-day prompt-cache efficiency (per account / per model, daily trend).
@@ -5509,16 +6336,15 @@ function usageReport(params) {
   const plans = loadAllAccountTokens().map(a => {
     const o = a.creds?.claudeAiOauth || {};
     const monthly = planMonthlyUsd(o.subscriptionType, o.rateLimitTier);
-    const key = a.label || a.name;
-    const used = cur.byAccount[key];
+    const used = cur.byAccount[a.id];
     return {
-      name: a.name, label: key, monthly,
+      name: a.name, key: a.id, label: a.label || a.id, monthly,
       tier: (String(o.rateLimitTier || '').match(/(\d+)x/) || [])[1] ? `Max ${String(o.rateLimitTier).match(/(\d+)x/)[1]}x` : (o.subscriptionType || 'unknown'),
       planCost: monthly ? monthly * days / MONTH_DAYS : null,
       apiCost: used?.cost || 0,
       requests: used?.requests || 0,
     };
-  }).filter(p => !filter.account || p.label === filter.account);
+  }).filter(p => !filter.account || p.key === filter.account);
   const planDaily = plans.reduce((sum, p) => sum + (p.monthly ? p.monthly / MONTH_DAYS : 0), 0);
   // A plan covers all of an account's usage: comparing it to one repo/branch/model is meaningless
   const planComparable = !filter.repo && !filter.branch && !filter.model;
@@ -5674,11 +6500,261 @@ function pipeAndWait(...streams) {
   });
 }
 
+
+// ── Session history (child process: history.mjs) ──
+// All archive work (links, digests, compression, search) runs in a separate low-priority
+// process, so the proxy never waits on it and a crash there never takes the proxy down.
+// It starts when history is on (or on demand to browse saved sessions) and restarts with
+// backoff when it dies.
+
+const HISTORY_MODULE = join(__dirname, 'history.mjs');
+const ARCHIVE_DIR = process.env.CSW_HISTORY_DIR || join(__dirname, 'history');
+const HISTORY_BROWSE_IDLE_MS = 10 * 60 * 1000; // history off: stop a child started only to browse
+const HISTORY_ID_RE = /^[0-9a-f-]{4,36}$/;
+
+const _hist = {
+  child: null, ready: null, state: 'off', pending: new Map(), nextId: 1,
+  restarts: 0, startedAt: 0, lastError: '', stopping: false, restartTimer: null, idleTimer: null,
+};
+
+function claudeCommand() {
+  return cleanClaudeCommand(process.env.VDM_CLAUDE_CMD) || settings.claudeCommand || 'claude';
+}
+
+function historyConfig() {
+  return {
+    enabled: settings.sessionHistory === true,
+    retentionDays: settings.historyRetentionDays || 0,
+    exclude: settings.historyExclude || [],
+    claudeCommand: claudeCommand(),
+  };
+}
+
+function hasSavedHistory() {
+  try { return readdirSync(join(ARCHIVE_DIR, 'sessions')).length > 0; } catch { return false; }
+}
+
+function pipeChildLines(stream, tag) {
+  let buf = '';
+  stream.setEncoding('utf8');
+  stream.on('data', (d) => {
+    buf += d;
+    let i;
+    while ((i = buf.indexOf('\n')) !== -1) {
+      const line = buf.slice(0, i).trim();
+      buf = buf.slice(i + 1);
+      if (line) log(tag, line);
+    }
+    if (buf.length > 64 * 1024) buf = '';
+  });
+}
+
+function startHistory() {
+  if (_hist.child) return _hist.ready;
+  if (!existsSync(HISTORY_MODULE)) {
+    _hist.state = 'missing';
+    return Promise.reject(new Error('history.mjs is missing: run `vdm upgrade`'));
+  }
+  clearTimeout(_hist.restartTimer);
+  _hist.state = 'starting';
+  _hist.startedAt = Date.now();
+  let child;
+  try {
+    child = fork(HISTORY_MODULE, ['serve'], {
+      execArgv: ['--max-old-space-size=512'],
+      env: { ...process.env, NODE_NO_WARNINGS: '1', CSW_HISTORY_DIR: ARCHIVE_DIR },
+      stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
+    });
+  } catch (err) {
+    _hist.state = 'error';
+    _hist.lastError = err.message;
+    return Promise.reject(err);
+  }
+  _hist.child = child;
+  try { setPriority(child.pid, 10); } catch { /* not allowed */ }
+  pipeChildLines(child.stdout, 'history');
+  pipeChildLines(child.stderr, 'history');
+  _hist.ready = new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error('history process did not start'));
+      try { child.kill('SIGKILL'); } catch { /* gone */ }
+    }, 20000);
+    child.on('message', (m) => {
+      if (m && m.ready) { clearTimeout(timer); _hist.state = 'ready'; resolve(); return; }
+      const p = m && _hist.pending.get(m.id);
+      if (!p) return;
+      _hist.pending.delete(m.id);
+      clearTimeout(p.timer);
+      if (m.ok) p.resolve(m.result);
+      else p.reject(Object.assign(new Error(m.error || 'history error'), { code: m.code || null }));
+    });
+    child.once('exit', () => { clearTimeout(timer); reject(new Error('history process stopped')); });
+  });
+  _hist.ready.catch(() => {});
+  child.on('error', (err) => log('error', `History process: ${err.message}`));
+  child.on('exit', (code, signal) => {
+    if (_hist.child === child) _hist.child = null;
+    for (const p of _hist.pending.values()) { clearTimeout(p.timer); p.reject(new Error('history process stopped')); }
+    _hist.pending.clear();
+    if (_hist.stopping) {
+      _hist.stopping = false;
+      _hist.state = 'off';
+      // History was turned on while this child was stopping: start a fresh one
+      if (historyConfig().enabled) startHistory().catch(err => log('error', `History: ${err.message}`));
+      return;
+    }
+    _hist.lastError = `stopped unexpectedly (${signal || `exit ${code}`})`;
+    log('error', `History process ${_hist.lastError}`);
+    if (!historyConfig().enabled) { _hist.state = 'off'; return; }
+    if (Date.now() - _hist.startedAt > 10 * 60 * 1000) _hist.restarts = 0;
+    const delay = Math.min(5 * 60 * 1000, 5000 * 2 ** _hist.restarts++);
+    _hist.state = 'restarting';
+    _hist.restartTimer = setTimeout(() => { startHistory().catch(() => {}); }, delay);
+    _hist.restartTimer.unref?.();
+  });
+  return _hist.ready.then(() => historySend('config', historyConfig()));
+}
+
+function stopHistory() {
+  clearTimeout(_hist.restartTimer);
+  clearTimeout(_hist.idleTimer);
+  const child = _hist.child;
+  if (!child) { _hist.state = 'off'; return; }
+  _hist.stopping = true;
+  try { child.disconnect(); } catch { /* gone */ }
+  setTimeout(() => { try { child.kill('SIGTERM'); } catch { /* gone */ } }, 3000).unref?.();
+}
+
+function historySend(op, args = {}, timeoutMs = 15000) {
+  return new Promise((resolve, reject) => {
+    const child = _hist.child;
+    if (!child || !child.connected) { reject(new Error('history process is not running')); return; }
+    const id = _hist.nextId++;
+    const timer = setTimeout(() => { _hist.pending.delete(id); reject(new Error('history process did not answer in time')); }, timeoutMs);
+    _hist.pending.set(id, { resolve, reject, timer });
+    try { child.send({ id, op, args }); } catch (err) { clearTimeout(timer); _hist.pending.delete(id); reject(err); }
+  });
+}
+
+/** Ask the history process (starting it if needed: with history off it stops again when idle). */
+async function historyCall(op, args = {}, timeoutMs) {
+  if (!_hist.child) await startHistory();
+  else await _hist.ready;
+  if (!historyConfig().enabled) {
+    clearTimeout(_hist.idleTimer);
+    _hist.idleTimer = setTimeout(stopHistory, HISTORY_BROWSE_IDLE_MS);
+    _hist.idleTimer.unref?.();
+  }
+  return historySend(op, args, timeoutMs);
+}
+
+function applyHistorySettings() {
+  const cfg = historyConfig();
+  if (cfg.enabled) {
+    clearTimeout(_hist.idleTimer);
+    saveSessions(true); // the first scan reads which accounts each session used
+    if (_hist.child) historySend('config', cfg).catch(() => {});
+    else startHistory().catch(err => log('error', `History: ${err.message}`));
+    log('history', 'Session history on');
+  } else if (_hist.child) {
+    historySend('config', cfg).catch(() => {});
+    clearTimeout(_hist.idleTimer);
+    _hist.idleTimer = setTimeout(stopHistory, HISTORY_BROWSE_IDLE_MS);
+    _hist.idleTimer.unref?.();
+    log('history', 'Session history off (saved sessions are kept)');
+  }
+}
+
+let _serversListening = 0;
+function onServerListening() {
+  if (++_serversListening === 2 && historyConfig().enabled) {
+    startHistory().catch(err => log('error', `History: ${err.message}`));
+  }
+}
+
+function historyStatusCode(err) {
+  if (err.code === 'NOT_FOUND') return 404;
+  if (err.code === 'AMBIGUOUS') return 400;
+  return 503;
+}
+
+async function handleHistoryAPI(req, res, url) {
+  const parts = url.pathname.split('/').filter(Boolean); // ['api', 'history', id?, action?]
+  const q = url.searchParams;
+  const base = () => ({
+    enabled: historyConfig().enabled, state: _hist.state, error: _hist.lastError || null,
+    module: existsSync(HISTORY_MODULE), claudeCommand: claudeCommand(),
+  });
+  try {
+    if (parts.length === 3 && parts[2] === 'status' && req.method === 'GET') {
+      if (!_hist.child && !historyConfig().enabled && !hasSavedHistory()) { json(res, { ...base(), sessions: 0 }); return true; }
+      json(res, { ...base(), ...(await historyCall('status')) });
+      return true;
+    }
+    if (parts.length === 3 && parts[2] === 'scan' && req.method === 'POST') {
+      if (!historyConfig().enabled) { json(res, { ...base(), error: 'Session history is off' }, 409); return true; }
+      saveSessions(true);
+      json(res, { ...base(), ...(await historyCall('scan')) });
+      return true;
+    }
+    if (parts.length === 2 && req.method === 'GET') {
+      if (!_hist.child && !historyConfig().enabled && !hasSavedHistory()) {
+        json(res, { ...base(), total: 0, count: 0, sessions: [], facets: { projects: [], branches: [], accounts: [] }, storage: { shared: 0, own: 0 } });
+        return true;
+      }
+      const args = {
+        q: (q.get('q') || '').slice(0, 500), project: q.get('project') || '', branch: q.get('branch') || '', account: q.get('account') || '',
+        days: Number(q.get('days')) || 0, automated: q.get('automated') === '1',
+        offset: Number(q.get('offset')) || 0, limit: Number(q.get('limit')) || 50,
+      };
+      json(res, { ...base(), ...(await historyCall('list', args)) });
+      return true;
+    }
+    const id = parts[2];
+    if (!id || !HISTORY_ID_RE.test(id)) { json(res, { error: 'Bad session id' }, 400); return true; }
+    const action = parts[3] || '';
+    if (parts.length > 4) return false;
+    if (!action && req.method === 'GET') { json(res, await historyCall('get', { id })); return true; }
+    if (action === 'messages' && req.method === 'GET') {
+      const num = (k) => (q.has(k) && q.get(k) !== '' ? Number(q.get(k)) : null);
+      json(res, await historyCall('messages', { id, from: num('from'), around: num('around'), limit: Number(q.get('limit')) || 200 }));
+      return true;
+    }
+    if (action === 'handoff' && req.method === 'POST') { json(res, await historyCall('handoff', { id })); return true; }
+    if (action === 'restore' && req.method === 'POST') {
+      const r = await historyCall('restore', { id }, 120000);
+      logActivity('history-restored', { session: id.slice(0, 8), restored: r.restored });
+      json(res, r);
+      return true;
+    }
+    if (action === 'delete' && req.method === 'POST') { json(res, await historyCall('remove', { id })); return true; }
+    if (action === 'download' && req.method === 'GET') {
+      const t = await historyCall('transcript', { id });
+      const okPath = [ARCHIVE_DIR, join(CLAUDE_DIR, 'projects')].some(root => t.file.startsWith(root + '/'));
+      if (!okPath) { json(res, { error: 'Refused' }, 403); return true; }
+      res.writeHead(200, {
+        'Content-Type': 'application/x-ndjson',
+        'Content-Disposition': `attachment; filename="${t.id}.jsonl"`,
+        'Cache-Control': 'no-store',
+      });
+      const streams = [createReadStream(t.file)];
+      if (t.compressed) streams.push(zlib.createBrotliDecompress());
+      await pipeAndWait(...streams, res);
+      return true;
+    }
+    return false;
+  } catch (err) {
+    if (!res.headersSent) json(res, { ...base(), error: err.message }, historyStatusCode(err));
+    else res.destroy();
+    return true;
+  }
+}
+
 // ── Proxy server ──
 
 const proxyServer = createServer((clientReq, clientRes) => {
   // Only this computer may use the accounts (unless CSW_ALLOW_REMOTE=1); web pages never.
-  const remote = !ALLOW_REMOTE && !isLoopbackAddr(clientReq.socket.remoteAddress);
+  const remote = !ALLOW_REMOTE && (!isLoopbackAddr(clientReq.socket.remoteAddress) || !isLocalHost(clientReq.headers.host));
   if (remote || !originAllowed(clientReq.headers.origin)) {
     clientRes.writeHead(403, { 'Content-Type': 'application/json' });
     clientRes.end(JSON.stringify({ type: 'error', error: { type: 'permission_error', message: remote
@@ -6708,7 +7784,10 @@ function shutdown(signal) {
   // Persist usage rollups, session pins and artifact links before exit
   try { flushUsage(); } catch {}
   try { saveSessions(true); } catch {}
+  try { if (_historyDirty) writeHistoryFile(); } catch {}
+  try { if (_throughputDirty) writeThroughputFile(); } catch {}
   if (_artifactLinksDirty) try { saveArtifacts(); } catch {}
+  try { stopHistory(); } catch {}
   proxyServer.close();
   server.close();
   process.exit(0);
@@ -6731,6 +7810,7 @@ process.on('unhandledRejection', (reason) => {
 });
 
 proxyServer.listen(PROXY_PORT, () => {
+  onServerListening();
   const s = settings;
   log('info', `API proxy on http://localhost:${PROXY_PORT} (proxy=${s.proxyEnabled ? 'on' : 'off'}, auto-switch=${s.autoSwitch ? 'on' : 'off'}, rotation=${s.rotationStrategy || 'conserve'}, ${loadAllAccountTokens().length} accounts)`);
 });

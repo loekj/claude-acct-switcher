@@ -259,6 +259,25 @@ with open('$CONFIG_FILE', 'w') as f:
 " 2>/dev/null
 }
 
+# Set a free-text string (e.g. a launch command). The value goes in as an argument,
+# never into the Python source, so quotes and $ in it are safe.
+set_config_text() {
+  python3 - "$CONFIG_FILE" "$1" "$2" <<'PYEOF' 2>/dev/null
+import json, os, sys
+path, key, value = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    with open(path) as f:
+        cfg = json.load(f)
+except Exception:
+    cfg = {}
+cfg[key] = value
+tmp = path + '.tmp'
+with open(tmp, 'w') as f:
+    json.dump(cfg, f, indent=2)
+os.replace(tmp, path)
+PYEOF
+}
+
 # Best-effort: push the just-written key to a running dashboard so the change
 # applies live (the dashboard otherwise only reads config.json at startup).
 # Reads the value back from config.json so JSON typing (bool/number/string) is correct.
@@ -313,6 +332,7 @@ cmd_add() {
   fi
   if [[ -n "$email" ]]; then
     echo "$email" > "$ACCOUNTS_DIR/${name}.label"
+    echo "$email" > "$ACCOUNTS_DIR/${name}.email"
   fi
 
   echo -e "${GREEN}✓${NC} Saved profile ${BOLD}$name${NC}"
@@ -489,7 +509,7 @@ cmd_remove() {
     return 1
   fi
 
-  rm -f "$file" "$ACCOUNTS_DIR/${name}.label"
+  rm -f "$file" "$ACCOUNTS_DIR/${name}.label" "$ACCOUNTS_DIR/${name}.email"
   echo -e "${GREEN}✓${NC} Removed profile ${BOLD}$name${NC}"
 }
 
@@ -561,6 +581,7 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
   local interval=$(get_config_string "rotationIntervalMin")
   local notifs=$(get_config_value "notifications")
   local affinity=$(get_config_value "sessionAffinity")
+  local history_on=$(get_config_value "sessionHistory")
   echo ""
   echo -e "  ${BOLD}Settings${NC}"
   echo -e "  ────────────────────────────────"
@@ -584,6 +605,11 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
     echo -e "  Affinity:      ${DIM}OFF${NC}"
   else
     echo -e "  Affinity:      ${GREEN}ON${NC}  ${DIM}(sessions stay on one account while their cache is warm)${NC}"
+  fi
+  if [[ "$history_on" == "True" ]]; then
+    echo -e "  History:       ${GREEN}ON${NC}  ${DIM}(sessions are saved: vdm history)${NC}"
+  else
+    echo -e "  History:       ${DIM}OFF${NC}  ${DIM}(vdm config history on)${NC}"
   fi
   if [[ "${strategy:-sticky}" == "round-robin" ]]; then
     echo -e "  Interval:      ${interval:-60} min"
@@ -669,6 +695,20 @@ cmd_config() {
     else
       echo -e "  sessionAffinity:    ${GREEN}on${NC}"
     fi
+    local hist=$(get_config_value "sessionHistory")
+    if [[ "$hist" == "True" ]]; then
+      echo -e "  sessionHistory:     ${GREEN}on${NC}"
+    else
+      echo -e "  sessionHistory:     ${DIM}off${NC}"
+    fi
+    local ccmd=$(get_config_string "claudeCommand")
+    echo -e "  claudeCommand:      ${CYAN}${VDM_CLAUDE_CMD:-${ccmd:-claude}}${NC}${VDM_CLAUDE_CMD:+  ${DIM}(from VDM_CLAUDE_CMD)${NC}}"
+    local keep=$(get_config_string "historyRetentionDays")
+    if [[ -z "$keep" || "$keep" == "0" ]]; then
+      echo -e "  historyRetentionDays: forever"
+    else
+      echo -e "  historyRetentionDays: ${keep}"
+    fi
     echo ""
     echo -e "  ${DIM}Usage: vdm config <key> <value>${NC}"
     echo -e "  ${DIM}  vdm config proxy on${NC}"
@@ -680,6 +720,9 @@ cmd_config() {
     echo -e "  ${DIM}  vdm config serialize on|off${NC}  ${DIM}[BETA]${NC}"
     echo -e "  ${DIM}  vdm config serialize-delay 0|100|200|500|1000${NC}  ${DIM}[BETA]${NC}"
     echo -e "  ${DIM}  vdm config affinity on|off${NC}  ${DIM}keep each session on one account (saves prompt cache)${NC}"
+    echo -e "  ${DIM}  vdm config history on|off${NC}  ${DIM}save sessions to search and continue later${NC}"
+    echo -e "  ${DIM}  vdm config claude-cmd 'claude --flags'${NC}  ${DIM}how vdm starts Claude Code (full command, not an alias)${NC}"
+    echo -e "  ${DIM}  vdm config history-keep 0|90|180|365|730${NC}  ${DIM}days to keep saved sessions (0 = forever)${NC}"
     return 0
   fi
 
@@ -695,9 +738,14 @@ cmd_config() {
     serialize-delay|serializeDelayMs|serialize-delay-ms) key="serializeDelayMs"; is_bool=false ;;
     max-concurrent|maxConcurrentPerAccount|max-concurrent-per-account) key="maxConcurrentPerAccount"; is_bool=false ;;
     affinity|sessionAffinity|session-affinity) key="sessionAffinity" ;;
+    history|sessionHistory|session-history) key="sessionHistory" ;;
+    claude-cmd|claudeCommand|claude-command) key="claudeCommand"; is_bool=false
+      # Allow it unquoted: vdm config claude-cmd claude --dangerously-skip-permissions
+      if [[ $# -gt 2 ]]; then shift; value="$*"; fi ;;
+    history-keep|historyRetentionDays|history-retention) key="historyRetentionDays"; is_bool=false ;;
     *)
       echo -e "${RED}Unknown setting: $key${NC}"
-      echo "  Available: proxy, autoswitch, notifications, rotation, interval, max-concurrent, serialize, serialize-delay, affinity"
+      echo "  Available: proxy, autoswitch, notifications, rotation, interval, max-concurrent, serialize, serialize-delay, affinity, history, claude-cmd, history-keep"
       return 1
       ;;
   esac
@@ -765,12 +813,36 @@ cmd_config() {
     set_config_number "$key" "$value"
     echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value} ms${NC}"
   elif [[ "$key" == "maxConcurrentPerAccount" ]]; then
-    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( value < 1 || value > 50 )); then
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( 10#$value < 1 || 10#$value > 50 )); then
       echo -e "${RED}Invalid value: $value${NC}  (use a number 1-50)"
       return 1
     fi
+    value=$((10#$value))
     set_config_number "$key" "$value"
     echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value}${NC}  ${DIM}concurrent in-flight per account${NC}"
+  elif [[ "$key" == "claudeCommand" ]]; then
+    if [[ ${#value} -gt 300 || "$value" == *$'\n'* ]]; then
+      echo -e "${RED}Invalid command${NC}  (one line, max 300 characters)"
+      return 1
+    fi
+    local first="${value%% *}"
+    first="${first/#\~/$HOME}"
+    if ! command -v "$first" >/dev/null 2>&1; then
+      echo -e "${YELLOW}Warning:${NC} '$first' is not a command vdm can run (shell aliases do not work here)."
+    fi
+    set_config_text "$key" "$value"
+    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value}${NC}"
+  elif [[ "$key" == "historyRetentionDays" ]]; then
+    if ! [[ "$value" =~ ^[0-9]+$ ]] || (( 10#$value > 3650 )); then
+      echo -e "${RED}Invalid value: $value${NC}  (days, 0 = forever)"
+      return 1
+    fi
+    value=$((10#$value))
+    set_config_number "$key" "$value"
+    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value}${NC}  ${DIM}(0 = keep forever)${NC}"
+  fi
+  if [[ "$key" == "sessionHistory" && "$value" == "True" ]]; then
+    echo -e "  ${DIM}Saving your sessions now. Browse them: vdm history, or the History tab in the dashboard.${NC}"
   fi
 
   # Apply live to a running dashboard so the change takes effect without a restart.
@@ -879,13 +951,19 @@ cmd_upgrade() {
   latest_hash=$(git -C "$tmpdir" describe --tags --abbrev=0 2>/dev/null \
     || git -C "$tmpdir" rev-parse --short HEAD 2>/dev/null)
 
-  if [[ -n "$current_hash" && "$current_hash" == "$latest_hash" ]]; then
+  # Same version, but a module is missing (an older upgrade did not know about it): repair
+  local missing=""
+  for f in "$tmpdir"/*.mjs; do
+    [[ -f "$f" && ! -f "$SCRIPT_DIR/$(basename "$f")" ]] && missing="$missing $(basename "$f")"
+  done
+  if [[ -n "$current_hash" && "$current_hash" == "$latest_hash" && -z "$missing" ]]; then
     echo -e "  ${GREEN}✓${NC} Already on the latest version (${DIM}$current_hash${NC})"
     return 0
   fi
+  [[ -n "$missing" ]] && echo -e "  ${DIM}Adding missing files:${missing}${NC}"
 
   # Verify the fetched repo has the files we need
-  for f in vdm dashboard.mjs lib.mjs install-hooks.sh; do
+  for f in vdm dashboard.mjs lib.mjs history.mjs install-hooks.sh; do
     if [[ ! -f "$tmpdir/$f" ]]; then
       echo -e "  ${RED}Fetched repo is missing $f — aborting.${NC}"
       return 1
@@ -914,11 +992,19 @@ cmd_upgrade() {
 
   # Overwrite only code files — never touch accounts/, config.json,
   # activity-log.json, .label files, or any other user data.
+  # Each file is written next to its target and renamed over it, so a running vdm (bash
+  # reads its script as it goes) keeps reading the old file, never a half-written one.
   echo -e "  ${DIM}Updating files…${NC}"
-  cp "$tmpdir/vdm"               "$SCRIPT_DIR/vdm"
-  cp "$tmpdir/dashboard.mjs"     "$SCRIPT_DIR/dashboard.mjs"
-  cp "$tmpdir/lib.mjs"           "$SCRIPT_DIR/lib.mjs"
-  cp "$tmpdir/install-hooks.sh"  "$SCRIPT_DIR/install-hooks.sh"
+  local files=(vdm install-hooks.sh)
+  for f in "$tmpdir"/*.mjs; do files+=("$(basename "$f")"); done
+  for f in "${files[@]}"; do
+    if ! { cp "$tmpdir/$f" "$SCRIPT_DIR/.$f.new" && mv -f "$SCRIPT_DIR/.$f.new" "$SCRIPT_DIR/$f"; }; then
+      rm -f "$SCRIPT_DIR/.$f.new" 2>/dev/null || true
+      echo -e "  ${RED}Could not update $f. Nothing else was changed after it; run vdm upgrade again.${NC}"
+      [[ "$dashboard_was_running" == "true" ]] && cmd_dashboard start
+      return 1
+    fi
+  done
   chmod +x "$SCRIPT_DIR/vdm"
 
   # Write version marker
@@ -926,6 +1012,7 @@ cmd_upgrade() {
 
   # Remove hooks older versions installed
   if [[ -f "$SCRIPT_DIR/install-hooks.sh" ]]; then
+    local _VDM_NEW_UPGRADE=1
     source "$SCRIPT_DIR/install-hooks.sh"
     if has_legacy_hooks; then
       remove_legacy_hooks && echo -e "  ${GREEN}✓${NC} Removed old token-tracking hooks (no longer needed)" || true
@@ -941,7 +1028,9 @@ cmd_upgrade() {
   fi
 
   echo ""
-  if [[ -n "$current_hash" ]]; then
+  if [[ -n "$current_hash" && "$current_hash" == "$latest_hash" ]]; then
+    echo -e "  ${GREEN}✓${NC} Repaired ${BOLD}$latest_hash${NC} (added missing files)"
+  elif [[ -n "$current_hash" ]]; then
     echo -e "  ${GREEN}✓${NC} Upgraded ${DIM}$current_hash${NC} → ${BOLD}$latest_hash${NC}"
   else
     echo -e "  ${GREEN}✓${NC} Upgraded to ${BOLD}$latest_hash${NC}"
@@ -1074,6 +1163,68 @@ except:
   done
 }
 
+cmd_history() {
+  # `vdm history --days 7` and `vdm history --all` mean "list"
+  local sub="list"
+  if [[ "${1:-}" == "-h" || "${1:-}" == "--help" ]]; then sub="help"; shift
+  elif [[ -n "${1:-}" && "$1" != -* ]]; then sub="$1"; shift; fi
+  if [[ ! -f "$SCRIPT_DIR/history.mjs" ]]; then
+    echo -e "${RED}history.mjs is missing.${NC} Run: vdm upgrade"
+    return 1
+  fi
+  local hist=(env NODE_NO_WARNINGS=1 CSW_PORT="$DASHBOARD_PORT" node "$SCRIPT_DIR/history.mjs" cli)
+  case "$sub" in
+    resume|continue)
+      if [[ -z "${1:-}" ]]; then echo -e "${RED}Usage: vdm history $sub <id>${NC}"; return 1; fi
+      local out dir cmd arg
+      out=$("${hist[@]}" launch "$sub" "$1") || return $?
+      { IFS= read -r dir; IFS= read -r cmd; IFS= read -r arg; } <<< "$out" || true
+      local first="${cmd%% *}"
+      first="${first/#\~/$HOME}"
+      if ! command -v "$first" >/dev/null 2>&1; then
+        echo -e "${RED}vdm: '$first' was not found.${NC} Shell aliases do not work here."
+        echo -e "  Set the full command: ${CYAN}vdm config claude-cmd 'claude --your-flags'${NC}"
+        return 1
+      fi
+      cd -- "$dir" || return 1
+      echo -e "  ${DIM}In $dir, running: $cmd …${NC}"
+      if [[ "$sub" == "resume" ]]; then
+        exec bash -c "$cmd \"\$@\"" vdm-claude --resume "$arg"
+      else
+        exec bash -c "$cmd \"\$@\"" vdm-claude "$(cat -- "$arg")"
+      fi
+      ;;
+    prompt)
+      if [[ -z "${1:-}" ]]; then echo -e "${RED}Usage: vdm history prompt <id>${NC}"; return 1; fi
+      local p
+      p=$("${hist[@]}" prompt "$1") || return $?
+      echo "$p"
+      if command -v pbcopy >/dev/null 2>&1; then
+        printf '%s' "$p" | pbcopy && echo -e "  ${GREEN}✓${NC} ${DIM}Copied. Paste it into a new Claude session.${NC}"
+      fi
+      ;;
+    help|-h|--help)
+      echo ""
+      echo -e "${BOLD}  vdm history${NC}  - saved Claude Code sessions"
+      echo ""
+      echo -e "    ${CYAN}vdm history${NC} [--days N] [--all]   Recent sessions (--all: also automated ones)"
+      echo -e "    ${CYAN}vdm history search${NC} <words>        Search everything said (file:x branch:x \"exact words\")"
+      echo -e "    ${CYAN}vdm history show${NC} <id>             Details of one session"
+      echo -e "    ${CYAN}vdm history prompt${NC} <id>           Copy a prompt that continues it in a new session"
+      echo -e "    ${CYAN}vdm history continue${NC} <id>         Start a new session with the handoff loaded"
+      echo -e "    ${CYAN}vdm history resume${NC} <id>           Resume the exact session (restores it if needed)"
+      echo -e "    ${CYAN}vdm history restore${NC} <id>          Put a deleted session back for claude --resume"
+      echo -e "    ${CYAN}vdm history delete${NC} <id>           Remove it from the archive (not from Claude Code)"
+      echo ""
+      echo -e "  ${DIM}<id> can be the first 8 characters. Turn saving on: vdm config history on${NC}"
+      echo ""
+      ;;
+    *)
+      "${hist[@]}" "$sub" "$@"
+      ;;
+  esac
+}
+
 cmd_help() {
   echo ""
   echo -e "${BOLD}  vdm${NC}  - Van Damme-o-Matic"
@@ -1090,6 +1241,7 @@ cmd_help() {
   echo -e "    ${CYAN}dashboard${NC} [start|stop]  Launch/stop the web dashboard"
   echo -e "    ${CYAN}logs${NC} [filter]            Stream live proxy logs"
   echo -e "    ${CYAN}tokens${NC} [--days N]       Show token usage and API-price value"
+  echo -e "    ${CYAN}history${NC} [cmd]            Search and continue saved sessions (vdm history help)"
   echo -e "    ${CYAN}upgrade${NC}                 Update to the latest version"
   echo -e "    ${CYAN}help${NC}                    Show this help"
   echo ""
@@ -1103,6 +1255,7 @@ cmd_help() {
   echo -e "    ${DIM}vdm config proxy on${NC}       Enable auth-swapping proxy"
   echo -e "    ${DIM}vdm config proxy off${NC}      Passthrough mode (no token swap)"
   echo -e "    ${DIM}vdm config autoswitch off${NC}  Disable auto-switch on 429/401"
+  echo -e "    ${DIM}vdm config history on${NC}     Save sessions (search, continue, resume later)"
   echo ""
   echo -e "  ${BOLD}HOW IT WORKS${NC}"
   echo -e "    Accounts are auto-discovered when you run ${DIM}claude login${NC}."
@@ -1115,25 +1268,32 @@ cmd_help() {
 # Main dispatch
 # ─────────────────────────────────────────────────────────
 
-command="${1:-help}"
-shift 2>/dev/null || true
+# Wrapped in a function and exited on the same line: bash reads scripts as it runs them,
+# so nothing after this line is read even if the file changes during the command.
+main() {
+  command="${1:-help}"
+  shift 2>/dev/null || true
 
-case "$command" in
-  add)       cmd_add "$@" ;;
-  label)     cmd_label "$@" ;;
-  list|ls)   cmd_list ;;
-  switch|sw) cmd_switch "$@" ;;
-  remove|rm) cmd_remove "$@" ;;
-  status|st) cmd_status ;;
-  config|cfg) cmd_config "$@" ;;
-  dashboard) cmd_dashboard "$@" ;;
-  logs|log) cmd_logs "$@" ;;
-  tokens|tok) cmd_tokens "$@" ;;
-  upgrade|update) cmd_upgrade ;;
-  help|--help|-h) cmd_help ;;
-  *)
-    echo -e "${RED}Unknown command: $command${NC}"
-    cmd_help
-    exit 1
-    ;;
-esac
+  case "$command" in
+    add)       cmd_add "$@" ;;
+    label)     cmd_label "$@" ;;
+    list|ls)   cmd_list ;;
+    switch|sw) cmd_switch "$@" ;;
+    remove|rm) cmd_remove "$@" ;;
+    status|st) cmd_status ;;
+    config|cfg) cmd_config "$@" ;;
+    dashboard) cmd_dashboard "$@" ;;
+    logs|log) cmd_logs "$@" ;;
+    tokens|tok) cmd_tokens "$@" ;;
+    history|hist) cmd_history "$@" ;;
+    upgrade|update) cmd_upgrade ;;
+    help|--help|-h) cmd_help ;;
+    *)
+      echo -e "${RED}Unknown command: $command${NC}"
+      cmd_help
+      exit 1
+      ;;
+  esac
+}
+
+main "$@"; exit $?

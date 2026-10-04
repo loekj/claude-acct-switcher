@@ -51,8 +51,9 @@ echo ""
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/accounts"
 
-cp "$SCRIPT_DIR/dashboard.mjs" "$INSTALL_DIR/dashboard.mjs"
-cp "$SCRIPT_DIR/lib.mjs" "$INSTALL_DIR/lib.mjs"
+for f in "$SCRIPT_DIR"/*.mjs; do
+  cp "$f" "$INSTALL_DIR/$(basename "$f")"
+done
 cp "$SCRIPT_DIR/vdm" "$INSTALL_DIR/vdm"
 cp "$SCRIPT_DIR/install-hooks.sh" "$INSTALL_DIR/install-hooks.sh"
 chmod +x "$INSTALL_DIR/vdm"

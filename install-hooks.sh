@@ -194,3 +194,41 @@ _uninstall_git_hook() {
     fi
   fi
 }
+
+# ─────────────────────────────────────────────────
+# Upgrade bridge for `vdm upgrade` from v4 and older
+# ─────────────────────────────────────────────────
+# That upgrade copies a fixed list of four files with `cp` over the running vdm, then sources
+# this file. Two problems, both handled here while this file is sourced (before its RETURN
+# trap deletes the checkout):
+#  1. newer modules (history.mjs, ...) are not in its list: copy every *.mjs from the checkout
+#  2. bash keeps reading the vdm file it is running, now overwritten in place with the new
+#     version, from the old offset: after the upgrade it would run random lines. So finish the
+#     upgrade here (old hooks, dashboard restart, message) and exit before bash reads on.
+# The new cmd_upgrade sets _VDM_NEW_UPGRADE and needs none of this.
+if [[ " ${FUNCNAME[*]-} " == *" cmd_upgrade "* && -z "${_VDM_NEW_UPGRADE:-}" \
+      && -n "${tmpdir:-}" && -f "${tmpdir}/dashboard.mjs" && -n "${SCRIPT_DIR:-}" && -d "${SCRIPT_DIR}" ]]; then
+  for _vdm_mod in "$tmpdir"/*.mjs; do
+    [[ -f "$_vdm_mod" ]] || continue
+    _vdm_name="$(basename "$_vdm_mod")"
+    { cp "$_vdm_mod" "$SCRIPT_DIR/.$_vdm_name.new" && mv -f "$SCRIPT_DIR/.$_vdm_name.new" "$SCRIPT_DIR/$_vdm_name"; } 2>/dev/null || true
+  done
+  unset _vdm_mod _vdm_name
+  if declare -F cmd_dashboard >/dev/null; then
+    if has_legacy_hooks; then
+      remove_legacy_hooks && echo -e "  ${GREEN:-}✓${NC:-} Removed old token-tracking hooks (no longer needed)" || true
+    else
+      remove_legacy_hooks 2>/dev/null || true
+    fi
+    if [[ "${dashboard_was_running:-false}" == "true" ]]; then
+      echo -e "  ${DIM:-}Restarting dashboard…${NC:-}"
+      cmd_dashboard start || true
+    fi
+    echo ""
+    echo -e "  ${GREEN:-}✓${NC:-} Upgraded ${DIM:-}${current_hash:-}${NC:-} → ${BOLD:-}${latest_hash:-}${NC:-}"
+    echo ""
+    if declare -F log_activity >/dev/null; then log_activity "upgrade" "from=${current_hash:-unknown}" "to=${latest_hash:-}" || true; fi
+    rm -rf "$tmpdir" 2>/dev/null || true
+    exit 0
+  fi
+fi

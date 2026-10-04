@@ -128,7 +128,21 @@ if [[ -f "$INSTALL_DIR/install-hooks.sh" ]]; then
   uninstall_beta_hooks && echo -e "  ${GREEN}✓${NC} Removed old token tracking hooks (if any)" || true
 fi
 
-# ── 5. Remove install directory ──
+# ── 5. Keep saved sessions (they may be the only copy left) ──
+
+if [[ -d "$INSTALL_DIR/history/sessions" ]] && [[ -n "$(ls -A "$INSTALL_DIR/history/sessions" 2>/dev/null)" ]]; then
+  history_backup="$HOME/.claude/vdm-history-backup-$(date +%Y%m%d-%H%M%S)"
+  if mv "$INSTALL_DIR/history" "$history_backup" 2>/dev/null; then
+    rm -f "$history_backup/.lock" 2>/dev/null || true
+    echo -e "  ${GREEN}✓${NC} Kept your saved sessions in ${CYAN}$history_backup${NC}"
+    echo -e "    ${DIM}After a reinstall, move it back to $INSTALL_DIR/history to keep using it, or delete it.${NC}"
+  else
+    echo -e "  ${YELLOW}Could not move $INSTALL_DIR/history; leaving the install folder in place.${NC}"
+    exit 1
+  fi
+fi
+
+# ── 6. Remove install directory ──
 
 if [[ -d "$INSTALL_DIR" ]]; then
   rm -rf "$INSTALL_DIR"

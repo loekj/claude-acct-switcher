@@ -725,82 +725,118 @@ const HISTORY_MIN_INTERVAL = 2 * 60 * 1000; // 2 min between points
 
 export { HISTORY_MAX_AGE, HISTORY_MIN_INTERVAL };
 
+/**
+ * Usage over time per account (keyed by account name: a token refresh must not start a new
+ * history). One point per fixed time bucket (minInterval): a sample in the same bucket as the
+ * last point updates it, so steady traffic gives one point per bucket instead of one point
+ * that keeps sliding forward. A field that is null (header missing) keeps its last value.
+ */
 export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval = HISTORY_MIN_INTERVAL) {
-  // Map<fingerprint, Array<{ ts, u5h, u7d }>>
+  // Map<key, Array<{ ts, u5h, u7d }>> sorted by ts
   const history = new Map();
+  const bucket = (ts) => Math.floor(ts / minInterval);
+  const num = (v) => (typeof v === 'number' && Number.isFinite(v) ? Math.min(Math.max(v, 0), 1.5) : null);
 
-  function record(fingerprint, u5h, u7d, ts = Date.now()) {
-    if (!history.has(fingerprint)) history.set(fingerprint, []);
-    const arr = history.get(fingerprint);
-    // If the last entry is too recent, update it in place (keeps latest value)
-    if (arr.length > 0 && ts - arr[arr.length - 1].ts < minInterval) {
-      arr[arr.length - 1] = { ts, u5h, u7d };
-    } else {
-      arr.push({ ts, u5h, u7d });
-    }
-    // Prune entries older than the window
+  function record(key, u5h, u7d, ts = Date.now()) {
+    if (!key) return;
+    let a = num(u5h), b = num(u7d);
+    if (a === null && b === null) return; // nothing known from this response
+    if (!history.has(key)) history.set(key, []);
+    const arr = history.get(key);
+    // The clock went back (VM restore, manual change): points "from the future" are wrong
+    while (arr.length && arr[arr.length - 1].ts > ts + 60000) arr.pop();
+    const last = arr[arr.length - 1];
+    if (last && ts < last.ts) return; // slightly out of order: ignore
+    if (a === null) a = last ? last.u5h : null;
+    if (b === null) b = last ? last.u7d : null;
+    const point = { ts, u5h: a, u7d: b }; // null = still unknown
+    if (last && bucket(last.ts) === bucket(ts)) arr[arr.length - 1] = point;
+    else arr.push(point);
     const cutoff = ts - maxAge;
     while (arr.length > 0 && arr[0].ts < cutoff) arr.shift();
   }
 
-  function getHistory(fingerprint) {
-    return history.get(fingerprint) || [];
+  function getHistory(key) {
+    return history.get(key) || [];
   }
 
   /**
-   * Calculate utilization velocity (change per hour) for the 5h window.
-   * Uses only the last 30 minutes of data to reflect current usage rate,
-   * not stale history from hours ago that inflates the slope.
-   * Returns null if insufficient data.
+   * 5h utilization change per hour over the last 30 minutes (0-1 scale), or null. Only the
+   * points since the last drop count: a window reset in between is not "negative usage".
    */
-  function getVelocity(fingerprint) {
-    const arr = history.get(fingerprint);
+  function getVelocity(key, now = Date.now()) {
+    const arr = history.get(key);
     if (!arr || arr.length < 2) return null;
-    // Use recent window (last 30 min) for velocity, not entire history
-    const recentCutoff = Date.now() - 30 * 60 * 1000;
-    const recent = arr.filter(e => e.ts >= recentCutoff);
+    const recentCutoff = now - 30 * 60 * 1000;
+    let recent = arr.filter(e => e.ts >= recentCutoff && typeof e.u5h === 'number');
+    for (let i = recent.length - 1; i > 0; i--) {
+      if (recent[i].u5h < recent[i - 1].u5h - 0.005) { recent = recent.slice(i); break; }
+    }
     if (recent.length < 2) return null;
     const first = recent[0];
     const last = recent[recent.length - 1];
     const timeDeltaHrs = (last.ts - first.ts) / (1000 * 60 * 60);
-    if (timeDeltaHrs < 0.16) return null; // need at least ~10 min of recent data
-    const utilizationDelta = last.u5h - first.u5h;
-    return utilizationDelta / timeDeltaHrs; // change per hour (0-1 scale)
+    if (timeDeltaHrs < 0.16) return null; // need at least ~10 min of data
+    return (last.u5h - first.u5h) / timeDeltaHrs;
   }
 
-  /**
-   * Predict minutes until 5h utilization reaches 1.0 (rate limit).
-   * Returns null if velocity is <= 0 or insufficient data.
-   */
-  function predictMinutesToLimit(fingerprint) {
-    const arr = history.get(fingerprint);
+  /** Minutes until 5h utilization reaches 1.0 at the current pace, or null. */
+  function predictMinutesToLimit(key, now = Date.now()) {
+    const arr = history.get(key);
     if (!arr || arr.length < 2) return null;
-    const velocity = getVelocity(fingerprint);
+    const velocity = getVelocity(key, now);
     if (!velocity || velocity <= 0) return null;
-    const current = arr[arr.length - 1].u5h;
-    const remaining = 1.0 - current;
+    const lastKnown = [...arr].reverse().find(e => typeof e.u5h === 'number');
+    if (!lastKnown) return null;
+    const remaining = 1.0 - lastKnown.u5h;
     if (remaining <= 0) return 0;
-    return Math.round((remaining / velocity) * 60); // minutes
+    return Math.round((remaining / velocity) * 60);
   }
 
   function getAllFingerprints() {
     return [...history.keys()];
   }
 
-  function load(fingerprint, entries) {
-    if (!entries || !entries.length) {
-      history.set(fingerprint, []);
-      return;
+  /** Replace a key's history (sorted, one point per bucket, inside the window). */
+  function load(key, entries, now = Date.now()) {
+    const cutoff = now - maxAge;
+    const out = [];
+    const sorted = (Array.isArray(entries) ? entries : [])
+      .filter(e => e && Number.isFinite(e.ts) && e.ts >= cutoff && e.ts <= now + 60000)
+      .sort((x, y) => x.ts - y.ts);
+    for (const e of sorted) {
+      const point = { ts: e.ts, u5h: num(e.u5h), u7d: num(e.u7d) };
+      if (out.length && bucket(out[out.length - 1].ts) === bucket(e.ts)) out[out.length - 1] = point;
+      else out.push(point);
     }
-    const cutoff = Date.now() - maxAge;
-    const valid = entries.filter(e => e.ts >= cutoff);
-    history.set(fingerprint, valid);
+    history.set(key, out);
+  }
+
+  /** Move a history to another key (merged by time when both exist). */
+  function rename(oldKey, newKey) {
+    if (!history.has(oldKey) || oldKey === newKey) return;
+    const merged = [...getHistory(newKey), ...getHistory(oldKey)];
+    history.delete(oldKey);
+    load(newKey, merged);
+  }
+
+  /** Forget a key (an account was removed: its name may be reused by another account). */
+  function remove(key) { history.delete(key); }
+
+  /** Drop points (and keys) older than the window: keys nobody records to anymore. */
+  function prune(now = Date.now()) {
+    const cutoff = now - maxAge;
+    for (const [key, arr] of history) {
+      while (arr.length > 0 && arr[0].ts < cutoff) arr.shift();
+      if (!arr.length) history.delete(key);
+    }
   }
 
   function toJSON() {
+    prune();
     const out = {};
-    for (const [fp, arr] of history.entries()) {
-      if (arr.length) out[fp] = arr;
+    for (const [key, arr] of history.entries()) {
+      if (arr.length) out[key] = arr;
     }
     return out;
   }
@@ -809,7 +845,7 @@ export function createUtilizationHistory(maxAge = HISTORY_MAX_AGE, minInterval =
     history.clear();
   }
 
-  return { record, getHistory, getVelocity, predictMinutesToLimit, getAllFingerprints, load, toJSON, clear };
+  return { record, getHistory, getVelocity, predictMinutesToLimit, getAllFingerprints, load, rename, remove, prune, toJSON, clear };
 }
 
 // ─────────────────────────────────────────────────
@@ -1523,4 +1559,154 @@ export function originAllowed(origin, port = null) {
 export function isSameOrigin(origin, host) {
   if (typeof host !== 'string' || !host) return false;
   try { return new URL(origin).host === host.toLowerCase(); } catch { return false; }
+}
+
+// ─────────────────────────────────────────────────
+// Token throughput per account (account-card charts)
+// ─────────────────────────────────────────────────
+
+export const THROUGHPUT_BUCKET_MS = 5 * 60 * 1000;
+
+/** Chart group of a model: fable | opus | sonnet | haiku | other. */
+export function usageFamily(model) {
+  return modelFamily(model) || (/haiku/i.test(String(model || '')) ? 'haiku' : 'other');
+}
+
+/** All tokens a request moved: uncached input + cache reads + cache writes + output. */
+export function totalTokens(u) {
+  if (!u) return 0;
+  return (u.input || 0) + (u.output || 0) + (u.cacheRead || 0) + (u.cacheWrite5m || 0) + (u.cacheWrite1h || 0);
+}
+
+/**
+ * Tokens per account in fixed time buckets, split by model family. Kept for maxAge.
+ * series() returns [{ t, w, by: { family: tokens } }] for the buckets that saw traffic.
+ */
+export function createThroughputStore({ bucketMs = THROUGHPUT_BUCKET_MS, maxAge = 26 * 60 * 60 * 1000, now = () => Date.now() } = {}) {
+  const data = new Map(); // key → Map<bucketStart, { family: tokens }>
+  let startedAt = now();  // first moment this store recorded (older periods come from hourly rollups)
+
+  function add(key, model, tokens, ts = now()) {
+    if (!key || !(tokens > 0)) return;
+    const t = Math.floor(ts / bucketMs) * bucketMs;
+    let buckets = data.get(key);
+    if (!buckets) data.set(key, (buckets = new Map()));
+    const by = buckets.get(t) || {};
+    const fam = usageFamily(model);
+    by[fam] = (by[fam] || 0) + tokens;
+    buckets.set(t, by);
+  }
+
+  function series(key, since, until = now()) {
+    const out = [];
+    for (const [t, by] of data.get(key) || []) {
+      if (t + bucketMs > since && t <= until) out.push({ t, w: bucketMs, by: { ...by } });
+    }
+    return out.sort((a, b) => a.t - b.t);
+  }
+
+  function prune(at = now()) {
+    const cutoff = at - maxAge;
+    for (const [key, buckets] of data) {
+      for (const t of buckets.keys()) if (t + bucketMs <= cutoff) buckets.delete(t);
+      if (!buckets.size) data.delete(key);
+    }
+  }
+
+  function remove(key) { data.delete(key); }
+
+  function rename(oldKey, newKey) {
+    const from = data.get(oldKey);
+    if (!from || oldKey === newKey) return;
+    data.delete(oldKey);
+    for (const [t, by] of from) for (const [fam, n] of Object.entries(by)) {
+      let buckets = data.get(newKey);
+      if (!buckets) data.set(newKey, (buckets = new Map()));
+      const cur = buckets.get(t) || {};
+      cur[fam] = (cur[fam] || 0) + n;
+      buckets.set(t, cur);
+    }
+  }
+
+  function toJSON() {
+    prune();
+    const out = {};
+    for (const [key, buckets] of data) out[key] = [...buckets.entries()];
+    return { v: 1, bucketMs, startedAt, data: out };
+  }
+
+  function load(json) {
+    data.clear();
+    if (!json || json.bucketMs !== bucketMs) return; // a different bucket size: start over
+    if (Number.isFinite(json.startedAt)) startedAt = json.startedAt;
+    for (const [key, entries] of Object.entries(json.data || {})) {
+      const buckets = new Map();
+      for (const [t, by] of Array.isArray(entries) ? entries : []) {
+        if (!Number.isFinite(t) || t > now() + 60000 || !by || typeof by !== 'object') continue;
+        const clean = {};
+        for (const [fam, n] of Object.entries(by)) if (Number.isFinite(n) && n > 0) clean[fam] = n;
+        if (Object.keys(clean).length) buckets.set(t, clean);
+      }
+      if (buckets.size) data.set(key, buckets);
+    }
+    prune();
+  }
+
+  return { add, series, prune, rename, remove, toJSON, load, get startedAt() { return startedAt; }, bucketMs };
+}
+
+/**
+ * Hourly throughput per account from the usage rollups: { account: [{ t, w, by }] }.
+ * `scale` divides each value (e.g. 12 to show an hour as an average 5-minute rate).
+ */
+export function throughputFromRollups(rows, { since = 0, until = Infinity, scale = 1 } = {}) {
+  const acc = {};
+  for (const r of rows || []) {
+    if (!(r.h >= since && r.h < until)) continue;
+    const n = totalTokens(r);
+    if (!n) continue;
+    const perAcct = acc[r.account] || (acc[r.account] = new Map());
+    const by = perAcct.get(r.h) || {};
+    const fam = usageFamily(r.model);
+    by[fam] = (by[fam] || 0) + n / scale;
+    perAcct.set(r.h, by);
+  }
+  const out = {};
+  for (const [account, m] of Object.entries(acc)) {
+    out[account] = [...m.entries()].sort((a, b) => a[0] - b[0]).map(([t, by]) => ({ t, w: 3600000, by }));
+  }
+  return out;
+}
+
+/**
+ * Total tokens per 5 minutes as an evenly spaced series for the account line charts.
+ * - step = 5 min: each value is that 5-minute total, from the 5-minute store (`fine`); slots
+ *   from before the store existed use their hour's average from the hourly rollups.
+ * - step = 1 h: each value is the hour's average per 5 minutes (same unit, same "hot" line).
+ * Missing slots are 0: every request goes through the proxy, so no data means no traffic.
+ * The running hour is averaged over its elapsed part only.
+ */
+export function throughputLine({ fine = [], hourly = [], startedAt = 0, now = Date.now(), windowMs, step = THROUGHPUT_BUCKET_MS }) {
+  const H = 3600000, F = THROUGHPUT_BUCKET_MS;
+  const total = (by) => Object.values(by || {}).reduce((a, b) => a + (b || 0), 0);
+  const n = Math.max(1, Math.round(windowMs / step));
+  const last = Math.floor(now / step) * step;
+  const start = last - (n - 1) * step;
+  const hours = new Map(hourly.map(x => [x.t, total(x.by)]));
+  const hourAvg = (h) => {
+    const v = hours.get(h) || 0;
+    const slots = h + H > now ? Math.max(1, Math.ceil((now - h) / F)) : H / F;
+    return v / slots;
+  };
+  const fineMap = new Map(fine.map(x => [Math.floor(x.t / step) * step, total(x.by)]));
+  const fineFrom = Math.floor(startedAt / step) * step;
+  const values = new Array(n);
+  let sum = 0; // real tokens in the window (the running hour is not extrapolated)
+  for (let i = 0; i < n; i++) {
+    const t = start + i * step;
+    if (step === H) { values[i] = Math.round(hourAvg(t)); sum += hours.get(t) || 0; }
+    else if (t >= fineFrom) { values[i] = fineMap.get(t) || 0; sum += values[i]; }
+    else { const h = Math.floor(t / H) * H; values[i] = Math.round(hourAvg(h)); sum += (hours.get(h) || 0) / (H / F); }
+  }
+  return { start, step, values, total: Math.round(sum) };
 }
