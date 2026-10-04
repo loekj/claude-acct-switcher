@@ -7,8 +7,15 @@ config.json
 activity-log.json
 account-state.json
 utilization-history.json
+throughput.json
 probe-log.json
 token-usage.json
+token-usage.imported.json
+session-history.json
+sessions.json
+artifacts.json
+usage/
+history/
 .dashboard.pid
 
 # Logs

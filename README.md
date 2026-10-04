@@ -43,7 +43,15 @@ Restart your terminal. Done. The proxy auto-starts on new shells.
 vdm upgrade
 ```
 
-Fetches the latest release, auto-installs hooks, and restarts the dashboard.
+Fetches the latest release, removes hooks older versions installed, and restarts the dashboard.
+
+**Coming from v3.0.0 or older?** The upgrade command of those versions only knows a fixed list of files, so it leaves out newer ones (such as `history.mjs`). Reinstall once instead; your accounts and settings stay:
+
+```bash
+git clone https://github.com/loekj/claude-acct-switcher.git && cd claude-acct-switcher && ./install.sh
+```
+
+From v3.0.1 on, `vdm upgrade` handles this by itself.
 
 ## Usage
 
@@ -64,45 +72,73 @@ vdm status                  Current account + settings
 vdm config [key] [on|off]   View/toggle settings
 vdm dashboard [start|stop]  Dashboard control
 vdm logs [filter]           Stream live proxy logs
-vdm tokens [options]        Show token usage (BETA)
+vdm tokens [--days N]       Show token usage and API-price value
+vdm history [cmd]           Search and continue saved sessions (see below)
 vdm upgrade                 Update to latest version
 ```
 
 ### Dashboard
 
-`http://localhost:3333` — accounts, rate limits, token usage, activity log.
+`http://localhost:3333`  - accounts, sessions, history, artifacts, usage, activity log.
 
-#### Tokens Tab (BETA)
+#### Accounts
 
-Per-session token usage tracking with breakdowns by model, repo, branch, and time range.
+Per account: 5h and weekly windows, plus a separate **Fable weekly** bar when the account has that bucket (Fable has its own weekly limit). Under them, a line shows the account's **token throughput** (all models, incl. cache reads) per 5 minutes: the last 24 hours, and the last 7 days as hourly averages. All accounts share one scale, so a busy account stands out; above the **hot line** (Config, default 25M tokens per 5 minutes) the line turns red.
 
-- **Filter row** — repo, branch, model, and time range (1d/7d/30d/90d)
-- **Summary stats** — total tokens, input, output, requests at a glance
-- **Daily stacked bar chart** — per-model colored segments with hover tooltips
-- **Model breakdown** — input/output split with proportional bars
-- **Repo/branch breakdown** — sorted by total tokens, with per-model detail
+Usage, charts and saved sessions are kept per account **email** (stored in `accounts/<name>.email`), so they carry on after a re-login, a token refresh, or removing and adding an account again. Each card lists the Claude Code sessions that ran through it in the last 24 hours, the account's 30-day cache hit rate, and how many artifacts it owns.
 
-Token usage is tracked via Claude Code hooks and attributed to the correct git repo and branch — including worktrees.
+#### Sessions & affinity
 
-#### Commit Token Trailers
+Prompt caches live per account. When a running session jumps to another account, its whole cache is written again there (1.25-2x the input price instead of ~0.1x), and limits burn faster.
 
-When enabled, a `prepare-commit-msg` git hook appends a `Token-Usage:` trailer to each commit message showing the tokens consumed since the previous commit. This is **disabled by default**.
+With **session affinity** (on by default) every Claude Code session  - and each of its subagents  - stays on one account while its cache is warm. It only moves when that account is rate limited, used up, expired or failing. The rotation strategy decides where *new* and *idle* sessions go. Works with every strategy.
 
-To enable:
+Sessions are named by their `/rename` name, else `branch:id`. Each shows an affinity indicator:
+
+| Bars | Meaning |
+|------|---------|
+| 3 green | Locked: no move with a warm cache in the last hour |
+| 2 yellow | Holding: one warm move in the last hour, or requests a bit spread |
+| 1 red | Drifting: repeated warm moves or requests spread over accounts |
+
+#### History (off by default)
+
+Claude Code deletes a session's transcript after 30 days, and a long or broken session is hard to carry into a new one. Turn on **session history** and vdm keeps every session, so you can find it again and continue it:
 
 ```bash
-vdm config commit-tokens on
+vdm config history on
 ```
 
-Example commit message:
+- **Saved without extra disk.** While Claude Code still has a transcript, vdm's copy is a hard link to the same file. When Claude Code deletes it, vdm's link keeps the data and is compressed (about 4x smaller). vdm never writes to Claude Code's files.
+- **Search everything.** Your prompts, Claude's replies, file names and commands are indexed (full-text, on this computer; no AI, no extra cost). Filters: `file:app.js`, `branch:fix`, `project:x`, `account:a@b`, `after:2026-09-01`, `"exact words"`. Each result shows your first and last prompt, the files it changed, the accounts it used and its cost at API prices.
+- **Continue in a new session.** *Copy prompt* writes a handoff file (Claude Code's latest compaction summary, the newest messages, files changed, last commands) and copies a one-line prompt. Paste it into any new Claude session. Or run `vdm history continue <id>` to open a new session in the right folder with the handoff loaded.
+- **Resume exactly.** `vdm history resume <id>` runs `claude --resume` in the session's folder. If Claude Code already deleted the session, vdm puts its copy back first (it never overwrites a file).
+- **Your launch command.** If you start Claude Code with flags (or an alias), set the full command once: `vdm config claude-cmd 'claude --dangerously-skip-permissions'`. Shell aliases do not work inside vdm. `VDM_CLAUDE_CMD` overrides it.
 
 ```
-Fix login validation bug
-
-Token-Usage: 12,345 tokens (claude-sonnet-4-20250514)
+vdm history [--days N] [--all]   Recent sessions (--all: include automated `claude -p` runs)
+vdm history search <words>       Search all sessions
+vdm history show <id>            Details (id = first 8 characters is enough)
+vdm history prompt <id>          Copy the "continue" prompt
+vdm history continue <id>        New session with the handoff loaded
+vdm history resume <id>          Resume the exact session (restores it if needed)
+vdm history restore <id>         Put a deleted session back for claude --resume
+vdm history delete <id>          Delete it from the archive (not from Claude Code); never saved again
 ```
 
-The hook queries the dashboard for usage data and silently skips the trailer if the dashboard is unreachable or the setting is off. Merge, squash, and amend commits are always skipped. After changing this setting, run `vdm hooks` to reinstall the hook.
+Saved sessions live in `~/.claude/account-switcher/history/` (only you can read it). The Config tab can keep them for a limited time and skip folders. Turning history off stops saving and keeps what was saved; uninstalling moves it to `~/.claude/vdm-history-backup-<date>`. The work runs in a separate low-priority process, so the proxy never waits on it.
+
+#### Artifacts
+
+Claude Code publishes artifacts with its own login (the account in the Keychain), not through the proxy. The Artifacts tab asks every account which artifacts it owns (every 15 minutes, or on demand). Paste an artifact link to find its owner. Artifact links seen in a session's messages are linked to that session.
+
+#### Usage
+
+Every request through the proxy is counted (input, output, cache reads, cache writes), per account, model, repo and branch. Data is kept as hourly rollups in `usage/` (one file per day), so it survives restarts and re-logins and has no row cap.
+
+- **Plan value**  - each Max account's subscription price (20x $200, 5x $100, prorated) vs the same usage at API prices
+- **Cache efficiency**  - rolling 30-day cache hit rate per account and per model, with a daily trend
+- Model, account and repo/branch breakdowns; CSV export of the hourly rows
 
 ### Settings
 
@@ -113,7 +149,10 @@ vdm config rotation <strategy>    # sticky|conserve|round-robin|spread|drain-fir
 vdm config interval <minutes>     # Round-robin timer
 vdm config serialize on|off       # Serialize proxy requests
 vdm config serialize-delay <ms>   # Serialization delay
-vdm config commit-tokens on|off  # Token-Usage trailer in commits
+vdm config affinity on|off        # Keep each session on one account
+vdm config history on|off         # Save sessions (search, continue, resume)
+vdm config claude-cmd '<command>' # How vdm starts Claude Code (full command, not an alias)
+vdm config history-keep <days>    # Delete saved sessions older than this (0 = forever)
 ```
 
 ### Rotation Strategies
@@ -125,13 +164,17 @@ vdm config commit-tokens on|off  # Token-Usage trailer in commits
 | **Round-robin** | Rotate every N minutes |
 | **Spread** | Always pick lowest utilization |
 | **Drain first** | Use highest 5hr utilization first |
+| **Balance** | Put new sessions on the least-loaded account, capped per account |
+
+All strategies skip accounts whose 5h or weekly window is used up. Per-model weekly limits (Fable, and weekly Opus or Sonnet limits) only steer that model's requests away; other models keep using the account. With session affinity on, the strategy only places new and idle sessions.
 
 ## How It Works
 
 ```
 Claude Code  ──ANTHROPIC_BASE_URL──>  Local Proxy (:3334)  ──>  api.anthropic.com
                                           |
-                                          |-- Picks account per rotation strategy
+                                          |-- Keeps each session on its account (affinity)
+                                          |-- Places new sessions per rotation strategy
                                           |-- Swaps Authorization header
                                           |-- On 429 → retries with next account
                                           |-- On 401 → refreshes token, then switches
@@ -162,7 +205,7 @@ The proxy is designed to never kill your Claude Code sessions, even when things 
 
 ### Worktree Support
 
-Sessions running in git worktrees are correctly grouped with the parent repo in the dashboard and token tracking. The proxy resolves the main repo root via `--git-common-dir` and re-reads the checked-out branch on every prompt.
+Sessions running in git worktrees are grouped with the parent repo in the Usage tab. The proxy resolves the main repo root via `--git-common-dir` and maps Claude Code's `worktree-*` branches back to the real branch.
 
 ## Ports
 
@@ -171,11 +214,15 @@ Sessions running in git worktrees are correctly grouped with the parent repo in 
 | 3333 | Web Dashboard | `CSW_PORT` |
 | 3334 | API Proxy | `CSW_PROXY_PORT` |
 
+Both ports answer only this computer. Other devices get `403`, and the dashboard refuses requests from other web pages (foreign `Origin`, wrong `Host`). To let another device or a devcontainer (`host.docker.internal`) use the proxy, start the dashboard with `CSW_ALLOW_REMOTE=1`. Web pages stay blocked.
+
 ## Testing
 
 ```bash
 node --test 'test/*.test.mjs'
 ```
+
+To run a throwaway copy of the proxy without touching your real login, point it at a test Keychain item and a stand-in API: `CSW_KEYCHAIN_SERVICE=vdm-test CSW_UPSTREAM=http://127.0.0.1:9999 CSW_PORT=4333 CSW_PROXY_PORT=4334 node dashboard.mjs` (run it from a copy with its own `accounts/`).
 
 ## Uninstall
 

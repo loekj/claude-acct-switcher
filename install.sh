@@ -51,8 +51,9 @@ echo ""
 mkdir -p "$INSTALL_DIR"
 mkdir -p "$INSTALL_DIR/accounts"
 
-cp "$SCRIPT_DIR/dashboard.mjs" "$INSTALL_DIR/dashboard.mjs"
-cp "$SCRIPT_DIR/lib.mjs" "$INSTALL_DIR/lib.mjs"
+for f in "$SCRIPT_DIR"/*.mjs; do
+  cp "$f" "$INSTALL_DIR/$(basename "$f")"
+done
 cp "$SCRIPT_DIR/vdm" "$INSTALL_DIR/vdm"
 cp "$SCRIPT_DIR/install-hooks.sh" "$INSTALL_DIR/install-hooks.sh"
 chmod +x "$INSTALL_DIR/vdm"
@@ -131,11 +132,15 @@ else
   echo '    # END claude-account-switcher'
 fi
 
-# ── [BETA] Install token tracking hooks ──
+# ── Remove hooks older versions installed (no longer needed) ──
 
 if [[ -f "$INSTALL_DIR/install-hooks.sh" ]]; then
   source "$INSTALL_DIR/install-hooks.sh"
-  install_beta_hooks && echo -e "  ${GREEN}✓${NC} [BETA] Token tracking hooks installed" || true
+  if has_legacy_hooks; then
+    remove_legacy_hooks && echo -e "  ${GREEN}✓${NC} Removed old token-tracking hooks" || true
+  else
+    remove_legacy_hooks 2>/dev/null || true
+  fi
 fi
 
 echo ""

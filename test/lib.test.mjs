@@ -208,7 +208,7 @@ describe('createAccountStateManager', () => {
 
   it('remove() deletes entry', () => {
     const sm = createAccountStateManager();
-    sm.update('tok1', 'acct1', {});
+    sm.update('tok1', 'acct1', { 'anthropic-ratelimit-unified-status': 'allowed' });
     assert.ok(sm.get('tok1'));
     sm.remove('tok1');
     assert.equal(sm.get('tok1'), undefined);
