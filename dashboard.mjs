@@ -111,6 +111,7 @@ const DEFAULT_SETTINGS = {
   historyExclude: [],         // folders whose sessions are never saved
   claudeCommand: 'claude',    // how `vdm history continue|resume` and copied commands start Claude Code
   hotTokensPer5m: 25_000_000, // account charts: above this many tokens per 5 minutes the line turns red
+  keepWarm: true,             // ping idle sessions so their prompt cache stays warm (smart, learned); on unless turned off
 };
 
 // Settings of features removed in v4 (commit token trailers, AI session monitor).
@@ -136,6 +137,7 @@ function clampSettings(s) {
   s.balanceWaitMs = n(s.balanceWaitMs, 10000, 0, 30000);
   s.hotTokensPer5m = Math.round(n(s.hotTokensPer5m, 25_000_000, 100_000, 10_000_000_000));
   s.sessionHistory = s.sessionHistory === true;
+  s.keepWarm = s.keepWarm !== false;
   s.historyRetentionDays = Math.floor(n(s.historyRetentionDays, 0, 0, 3650));
   const excludeAsked = (typeof s.historyExclude === 'string' ? s.historyExclude.split(/\r?\n/) : Array.isArray(s.historyExclude) ? s.historyExclude : [])
     .filter(x => typeof x === 'string' && x.trim());
@@ -292,6 +294,23 @@ import {
   ROTATION_INTERVALS,
   createThroughputStore,
   throughputFromRollups,
+  HOUR_MS,
+  KEEP_WARM_MIN_TOKENS,
+  SIDE_CALL_MAX_TOKENS,
+  lostCacheTokens,
+  rebuildCost,
+  pingCostRatio,
+  breakEvenPings,
+  isCacheRebuild,
+  cacheFingerprint,
+  classifyRebuild,
+  returnCurve,
+  weibullCurve,
+  RETURN_PRIOR,
+  bestPingCount,
+  createKeepWarmPlanner,
+  createCacheLedger,
+  setTopLevelJsonFields,
   throughputLine,
   totalTokens,
   THROUGHPUT_BUCKET_MS,
@@ -901,6 +920,16 @@ async function handleAPI(req, res) {
 
   if (url.pathname === '/api/history' || url.pathname.startsWith('/api/history/')) return handleHistoryAPI(req, res, url);
 
+  if (url.pathname === '/api/cache-care' && req.method === 'GET') { json(res, cacheCareReport()); return true; }
+  if (url.pathname === '/api/cache-care/mode' && req.method === 'POST') {
+    const { sid, mode } = JSON.parse(await readBody(req) || '{}');
+    if (!sid || typeof sid !== 'string' || !['auto', 'pin', 'never'].includes(mode)) { json(res, { error: 'sid and mode (auto|pin|never) required' }, 400); return true; }
+    keepWarmPlanner.setMode(sid, mode);
+    cacheCare.dirty = true;
+    json(res, { ok: true, sid, mode });
+    return true;
+  }
+
   if (url.pathname === '/api/profiles' && req.method === 'GET') {
     const profiles = await loadProfiles();
     // Attach utilization history + velocity to each profile
@@ -926,7 +955,8 @@ async function handleAPI(req, res) {
     json(res, {
       profiles, stats, probeStats, allExhausted, earliestReset,
       rotationStrategy: settings.rotationStrategy, balanceCap: settings.maxConcurrentPerAccount || 8,
-      sessionAffinity: settings.sessionAffinity !== false, sessionHistory: settings.sessionHistory === true, hotTokensPer5m: settings.hotTokensPer5m, queueStats: getQueueStats(),
+      sessionAffinity: settings.sessionAffinity !== false, sessionHistory: settings.sessionHistory === true, hotTokensPer5m: settings.hotTokensPer5m,
+      cacheCare: cacheCareHeadline(), queueStats: getQueueStats(),
     });
     return true;
   }
@@ -1117,6 +1147,10 @@ async function handleAPI(req, res) {
     if (typeof patch.sessionAffinity === 'boolean') settings.sessionAffinity = patch.sessionAffinity;
     if (typeof patch.hotTokensPer5m === 'number' && patch.hotTokensPer5m >= 100_000 && patch.hotTokensPer5m <= 10_000_000_000) {
       settings.hotTokensPer5m = Math.round(patch.hotTokensPer5m);
+    }
+    if (typeof patch.keepWarm === 'boolean' && patch.keepWarm !== settings.keepWarm) {
+      settings.keepWarm = patch.keepWarm;
+      log('cache', patch.keepWarm ? 'Keep-warm on: idle sessions keep their prompt cache (learned limits)' : 'Keep-warm off');
     }
     const historyBefore = JSON.stringify(historyConfig());
     if (typeof patch.sessionHistory === 'boolean') settings.sessionHistory = patch.sessionHistory;
@@ -2182,6 +2216,26 @@ function renderHTML() {
   .sparkline-svg { display: block; width: 100%; height: auto; }
   .spark-legend { display: flex; flex-wrap: wrap; gap: 0.125rem 0.625rem; font-size: 0.625rem; color: var(--muted); margin-top: 0.125rem; font-variant-numeric: tabular-nums; }
   .spark-hot { color: var(--red); font-weight: 600; }
+
+  /* ── Smart cache ── */
+  .sc-head { display: flex; align-items: center; gap: 1rem; margin: 0.25rem 0 0.875rem; }
+  .sc-big { font-size: 2.25rem; font-weight: 700; line-height: 1; color: var(--green); font-variant-numeric: tabular-nums; }
+  .sc-big.none { color: var(--muted); font-size: 1.5rem; }
+  .sc-sub { font-size: 0.8125rem; color: var(--muted); line-height: 1.5; }
+  .sc-sub b { color: var(--foreground); }
+  .sc-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.75rem; }
+  .sc-cell { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.625rem 0.75rem; font-size: 0.8125rem; line-height: 1.5; min-width: 0; }
+  .sc-cell-title { font-weight: 600; margin-bottom: 0.25rem; }
+  .sc-num { font-variant-numeric: tabular-nums; }
+  .sc-cause { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.5rem; font-size: 0.75rem; padding: 0.125rem 0; }
+  .sc-cause-name { color: var(--muted); line-height: 1.35; }
+  .sc-learned { font-size: 0.75rem; color: var(--muted); margin-top: 0.75rem; }
+  .sc-off { font-size: 0.8125rem; background: var(--yellow-soft); border: 1px solid var(--yellow-border); border-radius: var(--radius-sm); padding: 0.5rem 0.75rem; margin-bottom: 0.75rem; }
+  .sess-cache { display: flex; align-items: center; gap: 0.5rem; font-size: 0.75rem; color: var(--muted); margin-top: 0.375rem; flex-wrap: wrap; }
+  .sess-cache b { color: var(--foreground); font-weight: 600; }
+  .sess-cache .ok { color: var(--green); }
+  .sess-cache select { font-size: 0.6875rem; padding: 0.0625rem 0.25rem; margin-left: auto; }
+  @media (max-width: 720px) { .sc-grid { grid-template-columns: minmax(0, 1fr); } }
   .velocity-badge {
     font-size: 0.6875rem;
     font-weight: 500;
@@ -2564,6 +2618,7 @@ function renderHTML() {
       </select>
       <button class="tok-export-btn" onclick="exportUsageCsv()">Export CSV</button>
     </div>
+    <div class="usage-card" style="margin-bottom:1rem" id="tok-smartcache"><div class="usage-title">Smart cache</div><div class="sc-sub">Loading...</div></div>
     <div id="tok-empty" class="empty-state" style="display:none"></div>
     <div id="tok-content" style="display:none">
       <div id="tok-stats" class="stat-grid" style="margin-bottom:1rem"></div>
@@ -2732,6 +2787,18 @@ function renderHTML() {
             <div class="config-desc" title="Prompt caches live per account. Moving a running session rebuilds its whole cache on the new account, which costs more and uses up limits faster. A session only moves when its account is limited, expired or failing. The rotation strategy decides where new and idle sessions go.">Running sessions stay on their account while their cache is warm (saves cost and limits). New and idle sessions follow the strategy.</div>
           </div>
           <input type="checkbox" class="sw" id="toggle-affinity" aria-label="Session affinity" checked onchange="toggleSetting('sessionAffinity', this.checked)">
+        </div>
+      </div>
+
+      <div class="config-section">
+        <div class="config-section-title">Cache Care</div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Keep idle sessions' caches warm</div>
+            <div class="config-desc">Just before an open session's prompt cache expires, vdm resends its last request with "no answer needed", on the same account. That costs a cache read (a few % of a rebuild) and keeps the cache. How long to keep each session warm is learned from when you come back. On by default. Pings use a little of your plan's usage. Needs session affinity.</div>
+            <div class="config-desc" id="keepwarm-learned" style="margin-top:0.375rem"></div>
+          </div>
+          <input type="checkbox" class="sw" id="toggle-keepwarm" aria-label="Keep caches warm" onchange="toggleSetting('keepWarm', this.checked)">
         </div>
       </div>
 
@@ -3147,7 +3214,7 @@ function quickHash(obj) {
 async function refresh() {
   try {
     const resp = await fetch('/api/profiles');
-    const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy, balanceCap, sessionAffinity, sessionHistory, hotTokensPer5m, queueStats } = await resp.json();
+    const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy, balanceCap, sessionAffinity, sessionHistory, hotTokensPer5m, cacheCare, queueStats } = await resp.json();
     HIST.enabled = !!sessionHistory;
     if (hotTokensPer5m) HOT_TOKENS = hotTokensPer5m;
     _cachedProfiles = profiles;
@@ -3164,7 +3231,7 @@ async function refresh() {
     if (rotationStrategy) {
       const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first', balance: 'Balance' };
       document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy) +
-        (sessionAffinity ? ' \\u00b7 session affinity on' : ' \\u00b7 session affinity off');
+        (sessionAffinity ? ' \\u00b7 session affinity on' : ' \\u00b7 session affinity off') + smartCacheHeadline(cacheCare);
     }
     if (probeStats) renderProbeStats(probeStats);
     // [BETA] Queue stats
@@ -3484,6 +3551,8 @@ async function loadSettingsUI() {
     document.getElementById('serialize-delay-ctrl').style.display = s.serializeRequests ? '' : 'none';
     document.getElementById('toggle-affinity').checked = s.sessionAffinity !== false;
     document.getElementById('toggle-history').checked = s.sessionHistory === true;
+    document.getElementById('toggle-keepwarm').checked = s.keepWarm !== false;
+    loadKeepWarmLearned();
     var hot = document.getElementById('sel-hot');
     var hotVal = String(s.hotTokensPer5m || 25000000);
     if (![].some.call(hot.options, function(o) { return o.value === hotVal; })) {
@@ -3545,6 +3614,7 @@ async function toggleSetting(key, value) {
       serializeRequests: value ? 'Request serialization enabled' : 'Request serialization disabled',
       sessionAffinity: value ? 'Session affinity on' : 'Session affinity off  - sessions follow the strategy per request',
       sessionHistory: value ? 'Session history on: saving your sessions' : 'Session history off (saved sessions are kept)',
+      keepWarm: value ? 'Keep-warm on: idle sessions keep their cache' : 'Keep-warm off',
     };
     if (key === 'sessionHistory') { HIST.enabled = value; setTimeout(function() { refreshHistory(); }, 600); }
     showToast(msgs[key] || (key + ' = ' + value));
@@ -3661,6 +3731,7 @@ function tokTotal(t) { return tokPrompt(t) + (t.output || 0); }
 async function refreshTokens(force) {
   var tab = document.getElementById('tab-usage');
   if (!tab || !tab.classList.contains('active')) return;
+  refreshSmartCache();
   if (!force && _usage && Date.now() - _usageFetchedAt < USAGE_REFRESH_MS) return;
   if (_tokFetching) { _tokNeedsRefresh = true; return; }
   _tokFetching = true;
@@ -4047,6 +4118,108 @@ function exportUsageCsv() {
     if (el && el.value) q += '&' + k + '=' + encodeURIComponent(el.value);
   });
   window.location = '/api/usage/export?' + q;
+}
+
+
+// ── Smart cache ──
+var SC_CAUSE = {
+  idle: 'idle past cache lifetime', account: 'moved to another account', model: 'model switched',
+  tools: 'tool list changed', system: 'system prompt changed', settings: 'thinking or settings changed',
+  beta: 'API beta header changed', history: 'history rewritten (e.g. compaction)', unknown: 'dropped upstream',
+};
+var SC_STOP = {
+  done: 'learned limit reached', cold: 'cache had already expired', missed: 'ping missed the cache', 'near-limit': 'account near its limit',
+  'rate-limited': 'rate limited', moved: 'session moved account', unsupported: 'this model cannot be kept warm',
+  network: 'network error', 'no-request-kept': 'no request kept yet', 'account-removed': 'account removed',
+};
+var _scFetchedAt = 0;
+
+function money(n) {
+  var a = Math.abs(n || 0);
+  return (n < 0 ? '-' : '') + (a >= 100 ? '$' + Math.round(a).toLocaleString() : '$' + a.toFixed(2));
+}
+
+function smartCacheHeadline(c) {
+  if (!c || c.pct == null || !(c.saved > 0.005)) return '';
+  return ' · smart cache saved ' + Math.round(c.pct * 100) + '% (≈ ' + money(c.saved) + ' this week)';
+}
+
+async function refreshSmartCache() {
+  if (Date.now() - _scFetchedAt < 15000) return;
+  _scFetchedAt = Date.now();
+  try { renderSmartCache(await (await fetch('/api/cache-care')).json()); } catch (e) { /* next refresh */ }
+}
+
+function renderSmartCache(d) {
+  var el = document.getElementById('tok-smartcache');
+  if (!el || !d || !d.week) return;
+  var w = d.week, m = d.month;
+  var head = w.pct == null && w.pings > 0
+    ? '<div class="sc-big none">0%</div><div class="sc-sub">' + w.pings + ' keep-warm pings so far (' + money(w.pingCost) + '); no session has come back to a kept cache yet.</div>'
+    : w.pct == null
+    ? '<div class="sc-big none">–</div><div class="sc-sub">No cache savings or rebuilds recorded yet this week.</div>'
+    : w.saved < 0
+      ? '<div class="sc-big none">0%</div><div class="sc-sub">Keep-warm cost <b>≈ ' + money(-w.saved) + '</b> more than it saved this week (pings for sessions that did not come back in time).</div>'
+      : '<div class="sc-big">' + Math.round(w.pct * 100) + '%</div><div class="sc-sub">of prompt-cache rebuild cost avoided this week · <b>≈ ' + money(w.saved) + '</b> saved' +
+        (m.pct != null ? '<br>30 days: ' + Math.round(m.pct * 100) + '% · ≈ ' + money(m.saved) : '') + '</div>';
+  var causes = Object.keys(w.rebuilds || {}).map(function(k) { return [k, w.rebuilds[k]]; }).sort(function(a, b) { return b[1].cost - a[1].cost; });
+  var lost = causes.length ? causes.slice(0, 6).map(function(c) {
+    return '<div class="sc-cause"><span class="sc-cause-name">' + escHtml(SC_CAUSE[c[0]] || c[0]) + '</span>' +
+      '<span class="sc-num">' + c[1].count + '× · ' + money(c[1].cost) + '</span></div>';
+  }).join('') : '<div class="sc-sub">None this week.</div>';
+  var L = d.learned || {};
+  var learned = 'Keeps idle sessions warm up to ' + (L.hours ? L.hours.opus : '?') + ' h (Opus) · ' + (L.hours ? L.hours.fable : '?') + ' h (Fable) · ' +
+    (L.source === 'yours' ? 'learned from your ' + (L.periods || 0).toLocaleString() + ' idle periods' : 'starting estimate until 50 of your idle periods are seen (' + (L.periods || 0) + ' so far)');
+  el.innerHTML = '<div class="usage-title">Smart cache</div>' +
+    '<div class="section-note">Prompt-cache rebuilds vdm avoided, at API prices. On a subscription the same share of usage limits is saved.</div>' +
+    (d.keepWarm ? '' : '<div class="sc-off">Keep-warm is off: idle sessions lose their cache after an hour. <button class="link-btn" onclick="switchTab(&quot;config&quot;)">Turn it on in Config</button></div>') +
+    '<div class="sc-head">' + head + '</div>' +
+    '<div class="sc-grid">' +
+      '<div class="sc-cell"><div class="sc-cell-title">Keep-warm</div>' + w.pings + ' pings · ' + money(w.pingCost) + '<br>' + w.warmResumes + ' returns to a warm cache · <b class="sc-num">' + money(w.keepWarmSaved) + '</b> saved</div>' +
+      '<div class="sc-cell"><div class="sc-cell-title">Session affinity</div>' + w.affinityMoves + ' account moves avoided · <b class="sc-num">' + money(w.affinitySaved) + '</b> saved</div>' +
+      '<div class="sc-cell"><div class="sc-cell-title">Still rebuilt · ' + money(w.rebuildCost) + '</div>' + lost + '</div>' +
+    '</div>' +
+    '<div class="sc-learned">' + escHtml(learned) + (d.stats ? ' · ' + d.stats.kept + ' sessions held, ' + d.stats.memoryMB + ' MB · ' + d.stats.pingsLastHour + ' pings in the last hour' : '') + '</div>';
+}
+
+async function loadKeepWarmLearned() {
+  try {
+    var d = await (await fetch('/api/cache-care')).json();
+    var L = d.learned || {};
+    document.getElementById('keepwarm-learned').textContent = 'Learned: up to ' + (L.hours ? L.hours.opus : '?') + ' h for Opus, ' + (L.hours ? L.hours.fable : '?') + ' h for Fable · ' +
+      (L.source === 'yours' ? 'from your ' + (L.periods || 0).toLocaleString() + ' idle periods' : 'starting estimate (' + (L.periods || 0) + ' of 50 idle periods seen)');
+  } catch (e) { /* shown next time */ }
+}
+
+function minsUntil(t) { var m = Math.max(0, Math.round((t - Date.now()) / 60000)); return m >= 60 ? Math.floor(m / 60) + 'h ' + (m % 60) + 'm' : m + 'm'; }
+
+function sessionCacheLine(s) {
+  var c = s.cache;
+  if (!c || !c.state) return '';
+  var state;
+  if (c.state === 'active') state = '<span class="ok">cache warm</span>';
+  else if (c.state === 'kept' && c.small) state = 'cache warm for ' + minsUntil(c.expiresAt) + ' · small, not kept warm';
+  else if (c.state === 'kept') state = '<span class="ok">kept warm</span> · next ping in ' + minsUntil(c.nextPingAt) + (c.limit ? ' · ' + c.pingsThisIdle + ' of ' + c.limit : '');
+  else if (c.state === 'warm') state = 'cache warm for ' + minsUntil(c.expiresAt) + (c.small ? ' · small, not kept warm' : '');
+  else if (c.state === 'stopped') state = 'cache warm for ' + minsUntil(c.expiresAt) + ' · keep-warm stopped: ' + escHtml(SC_STOP[c.stopped] || c.stopped || '');
+  else state = 'cache cold';
+  var extra = [];
+  if (c.saved > 0.005) extra.push('saved ≈ ' + money(c.saved));
+  var rb = Object.keys(c.rebuilds || {});
+  if (rb.length) {
+    var n = rb.reduce(function(a, k) { return a + c.rebuilds[k]; }, 0);
+    extra.push('rebuilt ' + n + '×' + (c.lastRebuild ? ' (last: ' + escHtml(SC_CAUSE[c.lastRebuild.cause] || c.lastRebuild.cause) + ')' : ''));
+  }
+  var modeSel = '<select class="config-select" data-id="' + escHtml(s.id) + '" onchange="setCacheMode(this.dataset.id, this.value)" aria-label="Keep this session warm" title="Auto: learned limit. Keep warm: until the break-even. Never: no pings.">' +
+    ['auto', 'pin', 'never'].map(function(v) { return '<option value="' + v + '"' + (c.mode === v ? ' selected' : '') + '>' + ({ auto: 'Auto', pin: 'Keep warm', never: 'Never' })[v] + '</option>'; }).join('') + '</select>';
+  return '<div class="sess-cache"><span>' + state + (extra.length ? ' · ' + extra.join(' · ') : '') + '</span>' + modeSel + '</div>';
+}
+
+async function setCacheMode(sid, mode) {
+  try {
+    var r = await fetch('/api/cache-care/mode', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ sid: sid, mode: mode }) });
+    showToast(r.ok ? ({ auto: 'Cache: automatic', pin: 'Cache: kept warm until the break-even', never: 'Cache: never kept warm' })[mode] : 'Could not change it');
+  } catch (e) { showToast('Could not change it'); }
 }
 
 // ── History ──
@@ -4695,7 +4868,7 @@ function sessionCard(s) {
     (sub ? '<div class="sess-sub" title="' + escHtml(sub) + '">' + escHtml(sub) + '</div>' : '') +
     '<div class="sess-aff-line">' + affBars(a.level, title) + '<span><b>' + (AFF_TEXT[a.level] || a.level) + '</b> &middot; ' + on + ' &middot; ' + cachePct(a.cacheHit) +
       ' &middot; ' + s.requests + ' req' + (s.model ? ' &middot; ' + escHtml(shortModel(s.model)) : '') + '</span>' + arts + '</div>' +
-    '<div class="sess-accts">' + accts + '</div>' + moves +
+    '<div class="sess-accts">' + accts + '</div>' + sessionCacheLine(s) + moves +
   '</div>';
 }
 
@@ -5957,6 +6130,11 @@ function noteMove(sid, move) {
 // ── Session names: Claude Code's live registry + transcript ──
 
 let _registry = new Map();   // sessionId → { name, nameSource, cwd, status }
+let _registryOk = false;      // the registry folder could be read (empty then means: nothing running)
+
+function processAlive(pid) {
+  try { process.kill(pid, 0); return true; } catch (e) { return e.code === 'EPERM'; }
+}
 
 // ~/.claude/sessions/<pid>.json: Claude Code's list of running sessions (name, cwd, status).
 // Refreshed in the background; readers get the last snapshot.
@@ -5964,14 +6142,18 @@ async function refreshSessionRegistry() {
   const map = new Map();
   const dir = join(CLAUDE_DIR, 'sessions');
   let files = [];
-  try { files = (await readdir(dir)).filter(f => f.endsWith('.json')); } catch { /* no registry */ }
+  let ok = true;
+  try { files = (await readdir(dir)).filter(f => f.endsWith('.json')); } catch { ok = false; }
   for (const f of files) {
     try {
       const j = JSON.parse(await readFile(join(dir, f), 'utf8'));
+      const pid = Number(j?.pid) || parseInt(f, 10);
+      if (pid > 0 && !processAlive(pid)) continue; // left behind by a session that crashed
       if (j && j.sessionId) map.set(j.sessionId, { name: j.name, nameSource: j.nameSource, cwd: j.cwd, status: j.status });
     } catch { /* being rewritten  - skip */ }
   }
   _registry = map;
+  _registryOk = ok;
 }
 refreshSessionRegistry().catch(() => {});
 setInterval(() => refreshSessionRegistry().catch(() => {}), 15_000);
@@ -6173,6 +6355,7 @@ function listSessions(hours = 24, now = Date.now()) {
         lanes,
         moves: s.moves.slice(-10).reverse().map(m => ({ ...m, fromLabel: accountDisplay(m.from), toLabel: accountDisplay(m.to) })),
         artifacts: s.artifacts,
+        cache: sessionCacheView(s.id, now),
       };
     });
 }
@@ -6750,6 +6933,411 @@ async function handleHistoryAPI(req, res, url) {
   }
 }
 
+
+// ─────────────────────────────────────────────────
+// Cache care: explain every cache rebuild, keep idle caches warm
+// ─────────────────────────────────────────────────
+// Doctor: each rebuild of a big prompt gets a cause (idle, account move, tools changed, ...).
+// Keep-warm (settings.keepWarm): an idle session's last request is replayed with max_tokens 0
+// just before its cache expires, on the same account, for as long as the learned return curve
+// says it pays (look-ahead optimal stopping, capped at the break-even). Request bodies are kept
+// in memory only.
+
+const CACHE_CARE_FILE = join(__dirname, 'cache-care.json');
+const IDLE_LOG_MAX = 5000;
+const KEEP_WARM_PINGS_PER_HOUR = 60;
+const KEEP_WARM_NEAR_LIMIT = { fiveH: 0.85, sevenD: 0.95 };
+// Tests only: a short cache lifetime and a fast tick, so keep-warm can be checked in seconds
+const CACHE_TTL_OVERRIDE = Number(process.env.CSW_CACHE_TTL_MS) || 0;
+const KEEP_WARM_TICK_MS = Number(process.env.CSW_KEEP_WARM_TICK_MS) || 20_000;
+
+const cacheCare = { idle: [], probe: {}, sessions: {}, recentPings: [], dirty: false };
+let cacheLedger = createCacheLedger();
+const keepWarmPlanner = createKeepWarmPlanner({ pingLimit: (l) => keepWarmLimit(l) });
+// Each lane's last conversation request (memory only): the cache doctor compares the next one
+// with it when a cache was lost, and keep-warm replays a main lane's one. lane = sid|agent
+const _lastBodies = new Map();
+let _bodyBytes = 0;
+const BODIES_MEMORY_MAX = 300 * 1024 * 1024;
+const _affinityHeld = new Map();       // sid|agent → { account, at, credited }: one credit per warm stretch
+const _pingInFlight = new Set();       // account names with a keep-warm ping running
+
+try {
+  const j = JSON.parse(readFileSync(CACHE_CARE_FILE, 'utf8'));
+  cacheCare.idle = Array.isArray(j.idle) ? j.idle.slice(-IDLE_LOG_MAX) : [];
+  cacheCare.probe = j.probe || {};
+  cacheCare.sessions = j.sessions || {};
+  cacheLedger = createCacheLedger(j.ledger);
+  keepWarmPlanner.loadModes(j.modes);
+} catch { /* first run */ }
+
+function saveCacheCare(force = false) {
+  if (!cacheCare.dirty && !force) return;
+  cacheCare.dirty = false;
+  cacheLedger.prune();
+  // Per-session counters of sessions not seen for 30 days go
+  const cut = Date.now() - 30 * 86400000;
+  for (const [sid, c] of Object.entries(cacheCare.sessions)) if ((c.lastAt || 0) < cut) delete cacheCare.sessions[sid];
+  try {
+    writeFileSync(CACHE_CARE_FILE + '.tmp', JSON.stringify({
+      v: 1, idle: cacheCare.idle, probe: cacheCare.probe, sessions: cacheCare.sessions,
+      ledger: cacheLedger.toJSON(), modes: keepWarmPlanner.modes(),
+    }));
+    renameSync(CACHE_CARE_FILE + '.tmp', CACHE_CARE_FILE);
+  } catch (e) { log('error', `Failed to save cache-care.json: ${e.message}`); }
+}
+
+function sessionCache(sid) {
+  const c = cacheCare.sessions[sid] || (cacheCare.sessions[sid] = { pings: 0, pingCost: 0, warmResumes: 0, saved: 0, affinitySaved: 0, rebuilds: {}, lastRebuild: null, lastAt: 0 });
+  c.lastAt = Date.now();
+  cacheCare.dirty = true;
+  return c;
+}
+
+// Learned return curve (refit at most every 10 minutes): this user's own idle periods once
+// there are enough of them, else the prior measured on real Claude Code use.
+let _curve = { at: 0, surv: null, periods: 0, source: 'prior' };
+function returnCurveNow() {
+  const now = Date.now();
+  if (_curve.surv && now - _curve.at < 10 * 60 * 1000) return _curve;
+  const periods = cacheCare.idle.map(p => ({ waitMs: p.waitMs, returned: p.returned }));
+  // Sessions idle right now count as "not back yet" (censored)
+  for (const l of keepWarmPlanner.all()) {
+    if (l.realAt && l.inflight === 0 && now - l.realAt >= l.ttlMs - Math.min(60000, l.ttlMs / 4)) periods.push({ waitMs: now - l.realAt, returned: false });
+  }
+  const yours = periods.length >= 50;
+  _curve = {
+    at: now, periods: periods.length, source: yours ? 'yours' : 'prior',
+    surv: yours ? returnCurve(periods) : weibullCurve(RETURN_PRIOR.shape, RETURN_PRIOR.scaleMs),
+  };
+  return _curve;
+}
+
+/** Pings for one idle period of this lane: learned look-ahead, capped at the break-even. */
+function keepWarmLimit(l) {
+  const model = l.model || 'claude-opus-5-5', ttl = l.ttlMs || HOUR_MS;
+  const cap = breakEvenPings(model, ttl);
+  if (l.mode === 'pin') return cap;
+  const h = bestPingCount(returnCurveNow().surv, pingCostRatio(model, ttl), cap);
+  return h === 0 ? 0 : Math.min(cap, Math.max(2, h));
+}
+
+function learnedKeepWarm() {
+  const c = returnCurveNow();
+  const hours = (model) => {
+    const n = keepWarmLimit({ model, ttlMs: HOUR_MS, mode: 'auto' });
+    return Math.round(n * (HOUR_MS - 60000) / HOUR_MS);
+  };
+  return { periods: c.periods, source: c.source, hours: { opus: hours('claude-opus-5-5'), fable: hours('claude-fable-5-1') } };
+}
+
+function laneLabel(sid) {
+  return sessionLabel(sessionStore.get(sid)?.meta, sid);
+}
+
+/** Session affinity (and so keep-warm) only works while the proxy chooses accounts. */
+function affinityActive() {
+  return settings.sessionAffinity !== false && (isBalanceMode() || settings.autoSwitch);
+}
+
+/** Where balance mode would send this request if the lane were not kept on `pinned`. */
+function balanceAlternative(allAccounts, pinned, model) {
+  const load = { ...sessionStore.warmLoad() };
+  load[pinned.name] = Math.max(0, (load[pinned.name] || 0) - 1); // not counting this lane itself
+  const pick = _pickLeastLoaded(allAccounts, balanceLimiter.inflight, accountState, settings.maxConcurrentPerAccount || 8,
+    _balanceCooledTokens(allAccounts) || new Set(), Date.now(), { model, extraLoad: load });
+  return pick && pick.account.name !== pinned.name ? pick.account.name : null;
+}
+
+function cacheCareBegin(sid, agent) {
+  if (sid && agent === 'main') keepWarmPlanner.start(sid);
+}
+
+function cacheCareEnd(sid, agent) {
+  if (sid && agent === 'main') keepWarmPlanner.end(sid);
+}
+
+function setLru(map, key, value, max) {
+  map.delete(key);
+  map.set(key, value);
+  if (map.size > max) map.delete(map.keys().next().value);
+}
+
+const BODY_SKIP_HEADERS = new Set(['authorization', 'x-api-key', 'cookie', 'host', 'content-length', 'connection', 'accept-encoding']);
+
+function rememberBody(laneKey, entry) {
+  const old = _lastBodies.get(laneKey);
+  if (old) _bodyBytes -= old.bytes;
+  _lastBodies.delete(laneKey); // insertion order = recency
+  _lastBodies.set(laneKey, entry);
+  _bodyBytes += entry.bytes;
+  if (_bodyBytes <= BODIES_MEMORY_MAX) return;
+  // Over the cap: drop subagent lanes first, then the oldest
+  const order = [..._lastBodies.keys()].sort((x, y) => (x.endsWith('|main') ? 1 : 0) - (y.endsWith('|main') ? 1 : 0));
+  for (const k of order) {
+    if (_bodyBytes <= BODIES_MEMORY_MAX * 0.9) break;
+    _bodyBytes -= _lastBodies.get(k).bytes;
+    _lastBodies.delete(k);
+  }
+}
+
+function forgetBodies(sid) {
+  for (const [k, v] of _lastBodies) {
+    if (k.startsWith(sid + '|')) { _bodyBytes -= v.bytes; _lastBodies.delete(k); }
+  }
+}
+
+/**
+ * A successful request's usage arrived. Side calls (titles, quick checks) are skipped: they
+ * share the session id but not its conversation. Then: learning (idle periods end here),
+ * keep-warm and affinity savings, the cache doctor (only when the previous prompt's cache was
+ * lost: bodies are parsed then, not on every request), and this body is kept for the next time.
+ */
+function cacheCareResponse({ sid, agent, acct, model, usage, ttlMs, startedAt, body, headers, path, affinityAlt, pinnedName }) {
+  if (!sid || !usage || !acct || !Buffer.isBuffer(body)) return;
+  if (CACHE_TTL_OVERRIDE) ttlMs = CACHE_TTL_OVERRIDE;
+  const write = (usage.cacheWrite5m || 0) + (usage.cacheWrite1h || 0);
+  const tokens = (usage.input || 0) + (usage.cacheRead || 0) + write;
+  const cacheRead = usage.cacheRead || 0;
+  const account = acct.id || acct.name;
+  const laneKey = `${sid}|${agent}`;
+  const prev = _lastBodies.get(laneKey);
+  if (tokens < SIDE_CALL_MAX_TOKENS && prev && prev.tokens >= KEEP_WARM_MIN_TOKENS) return; // a side call
+
+  let warmResume = false;
+  if (agent === 'main') {
+    const r = keepWarmPlanner.finish(sid, { startedAt, account, model, ttlMs, tokens, cacheRead });
+    warmResume = r.warmResume;
+    if (r.idle) {
+      cacheCare.idle.push({ waitMs: r.idle.waitMs, returned: true, tokens: r.idle.tokens, model: r.idle.model, at: startedAt });
+      if (cacheCare.idle.length > IDLE_LOG_MAX) cacheCare.idle.splice(0, cacheCare.idle.length - IDLE_LOG_MAX);
+      cacheCare.dirty = true;
+    }
+    if (warmResume) {
+      const saved = rebuildCost(cacheRead, model, ttlMs);
+      cacheLedger.warmResume(saved);
+      const c = sessionCache(sid);
+      c.warmResumes++;
+      c.saved += saved;
+      log('cache', `${laneLabel(sid)}: back to a warm cache (kept warm, saved ≈ $${saved.toFixed(2)})`);
+    }
+  }
+
+  // Session affinity kept this warm lane on its account where the strategy would have moved
+  // it: without affinity it would have moved (and rebuilt) once, then stayed. So: one credit
+  // per warm stretch on an account, only when the request really ran there.
+  const held = _affinityHeld.get(laneKey);
+  const sameStretch = held && held.account === account && startedAt - held.at < ttlMs;
+  const canCredit = !!affinityAlt && pinnedName === acct.name && !warmResume && cacheRead > 0;
+  const credit = () => {
+    const saved = rebuildCost(cacheRead, model, ttlMs);
+    cacheLedger.affinity(saved);
+    sessionCache(sid).affinitySaved += saved;
+    return true;
+  };
+  if (sameStretch) {
+    held.at = startedAt;
+    if (canCredit && !held.credited) held.credited = credit();
+  } else {
+    setLru(_affinityHeld, laneKey, { account, at: startedAt, credited: canCredit ? credit() : false }, 2000);
+  }
+
+  // Cache doctor: the previous prompt's cache was (mostly) not read back
+  const lost = prev ? lostCacheTokens(cacheRead, prev.tokens) : 0;
+  if (lost > 0) {
+    setImmediate(() => {
+      let a = null, b = null;
+      try { a = cacheFingerprint(prev.body, prev.headers); b = cacheFingerprint(body, headers); } catch { /* compare what we can */ }
+      const c = a && b
+        ? classifyRebuild(a, b, { gapMs: startedAt - prev.at, ttlMs: prev.ttlMs, prevAccount: prev.account, account })
+        : { cause: 'unknown', detail: 'could not compare the requests' };
+      const cost = rebuildCost(lost, model, ttlMs);
+      cacheLedger.rebuild(c.cause, cost);
+      const sc = sessionCache(sid);
+      sc.rebuilds[c.cause] = (sc.rebuilds[c.cause] || 0) + 1;
+      sc.lastRebuild = { cause: c.cause, detail: c.detail, at: startedAt, cost };
+      const lane = agent === 'main' ? '' : ` [${agent.slice(0, 8)}]`;
+      log('cache', `${laneLabel(sid)}${lane}: cache rebuilt (${c.detail}), ≈ $${cost.toFixed(2)} extra`);
+    });
+  }
+
+  const h = {};
+  for (const [k, v] of Object.entries(headers || {})) if (!BODY_SKIP_HEADERS.has(k)) h[k] = v;
+  rememberBody(laneKey, { body, headers: h, path: path || '/v1/messages', account, accountName: acct.name, at: startedAt, ttlMs, tokens, model, bytes: body.length });
+}
+
+function readResponse(res, timeoutMs) {
+  return new Promise((resolve) => {
+    const chunks = [];
+    let done = false;
+    const finish = () => { if (!done) { done = true; resolve(Buffer.concat(chunks)); } };
+    res.on('data', c => chunks.push(c));
+    res.on('end', finish);
+    res.on('error', finish);
+    setTimeout(() => { res.destroy(); finish(); }, timeoutMs).unref?.();
+  });
+}
+
+/** Replay a lane's last request with max_tokens 0 (or 1), check that it read the cache. */
+async function sendKeepWarmPing(l, snap, acct) {
+  const startedAt = Date.now();
+  let req;
+  try { req = JSON.parse(snap.body.toString('utf8')); } catch { keepWarmPlanner.stop(l.sid, 'unreadable'); return; }
+  const key = `${req.model}|${req.thinking?.type || 'none'}`;
+  if (cacheCare.probe[key] === 'no') { keepWarmPlanner.stop(l.sid, 'unsupported'); return; }
+  const original = snap.body.toString('utf8');
+  const attempt = async (maxTokens) => {
+    // Only max_tokens and stream change; every other byte is the session's own request
+    const pingBody = setTopLevelJsonFields(original, { max_tokens: maxTokens, stream: false });
+    if (pingBody == null) throw new Error('request body is not a JSON object');
+    const buf = Buffer.from(pingBody);
+    const headers = buildForwardHeaders(snap.headers, acct.token);
+    headers['content-length'] = String(buf.length);
+    headers['accept'] = 'application/json';
+    const res = await forwardToAnthropic('POST', snap.path, headers, buf, 60_000);
+    const text = (await readResponse(res, 60_000)).toString('utf8');
+    return { status: res.statusCode, headers: res.headers, text };
+  };
+  const maxTokensRejected = (r) => r.status === 400 && /max_tokens/i.test(r.text);
+  try {
+    let r = await attempt(cacheCare.probe[key] === 'one' ? 1 : 0);
+    if (maxTokensRejected(r) && cacheCare.probe[key] !== 'one') {
+      cacheCare.probe[key] = 'one';
+      r = await attempt(1);
+    }
+    if (maxTokensRejected(r)) {
+      cacheCare.probe[key] = 'no';
+      cacheCare.dirty = true;
+      log('cache', `Keep-warm is not possible for ${req.model} with ${req.thinking?.type || 'no'} thinking (the API refuses the ping)`);
+      keepWarmPlanner.stop(l.sid, 'unsupported');
+      return;
+    }
+    updateAccountState(acct.token, acct.label || acct.name, r.headers, getFingerprintFromToken(acct.token));
+    if (r.status !== 200) {
+      keepWarmPlanner.stop(l.sid, r.status === 429 ? 'rate-limited' : `error ${r.status}`);
+      log('cache', `Keep-warm ping for ${laneLabel(l.sid)} got ${r.status}: stopped for this idle period`);
+      return;
+    }
+    if (!cacheCare.probe[key]) cacheCare.probe[key] = 'zero';
+    const parsed = parseJsonUsage(r.text);
+    const usage = parsed?.usage;
+    if (!usage) { keepWarmPlanner.stop(l.sid, 'no-usage'); return; }
+    const model = parsed.model || req.model;
+    const cost = usageCost(usage, model);
+    cacheLedger.ping(cost);
+    const sc = sessionCache(l.sid);
+    sc.pings++;
+    sc.pingCost += cost;
+    cacheCare.recentPings.push(startedAt);
+    recordUsage({ ts: startedAt, account: acct.id || acct.name, model, repo: '(keep-warm)', branch: '', usage });
+    throughput.add(acct.id || acct.name, model, totalTokens(usage));
+    _throughputDirty = true;
+    sessionStore.touch(l.sid, 'main', { ttlMs: l.ttlMs }); // the affinity pin stays warm too
+    const write = (usage.cacheWrite5m || 0) + (usage.cacheWrite1h || 0);
+    const ok = (usage.cacheRead || 0) >= l.tokens * 0.9 && write <= l.tokens * 0.1;
+    keepWarmPlanner.pinged(l.sid, ok ? { ok: true, startedAt } : { ok: false, reason: 'missed' });
+    const kept = _lastBodies.get(`${l.sid}|main`);
+    if (ok && kept === snap) kept.at = startedAt; // the doctor measures idle time from the last touch
+    if (!ok) log('cache', `Keep-warm ping for ${laneLabel(l.sid)} missed the cache (read ${usage.cacheRead || 0} of ${l.tokens} tokens): stopped for this idle period`);
+  } catch (e) {
+    keepWarmPlanner.stop(l.sid, 'network');
+    log('cache', `Keep-warm ping for ${laneLabel(l.sid)} failed: ${e.message}`);
+  }
+}
+
+function nearLimit(acct) {
+  const st = accountState.get(acct.token);
+  if (!st) return false;
+  return (st.utilization5h || 0) >= KEEP_WARM_NEAR_LIMIT.fiveH || (st.utilization7d || 0) >= KEEP_WARM_NEAR_LIMIT.sevenD;
+}
+
+/** Every 20 s: notice closed sessions (learning), then send the pings that are due. */
+async function keepWarmTick() {
+  const now = Date.now();
+  const registry = readSessionRegistry();
+  // A session missing from Claude Code's registry is closed: its idle period ends without a
+  // return. Only when the registry could be read (else nothing is known).
+  if (_registryOk) {
+    for (const l of keepWarmPlanner.all()) {
+      if (registry.has(l.sid) || l.inflight > 0) continue;
+      if (l.realAt && now - l.realAt >= l.ttlMs - Math.min(60000, l.ttlMs / 4)) {
+        cacheCare.idle.push({ waitMs: now - l.realAt, returned: false, tokens: l.tokens, model: l.model, at: now });
+        cacheCare.dirty = true;
+      }
+      keepWarmPlanner.drop(l.sid);
+      forgetBodies(l.sid);
+    }
+  }
+  // Subagent lanes are short-lived: forget their bodies after 2 hours
+  for (const [k, v] of _lastBodies) {
+    if (!k.endsWith('|main') && now - v.at > 2 * HOUR_MS) { _bodyBytes -= v.bytes; _lastBodies.delete(k); }
+  }
+  // Pings: only while the next request will land on the same account, and only for sessions
+  // known to be open
+  if (!settings.keepWarm || !settings.proxyEnabled || !affinityActive() || !_registryOk) return;
+  cacheCare.recentPings = cacheCare.recentPings.filter(t => now - t < HOUR_MS);
+  const accounts = loadAllAccountTokens();
+  for (const l of keepWarmPlanner.due(now)) {
+    if (cacheCare.recentPings.length >= KEEP_WARM_PINGS_PER_HOUR) break;
+    if (!registry.has(l.sid)) continue;
+    const snap = _lastBodies.get(`${l.sid}|main`);
+    if (!snap || snap.tokens < KEEP_WARM_MIN_TOKENS) { keepWarmPlanner.stop(l.sid, 'no-request-kept'); continue; }
+    const acct = accounts.find(a => a.name === snap.accountName);
+    if (!acct) { keepWarmPlanner.stop(l.sid, 'account-removed'); continue; }
+    if (_pingInFlight.has(acct.name)) continue;
+    const route = sessionStore.route(l.sid, 'main');
+    if (!route || route.account !== acct.name) { keepWarmPlanner.stop(l.sid, 'moved'); continue; }
+    if (!isAccountAvailable(acct.token, acct.expiresAt, l.model) || nearLimit(acct)) { keepWarmPlanner.stop(l.sid, 'near-limit'); continue; }
+    _pingInFlight.add(acct.name);
+    sendKeepWarmPing(l, snap, acct).finally(() => _pingInFlight.delete(acct.name));
+  }
+}
+setInterval(() => { keepWarmTick().catch(e => log('error', `Keep-warm: ${e.message}`)); }, KEEP_WARM_TICK_MS).unref?.();
+setInterval(() => saveCacheCare(), 60_000).unref?.();
+
+/** One line for the header: what cache care saved this week. */
+function cacheCareHeadline() {
+  const w = cacheLedger.summary(Date.now() - 7 * 86400000);
+  return { keepWarm: settings.keepWarm === true, pct: w.pct, saved: w.saved, rebuildCost: w.rebuildCost };
+}
+
+function cacheCareReport() {
+  const now = Date.now();
+  return {
+    keepWarm: settings.keepWarm === true,
+    learned: learnedKeepWarm(),
+    week: cacheLedger.summary(now - 7 * 86400000),
+    month: cacheLedger.summary(now - 30 * 86400000),
+    probe: cacheCare.probe,
+    stats: {
+      lanes: keepWarmPlanner.all().length,
+      kept: [..._lastBodies.entries()].filter(([k, v]) => k.endsWith('|main') && v.tokens >= KEEP_WARM_MIN_TOKENS).length,
+      memoryMB: Math.round(_bodyBytes / 1e5) / 10, pingsLastHour: cacheCare.recentPings.filter(t => now - t < HOUR_MS).length,
+    },
+  };
+}
+
+/** Cache state of one session for the Sessions tab. */
+function sessionCacheView(sid, now = Date.now()) {
+  const l = keepWarmPlanner.get(sid);
+  const c = cacheCare.sessions[sid] || null;
+  let state = null, nextPingAt = null;
+  if (l && l.touchedAt) {
+    const expiresAt = l.touchedAt + l.ttlMs;
+    if (l.inflight > 0 || now - l.realAt < l.ttlMs - 60000) state = 'active';
+    else if (now > expiresAt) state = 'cold';
+    else if (!settings.keepWarm || l.mode === 'never') state = 'warm';
+    else if (l.stopped) state = 'stopped';
+    else { state = 'kept'; nextPingAt = l.touchedAt + l.ttlMs - 60000; }
+  }
+  return {
+    mode: l?.mode || 'auto', state, stopped: l?.stopped || null, nextPingAt, expiresAt: l?.touchedAt ? l.touchedAt + l.ttlMs : null,
+    pingsThisIdle: l?.pings || 0, limit: l?.limit || 0, tokens: l?.tokens || 0, small: !!l && l.tokens < KEEP_WARM_MIN_TOKENS,
+    pings: c?.pings || 0, saved: (c?.saved || 0) + (c?.affinitySaved || 0), pingCost: c?.pingCost || 0, warmResumes: c?.warmResumes || 0,
+    rebuilds: c?.rebuilds || {}, lastRebuild: c?.lastRebuild || null,
+  };
+}
+
 // ── Proxy server ──
 
 const proxyServer = createServer((clientReq, clientRes) => {
@@ -6943,6 +7531,10 @@ async function handleProxyRequest(clientReq, clientRes) {
   const ttlMs = cacheTtlFromBody(body);
   const sid = extractSessionId(clientReq.headers, body);
   const agent = String(clientReq.headers['x-claude-code-agent-id'] || 'main').slice(0, 64);
+  // Cache care: a real request of this session is under way, also while it waits for a slot
+  // (no keep-warm ping may overlap it); 'close' fires on every outcome
+  cacheCareBegin(sid, agent);
+  clientRes.once('close', () => cacheCareEnd(sid, agent));
   const affinityOn = !!sid && settings.sessionAffinity !== false && (balanceMode || settings.autoSwitch);
   let laneWarm = false;
   let pinned = null;          // the lane's account, when it can take this request
@@ -6994,12 +7586,14 @@ async function handleProxyRequest(clientReq, clientRes) {
   // Start with active keychain token, apply rotation strategy
   let token = getActiveToken();
   const activeAcct = allAccounts.find(a => a.token === token);
+  let affinityAlt = null; // where the strategy would have sent a warm lane that affinity kept home
 
   if (balanceMode) {
     // Spread sessions across accounts by load; no keychain write (the active pointer
     // stays stable). A warm lane waits for a slot on its own account. If no account is
     // available, fall through with the keychain token  - the retry loop's exhausted path
     // handles it.
+    if (pinned) affinityAlt = balanceAlternative(allAccounts, pinned, model);
     let slot = pinned ? await acquireBalanceSlot(allAccounts, new Set(), { model, only: pinned }) : null;
     if (pinned && !slot) pinReason = 'unavailable';
     if (!slot) {
@@ -7021,6 +7615,13 @@ async function handleProxyRequest(clientReq, clientRes) {
   } else if (settings.autoSwitch && pinned) {
     // Warm session lane: stay on its account. No strategy run, no keychain write.
     token = pinned.token;
+    // For the savings figure only: where would the strategy have sent it?
+    const alt = _pickByStrategy({
+      strategy: settings.rotationStrategy || 'conserve', intervalMin: settings.rotationIntervalMin || 60,
+      currentToken: getActiveToken(), lastRotationTime, accounts: allAccounts, stateManager: accountState,
+      excludeTokens: new Set(), model,
+    }).account;
+    if (alt && alt.name !== pinned.name) affinityAlt = alt.name;
   } else if (settings.autoSwitch) {
     const { account: strategyPick, rotated } = _pickByStrategy({
       strategy: settings.rotationStrategy || 'conserve',
@@ -7078,6 +7679,8 @@ async function handleProxyRequest(clientReq, clientRes) {
     pinLane(allAccounts.find(a => a.token === token), pinReason);
   }
   if (affinityOn) sessionStore.touch(sid, agent, { ttlMs }); // concurrent requests see the lane warm
+
+  const reqStartedAt = Date.now(); // the cache lifetime counts from the request's start
 
   // Artifact links in this session's messages (e.g. the Artifact tool's results)
   if (sid && body.indexOf('/artifact/') !== -1) {
@@ -7720,6 +8323,10 @@ async function handleProxyRequest(clientReq, clientRes) {
       try {
         const r = tap.result();
         if (r?.usage) recordProxyUsage({ sid, agent, acct, model: r.model || model, usage: r.usage, ttlMs });
+        if (r?.usage && proxyRes.statusCode === 200) {
+          cacheCareResponse({ sid, agent, acct, model: r.model || model, usage: r.usage, ttlMs, startedAt: reqStartedAt,
+            body, headers: clientReq.headers, path: clientReq.url, affinityAlt, pinnedName: pinned?.name || null });
+        }
       } catch (e) { log('error', `Usage accounting failed: ${e.message}`); }
     } else {
       await pipeAndWait(proxyRes, clientRes);
@@ -7786,6 +8393,7 @@ function shutdown(signal) {
   try { saveSessions(true); } catch {}
   try { if (_historyDirty) writeHistoryFile(); } catch {}
   try { if (_throughputDirty) writeThroughputFile(); } catch {}
+  try { saveCacheCare(true); } catch {}
   if (_artifactLinksDirty) try { saveArtifacts(); } catch {}
   try { stopHistory(); } catch {}
   proxyServer.close();

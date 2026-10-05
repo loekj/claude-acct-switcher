@@ -582,6 +582,7 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
   local notifs=$(get_config_value "notifications")
   local affinity=$(get_config_value "sessionAffinity")
   local history_on=$(get_config_value "sessionHistory")
+  local keepwarm_on=$(get_config_value "keepWarm")
   echo ""
   echo -e "  ${BOLD}Settings${NC}"
   echo -e "  ────────────────────────────────"
@@ -605,6 +606,11 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
     echo -e "  Affinity:      ${DIM}OFF${NC}"
   else
     echo -e "  Affinity:      ${GREEN}ON${NC}  ${DIM}(sessions stay on one account while their cache is warm)${NC}"
+  fi
+  if [[ "$keepwarm_on" == "False" ]]; then
+    echo -e "  Keep-warm:     ${DIM}OFF${NC}  ${DIM}(vdm config keep-warm on)${NC}"
+  else
+    echo -e "  Keep-warm:     ${GREEN}ON${NC}  ${DIM}(idle sessions keep their prompt cache)${NC}"
   fi
   if [[ "$history_on" == "True" ]]; then
     echo -e "  History:       ${GREEN}ON${NC}  ${DIM}(sessions are saved: vdm history)${NC}"
@@ -695,6 +701,12 @@ cmd_config() {
     else
       echo -e "  sessionAffinity:    ${GREEN}on${NC}"
     fi
+    local kw=$(get_config_value "keepWarm")
+    if [[ "$kw" == "False" ]]; then
+      echo -e "  keepWarm:           ${DIM}off${NC}"
+    else
+      echo -e "  keepWarm:           ${GREEN}on${NC}"
+    fi
     local hist=$(get_config_value "sessionHistory")
     if [[ "$hist" == "True" ]]; then
       echo -e "  sessionHistory:     ${GREEN}on${NC}"
@@ -721,6 +733,7 @@ cmd_config() {
     echo -e "  ${DIM}  vdm config serialize-delay 0|100|200|500|1000${NC}  ${DIM}[BETA]${NC}"
     echo -e "  ${DIM}  vdm config affinity on|off${NC}  ${DIM}keep each session on one account (saves prompt cache)${NC}"
     echo -e "  ${DIM}  vdm config history on|off${NC}  ${DIM}save sessions to search and continue later${NC}"
+    echo -e "  ${DIM}  vdm config keep-warm on|off${NC}  ${DIM}keep idle sessions' prompt cache warm (learned limits)${NC}"
     echo -e "  ${DIM}  vdm config claude-cmd 'claude --flags'${NC}  ${DIM}how vdm starts Claude Code (full command, not an alias)${NC}"
     echo -e "  ${DIM}  vdm config history-keep 0|90|180|365|730${NC}  ${DIM}days to keep saved sessions (0 = forever)${NC}"
     return 0
@@ -739,13 +752,14 @@ cmd_config() {
     max-concurrent|maxConcurrentPerAccount|max-concurrent-per-account) key="maxConcurrentPerAccount"; is_bool=false ;;
     affinity|sessionAffinity|session-affinity) key="sessionAffinity" ;;
     history|sessionHistory|session-history) key="sessionHistory" ;;
+    keep-warm|keepWarm|keepwarm) key="keepWarm" ;;
     claude-cmd|claudeCommand|claude-command) key="claudeCommand"; is_bool=false
       # Allow it unquoted: vdm config claude-cmd claude --dangerously-skip-permissions
       if [[ $# -gt 2 ]]; then shift; value="$*"; fi ;;
     history-keep|historyRetentionDays|history-retention) key="historyRetentionDays"; is_bool=false ;;
     *)
       echo -e "${RED}Unknown setting: $key${NC}"
-      echo "  Available: proxy, autoswitch, notifications, rotation, interval, max-concurrent, serialize, serialize-delay, affinity, history, claude-cmd, history-keep"
+      echo "  Available: proxy, autoswitch, notifications, rotation, interval, max-concurrent, serialize, serialize-delay, affinity, history, keep-warm, claude-cmd, history-keep"
       return 1
       ;;
   esac
@@ -840,6 +854,9 @@ cmd_config() {
     value=$((10#$value))
     set_config_number "$key" "$value"
     echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value}${NC}  ${DIM}(0 = keep forever)${NC}"
+  fi
+  if [[ "$key" == "keepWarm" && "$value" == "True" ]]; then
+    echo -e "  ${DIM}Idle sessions now keep their prompt cache. Savings: Usage tab → Smart cache.${NC}"
   fi
   if [[ "$key" == "sessionHistory" && "$value" == "True" ]]; then
     echo -e "  ${DIM}Saving your sessions now. Browse them: vdm history, or the History tab in the dashboard.${NC}"

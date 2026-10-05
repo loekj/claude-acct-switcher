@@ -1710,3 +1710,378 @@ export function throughputLine({ fine = [], hourly = [], startedAt = 0, now = Da
   }
   return { start, step, values, total: Math.round(sum) };
 }
+
+// ─────────────────────────────────────────────────
+// Cache care: explain cache rebuilds, keep idle caches warm
+// ─────────────────────────────────────────────────
+
+export const HOUR_MS = 60 * 60 * 1000;
+export const KEEP_WARM_MIN_TOKENS = 30_000;   // smaller prefixes are cheap to rebuild
+export const REBUILD_MIN_PROMPT = 20_000;
+// Claude Code's side calls (session titles, quick checks) share the session id but carry no
+// conversation: a real conversation request includes the system prompt and tools (~15k+ tokens)
+export const SIDE_CALL_MAX_TOKENS = 10_000;
+const PING_MARGIN_MS = 60 * 1000;             // ping this long before the TTL runs out
+
+/** Per-MTok prices that matter for caching: input, cache read, cache write (for this TTL). */
+export function cachePrices(model, ttlMs = HOUR_MS) {
+  const p = priceFor(model);
+  return { input: p.input, read: p.cacheRead, write: p.input * (ttlMs >= HOUR_MS ? 2 : 1.25) };
+}
+
+/** Extra cost (USD) of writing `tokens` again instead of reading them from cache. */
+export function rebuildCost(tokens, model, ttlMs = HOUR_MS) {
+  const c = cachePrices(model, ttlMs);
+  return (tokens || 0) * (c.write - c.read) / 1e6;
+}
+
+/** One keep-warm ping costs this fraction of a rebuild (r / (w − r)). */
+export function pingCostRatio(model, ttlMs = HOUR_MS) {
+  const c = cachePrices(model, ttlMs);
+  return c.read / Math.max(c.write - c.read, 1e-9);
+}
+
+/** Ski-rental break-even: after this many pings, keeping a cache warm cost a whole rebuild. */
+export function breakEvenPings(model, ttlMs = HOUR_MS) {
+  return Math.max(1, Math.floor(1 / pingCostRatio(model, ttlMs) + 1e-9));
+}
+
+/**
+ * Tokens of the lane's previous prompt that had to be written again instead of read: the
+ * previous prompt size minus what this request read from cache. 0 when most of it was read
+ * (a turn that only appends new content is not a rebuild).
+ */
+export function lostCacheTokens(cacheRead, prevTokens, minPrompt = REBUILD_MIN_PROMPT) {
+  if (!(prevTokens >= minPrompt)) return 0;
+  return (cacheRead || 0) < prevTokens * 0.5 ? prevTokens - (cacheRead || 0) : 0;
+}
+
+/** Did this response rebuild most of a big prompt instead of reading it from cache? */
+export function isCacheRebuild(usage, minPrompt = REBUILD_MIN_PROMPT) {
+  if (!usage) return false;
+  const write = (usage.cacheWrite5m || 0) + (usage.cacheWrite1h || 0);
+  const prompt = (usage.input || 0) + (usage.cacheRead || 0) + write;
+  return prompt >= minPrompt && write > prompt * 0.5;
+}
+
+const shortHash = (s) => createHash('sha1').update(s).digest('hex').slice(0, 12);
+// cache_control markers move every turn without changing what is cached: leave them out
+const noMarkers = (k, v) => (k === 'cache_control' ? undefined : v);
+
+/**
+ * What decides whether a request can reuse the cache: tools, system, settings, beta header,
+ * and each message (cache_control markers ignored). Hashes only; null for a non-JSON body.
+ */
+export function cacheFingerprint(body, headers = {}) {
+  let j;
+  try { j = JSON.parse(Buffer.isBuffer(body) ? body.toString('utf8') : String(body)); } catch { return null; }
+  if (!j || typeof j !== 'object' || !Array.isArray(j.messages)) return null;
+  const settings = { thinking: j.thinking, tool_choice: j.tool_choice, output_config: j.output_config, speed: j.speed, effort: j.effort };
+  return {
+    model: j.model || null,
+    tools: shortHash(JSON.stringify(j.tools || null, noMarkers)),
+    system: shortHash(JSON.stringify(j.system || null, noMarkers)),
+    settings: shortHash(JSON.stringify(settings, noMarkers)),
+    beta: String(headers['anthropic-beta'] || ''),
+    msgs: j.messages.map(m => shortHash(JSON.stringify(m, noMarkers))),
+  };
+}
+
+/**
+ * Why a lane had to rebuild its cache, comparing this request with the lane's previous one.
+ * Returns { cause, detail }. cause: idle | account | model | tools | system | settings | beta |
+ * history | unknown.
+ */
+export function classifyRebuild(prev, cur, { gapMs = 0, ttlMs = HOUR_MS, prevAccount = null, account = null } = {}) {
+  if (!prev || !cur) return { cause: 'unknown', detail: 'no earlier request to compare' };
+  if (gapMs > ttlMs) return { cause: 'idle', detail: `idle ${Math.round(gapMs / 60000)} min (cache lasts ${Math.round(ttlMs / 60000)} min)` };
+  if (prevAccount && account && prevAccount !== account) return { cause: 'account', detail: `moved from ${prevAccount} to ${account}` };
+  if (prev.model !== cur.model) return { cause: 'model', detail: `${prev.model} → ${cur.model}` };
+  if (prev.tools !== cur.tools) return { cause: 'tools', detail: 'tool definitions changed' };
+  if (prev.system !== cur.system) return { cause: 'system', detail: 'system prompt changed' };
+  if (prev.settings !== cur.settings) return { cause: 'settings', detail: 'thinking or other settings changed' };
+  if (prev.beta !== cur.beta) return { cause: 'beta', detail: 'anthropic-beta header changed' };
+  const n = Math.min(prev.msgs.length, cur.msgs.length);
+  for (let i = 0; i < n; i++) {
+    if (prev.msgs[i] !== cur.msgs[i]) return { cause: 'history', detail: `message #${i + 1} of ${cur.msgs.length} changed (e.g. compaction)` };
+  }
+  if (cur.msgs.length < prev.msgs.length) return { cause: 'history', detail: 'conversation got shorter (e.g. compaction)' };
+  return { cause: 'unknown', detail: 'same prefix: the cache was dropped upstream' };
+}
+
+/**
+ * Return curve of idle sessions (Kaplan–Meier). periods: [{ waitMs, returned }]: how long a
+ * session was idle (counted from its last cache touch) and whether it came back (false =
+ * still idle or closed: censored). Returns surv[k] = P(still away when ping k+1 would be due),
+ * with one ping every `periodMs`; surv[0] = 1.
+ */
+export function returnCurve(periods, { periodMs = HOUR_MS - PING_MARGIN_MS, maxK = 200 } = {}) {
+  const events = new Map(), censored = new Map();
+  const slot = (ms) => Math.max(0, Math.ceil(ms / periodMs) - 1); // pings needed to be warm at that time
+  for (const p of periods || []) {
+    const k = Math.min(slot(p.waitMs), maxK + 1);
+    const m = p.returned ? events : censored;
+    m.set(k, (m.get(k) || 0) + 1);
+  }
+  const surv = new Array(maxK + 2);
+  let s = 1, atRisk = (periods || []).length;
+  for (let k = 0; k <= maxK + 1; k++) {
+    surv[k] = s;
+    const d = events.get(k) || 0;
+    if (atRisk > 0) s *= 1 - d / atRisk;
+    atRisk -= d + (censored.get(k) || 0);
+  }
+  return surv;
+}
+
+/** Return curve from a Weibull fit (the prior while there is little data). */
+export function weibullCurve(shape, scaleMs, { periodMs = HOUR_MS - PING_MARGIN_MS, maxK = 200 } = {}) {
+  const surv = new Array(maxK + 2);
+  surv[0] = 1;
+  for (let k = 1; k <= maxK + 1; k++) surv[k] = Math.exp(-Math.pow((k * periodMs) / scaleMs, shape));
+  return surv;
+}
+
+/** Measured on real Claude Code use (1,246 idle periods): returns fall off fast, then a long tail. */
+export const RETURN_PRIOR = { shape: 0.5, scaleMs: 17.3 * HOUR_MS };
+
+/**
+ * How many pings to send for one idle period (look-ahead optimal stopping): the H that
+ * maximises Σ P(return needing k pings)·(1 − k·ratio) − P(still away after H pings)·H·ratio,
+ * where ratio = one ping's cost / one rebuild's cost. Unlike a one-step "is the next hour
+ * worth it" rule, this also handles curves that dip and rise again (evening → next morning).
+ */
+export function bestPingCount(surv, ratio, maxPings) {
+  let best = 0, bestV = 0;
+  for (let H = 1; H <= Math.min(maxPings, surv.length - 2); H++) {
+    let v = 0;
+    for (let k = 1; k <= H; k++) v += (surv[k] - surv[k + 1]) * (1 - k * ratio); // k = 0 needs no ping
+    v -= surv[H + 1] * H * ratio;
+    if (v > bestV) { bestV = v; best = H; }
+  }
+  return best;
+}
+
+/**
+ * Replay recorded idle periods under a ping count: net value as a share of what all those
+ * rebuilds cost (1 = every rebuild avoided for free). For checking the policy on real data.
+ */
+export function backtestPings(periods, pingsFor, ratio, { periodMs = HOUR_MS - PING_MARGIN_MS } = {}) {
+  let value = 0, base = 0;
+  for (const p of periods) {
+    const n = pingsFor(p);
+    const size = p.tokens || 1;
+    if (!p.returned) { value -= size * ratio * Math.min(n, Math.floor(p.waitMs / periodMs)); continue; }
+    base += size;
+    const need = Math.max(0, Math.ceil(p.waitMs / periodMs) - 1);
+    value += need <= n ? size * (1 - need * ratio) : -size * ratio * n;
+  }
+  return base ? value / base : 0;
+}
+
+/**
+ * Keep-warm planner: which idle session lanes to ping, and when. Pure state; the caller
+ * does the requests. A lane is one Claude Code session's main conversation.
+ *   start/end     a real request begins / its response is closed (any outcome)
+ *   finish        a real request's usage arrived (confirms the cache touch)
+ *   due(t)        lanes whose cache needs a ping now, best value first
+ *   pinged        the outcome of a ping
+ * Pings stop for an idle period after `limit` pings (learned per model), a failed ping, a
+ * missed window (machine slept), or when the lane is set to "never".
+ */
+export function createKeepWarmPlanner({ now = () => Date.now(), pingLimit = () => 0 } = {}) {
+  const lanes = new Map();
+  // Ping a minute before the TTL runs out (a quarter of it for very short TTLs, e.g. in tests)
+  const margin = (l) => Math.min(PING_MARGIN_MS, l.ttlMs / 4);
+
+  function lane(sid) {
+    let l = lanes.get(sid);
+    if (!l) {
+      l = { sid, account: null, model: null, ttlMs: HOUR_MS, tokens: 0, touchedAt: 0, realAt: 0, inflight: 0,
+            pings: 0, limit: 0, stopped: null, mode: 'auto', warmedThisIdle: false };
+      lanes.set(sid, l);
+    }
+    return l;
+  }
+
+  /** A real request of this session starts (no ping may overlap it). */
+  function start(sid) {
+    lane(sid).inflight++;
+  }
+
+  /**
+   * A successful conversation request's usage arrived (not side calls, not errors or retries).
+   * `startedAt` is when it began: the cache TTL counts from there. Returns:
+   *   warmResume  pings kept this cache alive and it was read now
+   *   idle        the idle period this request ended ({ waitMs, pings, tokens, model }) or null;
+   *               idle time counts from the last real request (pings keep the cache, not the
+   *               user, active)
+   */
+  function finish(sid, { startedAt, account, model, ttlMs, tokens, cacheRead = 0, ok = true } = {}) {
+    const l = lane(sid);
+    if (!ok) return { warmResume: false, idle: null };
+    const at0 = startedAt || now();
+    const idle = l.realAt && at0 - l.realAt >= l.ttlMs - margin(l)
+      ? { waitMs: at0 - l.realAt, pings: l.pings, tokens: l.tokens, model: l.model } : null;
+    const warmResume = l.warmedThisIdle && l.account === account && cacheRead >= l.tokens * 0.9;
+    const at = startedAt || now();
+    Object.assign(l, { account, model, ttlMs: ttlMs || HOUR_MS, tokens: tokens || 0, touchedAt: at, realAt: at,
+                       pings: 0, stopped: null, warmedThisIdle: false });
+    l.limit = l.mode === 'never' ? 0 : pingLimit(l);
+    return { warmResume, idle };
+  }
+
+  function due(t = now()) {
+    const out = [];
+    for (const l of lanes.values()) {
+      if (l.mode === 'never' || l.stopped || l.inflight > 0 || !l.touchedAt || !l.account) continue;
+      if (l.tokens < KEEP_WARM_MIN_TOKENS) continue;
+      const at = l.touchedAt + l.ttlMs - margin(l);
+      if (t < at) continue;
+      if (t > l.touchedAt + l.ttlMs) { l.stopped = 'cold'; continue; } // missed it (machine slept)
+      if (l.pings >= l.limit) { l.stopped = 'done'; continue; }
+      out.push(l);
+    }
+    // Most valuable first: the biggest caches (equal per-token value across lanes otherwise)
+    return out.sort((a, b) => rebuildCost(b.tokens, b.model, b.ttlMs) - rebuildCost(a.tokens, a.model, a.ttlMs));
+  }
+
+  /** Outcome of a ping that started at `startedAt`: ok extends the cache; anything else stops. */
+  function pinged(sid, { ok, startedAt, reason = 'failed' }) {
+    const l = lanes.get(sid);
+    if (!l) return;
+    if (l.realAt > startedAt || l.inflight > 0) return; // a real request came in meanwhile: stale
+    if (ok) { l.pings++; l.touchedAt = startedAt; l.warmedThisIdle = true; }
+    else l.stopped = reason;
+  }
+
+  function setMode(sid, mode) {
+    const l = lane(sid);
+    l.mode = ['auto', 'pin', 'never'].includes(mode) ? mode : 'auto';
+    l.limit = l.mode === 'never' ? 0 : pingLimit(l);
+    if (l.mode !== 'never' && (l.stopped === 'done')) l.stopped = null;
+  }
+
+  /** The real request's response is closed (success, error or disconnect). */
+  function end(sid) { const l = lanes.get(sid); if (l) l.inflight = Math.max(0, l.inflight - 1); }
+
+  function stop(sid, reason) { const l = lanes.get(sid); if (l) l.stopped = reason; }
+  function drop(sid) { lanes.delete(sid); }
+  function get(sid) { return lanes.get(sid) || null; }
+  function all() { return [...lanes.values()]; }
+  function modes() { return Object.fromEntries([...lanes.values()].filter(l => l.mode !== 'auto').map(l => [l.sid, l.mode])); }
+  function loadModes(m) { for (const [sid, mode] of Object.entries(m || {})) lane(sid).mode = mode; }
+
+  return { start, end, finish, due, pinged, setMode, stop, drop, get, all, modes, loadModes };
+}
+
+/**
+ * Daily ledger of what cache care saved and cost (USD at API prices):
+ *   keepWarm  pings sent, their cost, warm resumes and the rebuilds they avoided
+ *   affinity  moves avoided by keeping a warm session on its account
+ *   rebuilds  rebuilds that still happened, by cause, with their extra cost
+ */
+export function createCacheLedger(saved = null) {
+  const days = new Map(Object.entries(saved?.days || {}));
+  const day = (t) => {
+    const k = new Date(t).toISOString().slice(0, 10);
+    let d = days.get(k);
+    if (!d) days.set(k, (d = { pings: 0, pingCost: 0, warmResumes: 0, keepWarmSaved: 0, affinityMoves: 0, affinitySaved: 0, rebuilds: {} }));
+    return d;
+  };
+  return {
+    ping(cost, t = Date.now()) { const d = day(t); d.pings++; d.pingCost += cost; },
+    warmResume(saved, t = Date.now()) { const d = day(t); d.warmResumes++; d.keepWarmSaved += saved; },
+    affinity(saved, t = Date.now()) { const d = day(t); d.affinityMoves++; d.affinitySaved += saved; },
+    rebuild(cause, cost, t = Date.now()) {
+      const r = day(t).rebuilds;
+      const c = r[cause] || (r[cause] = { count: 0, cost: 0 });
+      c.count++; c.cost += cost;
+    },
+    /** Totals since `since` (ms). pct = saved ÷ (saved + rebuild cost still paid). */
+    summary(since = 0) {
+      const s = { pings: 0, pingCost: 0, warmResumes: 0, keepWarmSaved: 0, affinityMoves: 0, affinitySaved: 0, rebuilds: {}, rebuildCost: 0 };
+      for (const [k, d] of days) {
+        if (Date.parse(k + 'T23:59:59Z') < since) continue;
+        for (const f of ['pings', 'pingCost', 'warmResumes', 'keepWarmSaved', 'affinityMoves', 'affinitySaved']) s[f] += d[f];
+        for (const [cause, c] of Object.entries(d.rebuilds)) {
+          const t = s.rebuilds[cause] || (s.rebuilds[cause] = { count: 0, cost: 0 });
+          t.count += c.count; t.cost += c.cost; s.rebuildCost += c.cost;
+        }
+      }
+      s.saved = s.keepWarmSaved - s.pingCost + s.affinitySaved;
+      const gross = s.keepWarmSaved + s.affinitySaved;
+      s.pct = gross + s.rebuildCost > 0 ? Math.max(0, s.saved) / (gross + s.rebuildCost) : null;
+      return s;
+    },
+    prune(keepDays = 120, t = Date.now()) {
+      const cut = new Date(t - keepDays * 86400000).toISOString().slice(0, 10);
+      for (const k of days.keys()) if (k < cut) days.delete(k);
+    },
+    toJSON() { return { v: 1, days: Object.fromEntries(days) }; },
+  };
+}
+
+/**
+ * Set top-level fields of a JSON object text without re-serializing it: every other byte stays
+ * as it was (JSON.parse + stringify would reorder number-like keys and could change the prompt
+ * the cache was built from). `fields` values are JSON-encoded. Missing fields are added first.
+ * Returns null when the text is not a JSON object.
+ */
+export function setTopLevelJsonFields(text, fields) {
+  let i = 0;
+  const n = text.length;
+  const ws = () => { while (i < n && (text[i] === ' ' || text[i] === '\n' || text[i] === '\r' || text[i] === '\t')) i++; };
+  const skipString = () => { // at the opening quote; returns the raw string contents
+    const start = ++i;
+    while (i < n && text[i] !== '"') i += text[i] === '\\' ? 2 : 1;
+    if (i >= n) throw new Error('unterminated string');
+    return text.slice(start, i++);
+  };
+  const skipValue = () => {
+    ws();
+    if (text[i] === '"') { skipString(); return; }
+    if (text[i] === '{' || text[i] === '[') {
+      let depth = 0;
+      while (i < n) {
+        const c = text[i];
+        if (c === '"') { skipString(); continue; }
+        if (c === '{' || c === '[') depth++;
+        else if (c === '}' || c === ']') { depth--; if (depth === 0) { i++; return; } }
+        i++;
+      }
+      throw new Error('unterminated value');
+    }
+    while (i < n && !',}] \n\r\t'.includes(text[i])) i++; // number, true, false, null
+  };
+  try {
+    ws();
+    if (text[i] !== '{') return null;
+    const open = i++;
+    const spans = {};
+    ws();
+    while (i < n && text[i] !== '}') {
+      if (text[i] !== '"') return null;
+      const key = JSON.parse('"' + skipString() + '"');
+      ws();
+      if (text[i++] !== ':') return null;
+      ws();
+      const vStart = i;
+      skipValue();
+      if (key in fields && !(key in spans)) spans[key] = [vStart, i];
+      ws();
+      if (text[i] === ',') { i++; ws(); }
+    }
+    if (text[i] !== '}') return null;
+    const edits = Object.entries(spans).map(([k, [a, b]]) => [a, b, JSON.stringify(fields[k])]).sort((x, y) => y[0] - x[0]);
+    let out = text;
+    for (const [a, b, v] of edits) out = out.slice(0, a) + v + out.slice(b);
+    const missing = Object.keys(fields).filter(k => !(k in spans));
+    if (missing.length) {
+      const add = missing.map(k => JSON.stringify(k) + ':' + JSON.stringify(fields[k])).join(',');
+      const rest = out.slice(open + 1);
+      out = out.slice(0, open + 1) + add + (/^\s*\}/.test(rest) ? '' : ',') + rest;
+    }
+    return out;
+  } catch { return null; }
+}
