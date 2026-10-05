@@ -582,6 +582,7 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
   local notifs=$(get_config_value "notifications")
   local affinity=$(get_config_value "sessionAffinity")
   local history_on=$(get_config_value "sessionHistory")
+  local keepwarm_on=$(get_config_value "keepWarm")
   echo ""
   echo -e "  ${BOLD}Settings${NC}"
   echo -e "  ────────────────────────────────"
@@ -605,6 +606,11 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
     echo -e "  Affinity:      ${DIM}OFF${NC}"
   else
     echo -e "  Affinity:      ${GREEN}ON${NC}  ${DIM}(sessions stay on one account while their cache is warm)${NC}"
+  fi
+  if [[ "$keepwarm_on" == "False" ]]; then
+    echo -e "  Keep-warm:     ${DIM}OFF${NC}  ${DIM}(vdm config keep-warm on)${NC}"
+  else
+    echo -e "  Keep-warm:     ${GREEN}ON${NC}  ${DIM}(idle sessions keep their prompt cache)${NC}"
   fi
   if [[ "$history_on" == "True" ]]; then
     echo -e "  History:       ${GREEN}ON${NC}  ${DIM}(sessions are saved: vdm history)${NC}"
@@ -696,10 +702,10 @@ cmd_config() {
       echo -e "  sessionAffinity:    ${GREEN}on${NC}"
     fi
     local kw=$(get_config_value "keepWarm")
-    if [[ "$kw" == "True" ]]; then
-      echo -e "  keepWarm:           ${GREEN}on${NC}"
-    else
+    if [[ "$kw" == "False" ]]; then
       echo -e "  keepWarm:           ${DIM}off${NC}"
+    else
+      echo -e "  keepWarm:           ${GREEN}on${NC}"
     fi
     local hist=$(get_config_value "sessionHistory")
     if [[ "$hist" == "True" ]]; then

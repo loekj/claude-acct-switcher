@@ -111,7 +111,7 @@ const DEFAULT_SETTINGS = {
   historyExclude: [],         // folders whose sessions are never saved
   claudeCommand: 'claude',    // how `vdm history continue|resume` and copied commands start Claude Code
   hotTokensPer5m: 25_000_000, // account charts: above this many tokens per 5 minutes the line turns red
-  keepWarm: false,            // ping idle sessions so their prompt cache stays warm (smart, learned)
+  keepWarm: true,             // ping idle sessions so their prompt cache stays warm (smart, learned); on unless turned off
 };
 
 // Settings of features removed in v4 (commit token trailers, AI session monitor).
@@ -137,7 +137,7 @@ function clampSettings(s) {
   s.balanceWaitMs = n(s.balanceWaitMs, 10000, 0, 30000);
   s.hotTokensPer5m = Math.round(n(s.hotTokensPer5m, 25_000_000, 100_000, 10_000_000_000));
   s.sessionHistory = s.sessionHistory === true;
-  s.keepWarm = s.keepWarm === true;
+  s.keepWarm = s.keepWarm !== false;
   s.historyRetentionDays = Math.floor(n(s.historyRetentionDays, 0, 0, 3650));
   const excludeAsked = (typeof s.historyExclude === 'string' ? s.historyExclude.split(/\r?\n/) : Array.isArray(s.historyExclude) ? s.historyExclude : [])
     .filter(x => typeof x === 'string' && x.trim());
@@ -2795,7 +2795,7 @@ function renderHTML() {
         <div class="config-row">
           <div class="config-info">
             <div class="config-label">Keep idle sessions' caches warm</div>
-            <div class="config-desc">Just before an open session's prompt cache expires, vdm resends its last request with "no answer needed", on the same account. That costs a cache read (a few % of a rebuild) and keeps the cache. How long to keep each session warm is learned from when you come back. Off by default: pings use a little of your plan's usage. Needs session affinity.</div>
+            <div class="config-desc">Just before an open session's prompt cache expires, vdm resends its last request with "no answer needed", on the same account. That costs a cache read (a few % of a rebuild) and keeps the cache. How long to keep each session warm is learned from when you come back. On by default. Pings use a little of your plan's usage. Needs session affinity.</div>
             <div class="config-desc" id="keepwarm-learned" style="margin-top:0.375rem"></div>
           </div>
           <input type="checkbox" class="sw" id="toggle-keepwarm" aria-label="Keep caches warm" onchange="toggleSetting('keepWarm', this.checked)">
@@ -3551,7 +3551,7 @@ async function loadSettingsUI() {
     document.getElementById('serialize-delay-ctrl').style.display = s.serializeRequests ? '' : 'none';
     document.getElementById('toggle-affinity').checked = s.sessionAffinity !== false;
     document.getElementById('toggle-history').checked = s.sessionHistory === true;
-    document.getElementById('toggle-keepwarm').checked = s.keepWarm === true;
+    document.getElementById('toggle-keepwarm').checked = s.keepWarm !== false;
     loadKeepWarmLearned();
     var hot = document.getElementById('sel-hot');
     var hotVal = String(s.hotTokensPer5m || 25000000);
