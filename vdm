@@ -695,6 +695,12 @@ cmd_config() {
     else
       echo -e "  sessionAffinity:    ${GREEN}on${NC}"
     fi
+    local kw=$(get_config_value "keepWarm")
+    if [[ "$kw" == "True" ]]; then
+      echo -e "  keepWarm:           ${GREEN}on${NC}"
+    else
+      echo -e "  keepWarm:           ${DIM}off${NC}"
+    fi
     local hist=$(get_config_value "sessionHistory")
     if [[ "$hist" == "True" ]]; then
       echo -e "  sessionHistory:     ${GREEN}on${NC}"
@@ -721,6 +727,7 @@ cmd_config() {
     echo -e "  ${DIM}  vdm config serialize-delay 0|100|200|500|1000${NC}  ${DIM}[BETA]${NC}"
     echo -e "  ${DIM}  vdm config affinity on|off${NC}  ${DIM}keep each session on one account (saves prompt cache)${NC}"
     echo -e "  ${DIM}  vdm config history on|off${NC}  ${DIM}save sessions to search and continue later${NC}"
+    echo -e "  ${DIM}  vdm config keep-warm on|off${NC}  ${DIM}keep idle sessions' prompt cache warm (learned limits)${NC}"
     echo -e "  ${DIM}  vdm config claude-cmd 'claude --flags'${NC}  ${DIM}how vdm starts Claude Code (full command, not an alias)${NC}"
     echo -e "  ${DIM}  vdm config history-keep 0|90|180|365|730${NC}  ${DIM}days to keep saved sessions (0 = forever)${NC}"
     return 0
@@ -739,13 +746,14 @@ cmd_config() {
     max-concurrent|maxConcurrentPerAccount|max-concurrent-per-account) key="maxConcurrentPerAccount"; is_bool=false ;;
     affinity|sessionAffinity|session-affinity) key="sessionAffinity" ;;
     history|sessionHistory|session-history) key="sessionHistory" ;;
+    keep-warm|keepWarm|keepwarm) key="keepWarm" ;;
     claude-cmd|claudeCommand|claude-command) key="claudeCommand"; is_bool=false
       # Allow it unquoted: vdm config claude-cmd claude --dangerously-skip-permissions
       if [[ $# -gt 2 ]]; then shift; value="$*"; fi ;;
     history-keep|historyRetentionDays|history-retention) key="historyRetentionDays"; is_bool=false ;;
     *)
       echo -e "${RED}Unknown setting: $key${NC}"
-      echo "  Available: proxy, autoswitch, notifications, rotation, interval, max-concurrent, serialize, serialize-delay, affinity, history, claude-cmd, history-keep"
+      echo "  Available: proxy, autoswitch, notifications, rotation, interval, max-concurrent, serialize, serialize-delay, affinity, history, keep-warm, claude-cmd, history-keep"
       return 1
       ;;
   esac
@@ -840,6 +848,9 @@ cmd_config() {
     value=$((10#$value))
     set_config_number "$key" "$value"
     echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value}${NC}  ${DIM}(0 = keep forever)${NC}"
+  fi
+  if [[ "$key" == "keepWarm" && "$value" == "True" ]]; then
+    echo -e "  ${DIM}Idle sessions now keep their prompt cache. Savings: Usage tab → Smart cache.${NC}"
   fi
   if [[ "$key" == "sessionHistory" && "$value" == "True" ]]; then
     echo -e "  ${DIM}Saving your sessions now. Browse them: vdm history, or the History tab in the dashboard.${NC}"

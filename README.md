@@ -79,7 +79,7 @@ vdm upgrade                 Update to latest version
 
 ### Dashboard
 
-`http://localhost:3333`  - accounts, sessions, history, artifacts, usage, activity log.
+`http://localhost:3333`  - accounts, sessions, history, artifacts, usage (incl. smart cache savings), activity log.
 
 #### Accounts
 
@@ -100,6 +100,16 @@ Sessions are named by their `/rename` name, else `branch:id`. Each shows an affi
 | 3 green | Locked: no move with a warm cache in the last hour |
 | 2 yellow | Holding: one warm move in the last hour, or requests a bit spread |
 | 1 red | Drifting: repeated warm moves or requests spread over accounts |
+
+#### Cache care
+
+Big Claude Code sessions carry hundreds of thousands of tokens of prompt cache. Rebuilding it costs 2x the input price; reading it costs 0.025-0.1x. vdm keeps track of this:
+
+- **Cache doctor (always on):** every time a big prompt is rebuilt instead of read, vdm names the cause: idle past the cache lifetime, moved to another account, model switched, tool list changed, system prompt changed, thinking/settings changed, history rewritten (e.g. compaction), or dropped upstream. Per session in the Sessions tab, totals in the Usage tab.
+- **Keep-warm (off by default: `vdm config keep-warm on`):** just before an open, idle session's cache expires, vdm resends that session's last request with `max_tokens: 0` (no answer, only a cache read) to the same account. How long to keep each session warm is **learned**: vdm builds a return curve from your own idle periods (Kaplan-Meier, counting sessions that never came back) and picks the stop time with the best expected saving for that model's prices, capped at the break-even. On real Claude Code use this saved about two thirds of rebuild cost; a constant-rate (Poisson) model saved nothing because people come back fast or much later. Per session you can choose *Keep warm* or *Never* in the Sessions tab. Pings skip closed sessions, accounts near their limits, and stop after a failed ping or a sleeping machine. Pings use a little of your plan's usage.
+- **Smart cache savings:** the header and the Usage tab show what keep-warm and session affinity saved (only counted when a session really came back to a warm cache, minus what the pings cost) and what was still lost, by cause.
+
+Claude Code itself uses a 1-hour cache for main sessions on a subscription and 5 minutes for subagents; `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h` helps long-running subagents.
 
 #### History (off by default)
 
@@ -151,6 +161,7 @@ vdm config serialize on|off       # Serialize proxy requests
 vdm config serialize-delay <ms>   # Serialization delay
 vdm config affinity on|off        # Keep each session on one account
 vdm config history on|off         # Save sessions (search, continue, resume)
+vdm config keep-warm on|off       # Keep idle sessions' prompt cache warm (learned limits)
 vdm config claude-cmd '<command>' # How vdm starts Claude Code (full command, not an alias)
 vdm config history-keep <days>    # Delete saved sessions older than this (0 = forever)
 ```

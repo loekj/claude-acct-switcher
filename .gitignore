@@ -8,6 +8,7 @@ activity-log.json
 account-state.json
 utilization-history.json
 throughput.json
+cache-care.json
 probe-log.json
 token-usage.json
 token-usage.imported.json
