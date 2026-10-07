@@ -5296,6 +5296,18 @@ function markAccountExpired(token, name) {
   accountState.markExpired(token, name);
 }
 
+// A 403 permission_error is neither a rate limit nor an expired token: the
+// credentials are valid and the subscription is live, but the organization
+// forbids this kind of access (`oauth_not_allowed_for_organization`). Nothing
+// about it expires, so the cooldown is long rather than a normal rate-limit
+// window — but not infinite, so an account whose org policy is changed back
+// recovers on its own instead of needing a restart.
+const PERMISSION_BLOCK_SEC = 6 * 60 * 60; // 6h
+
+function markAccountPermissionBlocked(token, name) {
+  accountState.markLimited(token, name, PERMISSION_BLOCK_SEC);
+}
+
 // ── Load saved accounts from disk ──
 
 let _accountsCache = null;
@@ -8035,6 +8047,61 @@ async function handleProxyRequest(clientReq, clientRes) {
           message: 'All account tokens are expired. Re-add accounts with: vdm add <name>',
         },
       }));
+      return;
+    }
+
+    // ── 403: Permission denied → this account cannot serve traffic, move on ──
+    //
+    // Anthropic answers `403 permission_error` with
+    // `oauth_not_allowed_for_organization` when an organization has OAuth
+    // disabled. Without a branch here the error goes straight back to the
+    // client while healthy accounts sit idle — and the account is never marked,
+    // so the very next request picks it again.
+    //
+    // Under `spread` it is worse than a single failed request: that strategy
+    // prefers the LEAST used account, and an account that never completes a
+    // request never accumulates usage, so it stays at 0% and is chosen first
+    // every time. One account with OAuth disabled starves the whole rotation.
+    if (status === 403) {
+      const errBody = await drainResponse(proxyRes);
+      let reason = 'permission denied';
+      try {
+        const parsed = JSON.parse(errBody.toString('utf8'));
+        reason = parsed?.error?.details?.error_code || parsed?.error?.message || reason;
+      } catch { /* keep the generic reason */ }
+      log('switch', `${acctName} → 403 ${reason}`);
+
+      markAccountPermissionBlocked(token, acctName);
+      logEvent('permission-blocked', { account: acctName, reason });
+
+      if (settings.autoSwitch || balanceMode) {
+        const next = balanceMode
+          ? await balanceSwitch(triedTokens)
+          : (pickBestAccount(triedTokens) || pickAnyUntried(triedTokens));
+        if (next) {
+          log(balanceMode ? 'balance' : 'switch', `  → switching to ${next.label || next.name}`);
+          if (!balanceMode) {
+            try {
+              await withSwitchLock(() => {
+                writeKeychain(next.creds);
+                invalidateTokenCache();
+              });
+            } catch (e) {
+              log('warn', `Keychain write failed during 403 switch: ${e.message}`);
+            }
+          }
+          token = next.token;
+          logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '403' });
+          continue;
+        }
+      }
+
+      // No other account left. When every account answers 403 the cause is the
+      // request rather than the accounts, so the upstream error is the honest
+      // reply — a synthesized proxy error would hide the real diagnosis.
+      log('switch', '  → no other account available — returning the upstream 403');
+      clientRes.writeHead(403, { 'Content-Type': 'application/json' });
+      clientRes.end(errBody);
       return;
     }
 
