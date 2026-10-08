@@ -79,13 +79,13 @@ vdm upgrade                 Update to latest version
 
 ### Dashboard
 
-`http://localhost:3333`  - accounts, sessions, history, artifacts, usage (incl. smart cache savings), activity log.
+`http://localhost:3333`  - accounts, sessions, history, artifacts, usage (incl. smart cache savings), activity (events, and the live proxy log under *Live logs*).
 
 #### Accounts
 
-Per account: 5h and weekly windows, plus a separate **Fable weekly** bar when the account has that bucket (Fable has its own weekly limit). Under them, a line shows the account's **token throughput** (all models, incl. cache reads) per 5 minutes: the last 24 hours, and the last 7 days as hourly averages. All accounts share one scale, so a busy account stands out; above the **hot line** (Config, default 25M tokens per 5 minutes) the line turns red.
+Per account: 5h and weekly windows, plus a small **Fable weekly** bar next to the weekly countdown when the account has that bucket (Fable has its own weekly limit). Under them, a line shows the account's **token throughput** (all models, incl. cache reads) per 5 minutes: the last 24 hours, and the last 7 days as hourly averages. All accounts share one scale, so a busy account stands out; above the **hot line** (Config → Advanced, default 25M tokens per 5 minutes) the line turns red.
 
-Usage, charts and saved sessions are kept per account **email** (stored in `accounts/<name>.email`), so they carry on after a re-login, a token refresh, or removing and adding an account again. Each card lists the Claude Code sessions that ran through it in the last 24 hours, the account's 30-day cache hit rate, and how many artifacts it owns.
+Usage, charts and saved sessions are kept per account **email** (stored in `accounts/<name>.email`), so they carry on after a re-login, a token refresh, or removing and adding an account again. Each card shows how many Claude Code sessions ran through it in the last 24 hours (a link to them in the Sessions tab) and how many artifacts it owns.
 
 #### Sessions & affinity
 
@@ -101,13 +101,15 @@ Sessions are named by their `/rename` name, else `branch:id`. Each shows an affi
 | 2 yellow | Holding: one warm move in the last hour, or requests a bit spread |
 | 1 red | Drifting: repeated warm moves or requests spread over accounts |
 
+Each session shows the account it is on now and its cache state. When it used more than one account, a bar per account shows how its requests were spread. Every move between accounts is in the Activity tab; repeats close together are grouped into one line.
+
 #### Cache care
 
 Big Claude Code sessions carry hundreds of thousands of tokens of prompt cache. Rebuilding it costs 2x the input price; reading it costs 0.025-0.1x. vdm keeps track of this:
 
 - **Cache doctor (always on):** every time a big prompt is rebuilt instead of read, vdm names the cause: idle past the cache lifetime, moved to another account, model switched, tool list changed, system prompt changed, thinking/settings changed, history rewritten (e.g. compaction), or dropped upstream. Per session in the Sessions tab, totals in the Usage tab.
 - **Keep-warm (on by default; turn off with `vdm config keep-warm off`):** just before an open, idle session's cache expires, vdm resends that session's last request with `max_tokens: 0` (no answer, only a cache read) to the same account. How long to keep each session warm is **learned**: vdm builds a return curve from your own idle periods (Kaplan-Meier, counting sessions that never came back) and picks the stop time with the best expected saving for that model's prices, capped at the break-even. On real Claude Code use this saved about two thirds of rebuild cost; a constant-rate (Poisson) model saved nothing because people come back fast or much later. Per session you can choose *Keep warm* or *Never* in the Sessions tab. Pings skip closed sessions, accounts near their limits, and stop after a failed ping or a sleeping machine. Pings use a little of your plan's usage.
-- **Smart cache savings:** the header and the Usage tab show what keep-warm and session affinity saved (only counted when a session really came back to a warm cache, minus what the pings cost) and what was still lost, by cause.
+- **Smart cache savings:** the Usage tab shows three numbers for its time period: what keep-warm and session affinity saved (only counted when a session really came back to a warm cache, minus what the pings cost), how often a kept cache was used, and what was still rebuilt. Hover a number for the split and the causes.
 
 Claude Code itself uses a 1-hour cache for main sessions on a subscription and 5 minutes for subagents; `CLAUDE_CODE_SUBAGENT_PROMPT_CACHE_TTL=1h` helps long-running subagents.
 
@@ -120,7 +122,7 @@ vdm config history on
 ```
 
 - **Saved without extra disk.** While Claude Code still has a transcript, vdm's copy is a hard link to the same file. When Claude Code deletes it, vdm's link keeps the data and is compressed (about 4x smaller). vdm never writes to Claude Code's files.
-- **Search everything.** Your prompts, Claude's replies, file names and commands are indexed (full-text, on this computer; no AI, no extra cost). Filters: `file:app.js`, `branch:fix`, `project:x`, `account:a@b`, `after:2026-09-01`, `"exact words"`. Each result shows your first and last prompt, the files it changed, the accounts it used and its cost at API prices.
+- **Search everything.** Your prompts, Claude's replies, file names and commands are indexed (full-text, on this computer; no AI, no extra cost). Filters: `file:app.js`, `branch:fix`, `project:x`, `account:a@b`, `after:2026-09-01`, `"exact words"`. Each result shows your first and last prompt and the files it changed; the detail view adds its cost at API prices.
 - **Continue in a new session.** *Copy prompt* writes a handoff file (Claude Code's latest compaction summary, the newest messages, files changed, last commands) and copies a one-line prompt. Paste it into any new Claude session. Or run `vdm history continue <id>` to open a new session in the right folder with the handoff loaded.
 - **Resume exactly.** `vdm history resume <id>` runs `claude --resume` in the session's folder. If Claude Code already deleted the session, vdm puts its copy back first (it never overwrites a file).
 - **Your launch command.** If you start Claude Code with flags (or an alias), set the full command once: `vdm config claude-cmd 'claude --dangerously-skip-permissions'`. Shell aliases do not work inside vdm. `VDM_CLAUDE_CMD` overrides it.
@@ -146,8 +148,7 @@ Claude Code publishes artifacts with its own login (the account in the Keychain)
 
 Every request through the proxy is counted (input, output, cache reads, cache writes), per account, model, repo and branch. Data is kept as hourly rollups in `usage/` (one file per day), so it survives restarts and re-logins and has no row cap.
 
-- **Plan value**  - each Max account's subscription price (20x $200, 5x $100, prorated) vs the same usage at API prices
-- **Cache efficiency**  - rolling 30-day cache hit rate per account and per model, with a daily trend
+- **Plan value**  - each Max account's subscription price (20x $200, 5x $100, prorated) vs the same usage at API prices, over the chosen period. Accounts not used in that period are left out.
 - Model, account and repo/branch breakdowns; CSV export of the hourly rows
 
 ### Settings

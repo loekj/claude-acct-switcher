@@ -167,19 +167,3 @@ describe('body helpers accept Buffers', () => {
   });
 });
 
-describe('cacheEfficiency', () => {
-  it('computes hit and rebuild ratios per account/model with a daily trend', async () => {
-    const { cacheEfficiency, createUsageDay } = await import('../lib.mjs');
-    const d0 = Date.UTC(2026, 9, 1);
-    const day = createUsageDay();
-    day.add({ ts: d0 + 3600e3, account: 'a', model: 'm1', usage: { input: 10, cacheRead: 900, cacheWrite5m: 90 } });
-    day.add({ ts: d0 + 86400e3 + 3600e3, account: 'b', model: 'm1', usage: { input: 50, cacheRead: 0, cacheWrite1h: 950 } });
-    const eff = cacheEfficiency(day.rows(), { since: d0, until: d0 + 3 * 86400e3 });
-    assert.equal(eff.byAccount.a.hit, 0.9);
-    assert.equal(eff.byAccount.b.hit, 0);
-    assert.equal(eff.byAccount.b.rebuild, 0.95);
-    assert.equal(eff.overall.hit, 900 / 2000);
-    assert.deepEqual(eff.byModel.m1.trend, [0.9, 0, null]);
-    assert.deepEqual(eff.byAccount.a.trend, [0.9, null, null]);
-  });
-});
