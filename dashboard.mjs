@@ -22,7 +22,6 @@ process.stderr?.on?.('error', () => {});
 
 const PORT = parseInt(process.env.CSW_PORT || '3333', 10);
 const ACCOUNTS_DIR = join(__dirname, 'accounts');
-const STATS_CACHE = join(process.env.HOME, '.claude', 'stats-cache.json');
 const CONFIG_FILE = join(__dirname, 'config.json');
 const STATE_FILE = join(__dirname, 'account-state.json');
 const LEGACY_TOKEN_USAGE_FILE = join(__dirname, 'token-usage.json'); // pre-v4 per-request log, imported once
@@ -269,7 +268,6 @@ import {
   planMonthlyUsd,
   createUsageDay,
   summarizeUsage,
-  cacheEfficiency,
   utcDay,
   extractArtifactRefs,
   artifactRefMatches,
@@ -902,15 +900,6 @@ async function loadProfiles() {
   return profiles;
 }
 
-async function loadStats() {
-  try {
-    const raw = await readFile(STATS_CACHE, 'utf8');
-    return JSON.parse(raw);
-  } catch {
-    return null;
-  }
-}
-
 // ─────────────────────────────────────────────────
 // API handlers
 // ─────────────────────────────────────────────────
@@ -920,7 +909,7 @@ async function handleAPI(req, res) {
 
   if (url.pathname === '/api/history' || url.pathname.startsWith('/api/history/')) return handleHistoryAPI(req, res, url);
 
-  if (url.pathname === '/api/cache-care' && req.method === 'GET') { json(res, cacheCareReport()); return true; }
+  if (url.pathname === '/api/cache-care' && req.method === 'GET') { json(res, cacheCareReport(parseInt(url.searchParams.get('days') || '7', 10))); return true; }
   if (url.pathname === '/api/cache-care/mode' && req.method === 'POST') {
     const { sid, mode } = JSON.parse(await readBody(req) || '{}');
     if (!sid || typeof sid !== 'string' || !['auto', 'pin', 'never'].includes(mode)) { json(res, { error: 'sid and mode (auto|pin|never) required' }, 400); return true; }
@@ -942,10 +931,7 @@ async function handleAPI(req, res) {
       p.artifactCount = (artifactIndex.accounts[p.name]?.frames || []).length;
       p.blocked = blockedInfo(p.name);
       p.modelBlocks = modelBlocks(p.name);
-      const c30 = cacheReport30d().byAccount[p.id];
-      p.cache30d = c30 ? { hit: c30.hit, rebuild: c30.rebuild } : null;
     }
-    const stats = await loadStats();
     const probeStats = getProbeStats();
     // Check if all accounts are exhausted
     const allAccounts = loadAllAccountTokens();
@@ -953,10 +939,10 @@ async function handleAPI(req, res) {
       allAccounts.every(a => !isAccountAvailable(a.token, a.expiresAt));
     const earliestReset = allExhausted ? getEarliestReset() : null;
     json(res, {
-      profiles, stats, probeStats, allExhausted, earliestReset,
+      profiles, probeStats, allExhausted, earliestReset,
       rotationStrategy: settings.rotationStrategy, balanceCap: settings.maxConcurrentPerAccount || 8,
       sessionAffinity: settings.sessionAffinity !== false, sessionHistory: settings.sessionHistory === true, hotTokensPer5m: settings.hotTokensPer5m,
-      cacheCare: cacheCareHeadline(), queueStats: getQueueStats(),
+      queueStats: getQueueStats(),
     });
     return true;
   }
@@ -1383,6 +1369,21 @@ function renderHTML() {
     color: var(--muted);
     margin-bottom: 0.875rem;
   }
+  .config-advanced { border-top: 1px solid var(--border); }
+  .config-advanced > summary {
+    padding: 1rem 1.5rem;
+    cursor: pointer;
+    list-style: none;
+    font-size: 0.6875rem;
+    font-weight: 600;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    color: var(--muted);
+  }
+  .config-advanced > summary::-webkit-details-marker { display: none; }
+  .config-advanced > summary::before { content: '▸ '; }
+  .config-advanced[open] > summary::before { content: '▾ '; }
+  .config-advanced > .config-section { border-top: 1px solid var(--border); }
   .config-row {
     display: flex;
     align-items: center;
@@ -1421,6 +1422,10 @@ function renderHTML() {
     min-width: 120px;
   }
   .config-select:hover { border-color: var(--primary); }
+  .strategy-more summary { cursor: pointer; font-size: 0.8125rem; color: var(--primary); margin-top: 0.625rem; list-style: none; }
+  .strategy-more summary::-webkit-details-marker { display: none; }
+  .strategy-more summary::before { content: '▸ '; }
+  .strategy-more[open] summary::before { content: '▾ '; }
   .strategy-list {
     margin-top: 0.75rem;
     display: flex;
@@ -1467,8 +1472,12 @@ function renderHTML() {
     box-shadow: var(--shadow);
   }
   .tab {
-    flex: 1;
-    padding: 0.5rem 0;
+    flex: 1 1 auto;
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    white-space: nowrap;
+    padding: 0.5rem 0.5rem;
     font-size: 0.9375rem;
     font-weight: 500;
     color: var(--muted);
@@ -1586,7 +1595,7 @@ function renderHTML() {
   /* Rate limit bars */
   .rate-bars {
     display: grid;
-    grid-template-columns: 1fr 1fr;
+    grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
     gap: 3rem;
   }
   .rate-group {}
@@ -1625,11 +1634,19 @@ function renderHTML() {
   .fill-high { background: var(--red); }
   .fill-full { background: var(--red); animation: pulse-fill 1.5s infinite; }
   @keyframes pulse-fill { 0%,100%{opacity:1} 50%{opacity:0.5} }
+  .rate-foot {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 0.75rem;
+    min-height: 1.125rem;
+    margin-top: 0.1875rem;
+  }
   .rate-reset {
     font-size: 0.6875rem;
     color: var(--muted);
-    margin-top: 0.1875rem;
     font-variant-numeric: tabular-nums;
+    white-space: nowrap;
   }
 
   .switch-btn {
@@ -1705,8 +1722,9 @@ function renderHTML() {
     border-radius: 0.5rem;
     padding: 0 0.25rem;
     margin-left: 0.375rem;
-    vertical-align: middle;
+    font-variant-numeric: tabular-nums;
   }
+  .tab.active .tab-badge { background: rgba(255,255,255,0.25); color: #fff; }
   /* Affinity strength: 3 bars = strong, 2 = ok, 1 = weak */
   .aff { display: inline-flex; align-items: flex-end; gap: 2px; height: 11px; flex-shrink: 0; }
   .aff i { display: block; width: 3px; border-radius: 1px; background: var(--border); }
@@ -1716,25 +1734,9 @@ function renderHTML() {
   .aff-strong i { background: var(--green); }
   .aff-ok i:nth-child(-n+2) { background: var(--yellow); }
   .aff-weak i:nth-child(1) { background: var(--red); }
-  .acct-sessions {
-    margin-top: 0.875rem;
-    padding-top: 0.75rem;
-    border-top: 1px dashed var(--border);
-  }
-  .acct-sessions-head {
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
-    font-size: 0.6875rem;
-    font-weight: 600;
-    text-transform: uppercase;
-    letter-spacing: 0.05em;
-    color: var(--muted);
-    margin-bottom: 0.375rem;
-  }
-  .sess-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8125rem; padding: 0.1875rem 0; }
-  .sess-here { width: 6px; height: 6px; border-radius: 50%; background: var(--green); flex-shrink: 0; }
-  .sess-here.away { background: var(--border); }
+  .card-actions { display: flex; align-items: center; gap: 1rem; margin-top: 0.875rem; padding-top: 0.75rem; border-top: 1px dashed var(--border); }
+  .card-actions .switch-btn, .card-actions .refresh-btn { margin-left: auto; }
+  .sess-link { font-size: 0.8125rem; }
   .sess-name { flex: 1; min-width: 0; font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sess-meta { font-size: 0.75rem; color: var(--muted); white-space: nowrap; font-variant-numeric: tabular-nums; }
   .link-btn {
@@ -1775,14 +1777,33 @@ function renderHTML() {
   .sess-card-title { flex: 1; min-width: 0; font-weight: 600; font-size: 0.9375rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sess-sub { font-size: 0.75rem; color: var(--muted); margin-top: 0.125rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .sess-aff-line { display: flex; align-items: center; gap: 0.5rem; font-size: 0.8125rem; margin-top: 0.625rem; }
-  .sess-accts { margin-top: 0.5rem; }
-  .sess-acct-row { display: flex; align-items: center; gap: 0.5rem; font-size: 0.75rem; padding: 0.125rem 0; font-variant-numeric: tabular-nums; }
-  .sess-acct-name { width: 40%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .sess-acct-bar { flex: 1; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
-  .sess-acct-bar > div { height: 100%; background: var(--primary); }
-  .sess-moves { margin-top: 0.5rem; font-size: 0.75rem; color: var(--muted); }
-  .sess-move { padding: 0.0625rem 0; }
-  .sess-move.warm { color: var(--red); }
+  .sess-on { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess-cache { font-size: 0.75rem; color: var(--muted); white-space: nowrap; }
+  .sess-cache .ok { color: var(--green); }
+  .sess-mode { margin-left: auto; min-width: 0; font-size: 0.6875rem; padding: 0.0625rem 0.25rem; flex-shrink: 0; }
+  .sess-more summary { cursor: pointer; font-size: 0.75rem; color: var(--muted); margin-top: 0.25rem; list-style: none; }
+  .sess-more summary::-webkit-details-marker { display: none; }
+  .sess-more summary::before { content: '▸ '; }
+  .sess-more[open] summary::before { content: '▾ '; }
+  .sess-more .sess-accts { margin-top: 0.25rem; }
+  /* Accounts that served one session: fixed columns, so every bar has the same length */
+  .sess-accts {
+    display: grid;
+    grid-template-columns: minmax(0, 15rem) minmax(3rem, 1fr) 8.5rem;
+    gap: 0.25rem 0.75rem;
+    align-items: center;
+    margin-top: 0.625rem;
+    font-size: 0.75rem;
+    font-variant-numeric: tabular-nums;
+  }
+  .sess-accts .sess-meta { text-align: right; }
+  .sess-acct-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sess-acct-bar { display: block; height: 5px; border-radius: 3px; background: var(--border); overflow: hidden; }
+  .sess-acct-bar > span { display: block; height: 100%; background: var(--primary); }
+  @media (max-width: 520px) {
+    .sess-aff-line { flex-wrap: wrap; }
+    .sess-accts { grid-template-columns: minmax(0, 1fr) 3rem max-content; }
+  }
   .live-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 0 3px var(--green-soft); flex-shrink: 0; }
   .live-dot.off { background: var(--border); box-shadow: none; }
 
@@ -1834,14 +1855,12 @@ function renderHTML() {
   .hist-row.sel { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
   .hist-top { display: flex; align-items: center; gap: 0.5rem; }
   .hist-title { flex: 1; min-width: 0; font-weight: 600; font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .hist-cost { font-size: 0.75rem; color: var(--muted); font-variant-numeric: tabular-nums; white-space: nowrap; }
   .hist-sub { font-size: 0.75rem; color: var(--muted); margin-top: 0.125rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .hist-text { font-size: 0.8125rem; margin-top: 0.375rem; line-height: 1.45; color: var(--foreground); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word; }
   .hist-last { font-size: 0.75rem; color: var(--muted); margin-top: 0.25rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .hist-text mark, .hm mark { background: var(--yellow-soft); color: inherit; border-radius: 2px; padding: 0 1px; box-shadow: 0 0 0 1px var(--yellow-border); }
   .hist-chips { display: flex; gap: 0.25rem; flex-wrap: wrap; margin-top: 0.375rem; }
   .hist-chip { font-size: 0.6875rem; padding: 0.0625rem 0.4375rem; border-radius: 999px; border: 1px solid var(--border); color: var(--muted); background: var(--bg); white-space: nowrap; max-width: 220px; overflow: hidden; text-overflow: ellipsis; }
-  .hist-chip.acct { color: var(--primary); border-color: var(--blue-border); background: var(--blue-soft); }
   .pill-saved { color: hsl(32 80% 38%); background: var(--yellow-soft); border: 1px solid var(--yellow-border); }
   .pill-soft { color: var(--muted); background: var(--bg); border: 1px solid var(--border); }
   .hist-more { display: block; margin: 0.75rem auto 0; }
@@ -1934,9 +1953,9 @@ function renderHTML() {
   .plan-table td.name { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .val-good { color: var(--green); font-weight: 600; }
   .val-bad { color: var(--red); font-weight: 600; }
+  .plan-table tr.total td { font-weight: 600; }
 
   /* ── Account card extras ── */
-  .badge-soft { background: var(--card); color: var(--muted); border: 1px solid var(--border); }
   .blocked-banner {
     display: flex;
     align-items: center;
@@ -1952,9 +1971,10 @@ function renderHTML() {
   }
   .blocked-banner .muted { color: var(--muted); font-weight: 400; }
   .blocked-banner.model { background: var(--yellow-soft); border-color: var(--yellow-border); color: hsl(32 80% 38%); }
-  .rate-sub { display: flex; align-items: center; gap: 0.5rem; margin-top: 0.375rem; font-size: 0.75rem; color: var(--muted); }
-  .rate-sub .rate-track { flex: 1; height: 4px; }
-  .rate-sub .rate-pct { font-size: 0.75rem; min-width: 2.5rem; text-align: right; }
+  /* Fable's own weekly limit, on the countdown line of the weekly column */
+  .rate-sub { display: flex; align-items: center; gap: 0.375rem; flex: 0 1 55%; min-width: 0; font-size: 0.6875rem; color: var(--muted); }
+  .rate-sub .rate-track { flex: 1; min-width: 1.5rem; height: 3px; }
+  .rate-sub .rate-pct { font-size: 0.6875rem; white-space: nowrap; }
 
   /* ── Sessions tab ── */
   .sess-toolbar { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
@@ -1990,19 +2010,6 @@ function renderHTML() {
   .pill-running { color: var(--green); background: var(--green-soft); border: 1px solid var(--green-border); }
 
   /* ── Usage extras ── */
-  .eff-row {
-    display: grid;
-    grid-template-columns: minmax(0, 1.5fr) 96px minmax(0, 1.4fr) 4.5rem;
-    align-items: center;
-    gap: 0.75rem;
-    padding: 0.4375rem 0;
-    font-size: 0.875rem;
-  }
-  .eff-row + .eff-row { border-top: 1px solid var(--border); }
-  .eff-name { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .eff-detail { color: var(--muted); font-size: 0.8125rem; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-  .eff-hit { text-align: right; font-weight: 600; font-variant-numeric: tabular-nums; }
-  .eff-group { font-size: 0.6875rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin: 0.875rem 0 0.25rem; }
   .notice { font-size: 0.8125rem; color: var(--muted); background: var(--surface); border: 1px dashed var(--border); border-radius: 8px; padding: 0.625rem 0.75rem; }
   .err-state { color: var(--red); }
 
@@ -2035,6 +2042,13 @@ function renderHTML() {
   .evt-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
   .evt-msg { flex: 1; color: var(--muted); line-height: 1.4; }
   .evt-msg b { color: var(--foreground); font-weight: 600; }
+  .evt-count { font-size: 0.6875rem; font-weight: 600; color: var(--muted); background: var(--bg); border-radius: 4px; padding: 0 0.3125rem; margin-left: 0.25rem; }
+  .act-toolbar { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; }
+  .act-toolbar #log-clear { margin-left: auto; }
+  .seg { display: inline-flex; gap: 2px; padding: 2px; background: var(--card); border: 1px solid var(--border); border-radius: 8px; }
+  .seg-btn { border: none; background: none; font-family: inherit; font-size: 0.8125rem; font-weight: 500; color: var(--muted); padding: 0.25rem 0.75rem; border-radius: 6px; cursor: pointer; }
+  .seg-btn:hover { color: var(--foreground); }
+  .seg-btn.active { background: var(--bg); color: var(--foreground); }
 
   /* ── Usage ── */
   .usage-card {
@@ -2083,60 +2097,6 @@ function renderHTML() {
   }
   .chart-legend-item { display: flex; align-items: center; gap: 0.3rem; }
   .chart-legend-dot { width: 8px; height: 8px; border-radius: 2px; }
-  .chart-container {
-    height: 160px;
-    display: flex;
-    align-items: flex-end;
-    gap: 3px;
-  }
-  .chart-day {
-    flex: 1;
-    display: flex;
-    flex-direction: column;
-    align-items: center;
-    min-width: 0;
-  }
-  .chart-bars {
-    display: flex;
-    align-items: flex-end;
-    gap: 2px;
-    width: 100%;
-    justify-content: center;
-    height: 125px;
-  }
-  .chart-bar {
-    flex: 1;
-    min-width: 4px;
-    max-width: 16px;
-    border-radius: 3px 3px 0 0;
-    transition: height 0.3s;
-    position: relative;
-    cursor: default;
-  }
-  .chart-bar:hover { opacity: 0.75; z-index: 20; }
-  .chart-bar:hover::after {
-    content: attr(data-tooltip);
-    position: absolute;
-    bottom: calc(100% + 6px);
-    left: 50%;
-    transform: translateX(-50%);
-    background: var(--foreground);
-    color: #fff;
-    padding: 0.25rem 0.5rem;
-    border-radius: 6px;
-    font-size: 0.6875rem;
-    white-space: nowrap;
-    z-index: 10;
-    pointer-events: none;
-    box-shadow: 0 2px 8px rgba(0,0,0,0.15);
-  }
-  .chart-bar.msg-bar { background: var(--primary); }
-  .chart-bar.tok-bar { background: var(--purple); opacity: 0.6; }
-  .chart-label {
-    font-size: 0.625rem;
-    color: var(--muted);
-    margin-top: 0.375rem;
-  }
 
   /* ── Toast ── */
   .toast {
@@ -2218,24 +2178,10 @@ function renderHTML() {
   .spark-hot { color: var(--red); font-weight: 600; }
 
   /* ── Smart cache ── */
-  .sc-head { display: flex; align-items: center; gap: 1rem; margin: 0.25rem 0 0.875rem; }
-  .sc-big { font-size: 2.25rem; font-weight: 700; line-height: 1; color: var(--green); font-variant-numeric: tabular-nums; }
-  .sc-big.none { color: var(--muted); font-size: 1.5rem; }
-  .sc-sub { font-size: 0.8125rem; color: var(--muted); line-height: 1.5; }
-  .sc-sub b { color: var(--foreground); }
-  .sc-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 0.75rem; }
-  .sc-cell { border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 0.625rem 0.75rem; font-size: 0.8125rem; line-height: 1.5; min-width: 0; }
-  .sc-cell-title { font-weight: 600; margin-bottom: 0.25rem; }
-  .sc-num { font-variant-numeric: tabular-nums; }
-  .sc-cause { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 0.5rem; font-size: 0.75rem; padding: 0.125rem 0; }
-  .sc-cause-name { color: var(--muted); line-height: 1.35; }
-  .sc-learned { font-size: 0.75rem; color: var(--muted); margin-top: 0.75rem; }
+  .sc-tiles { grid-template-columns: repeat(3, minmax(0, 1fr)); margin-bottom: 0; }
+  .stat-val.good { color: var(--green); }
+  .stat-val.bad { color: var(--red); }
   .sc-off { font-size: 0.8125rem; background: var(--yellow-soft); border: 1px solid var(--yellow-border); border-radius: var(--radius-sm); padding: 0.5rem 0.75rem; margin-bottom: 0.75rem; }
-  .sess-cache { display: flex; align-items: center; gap: 0.5rem; font-size: 0.75rem; color: var(--muted); margin-top: 0.375rem; flex-wrap: wrap; }
-  .sess-cache b { color: var(--foreground); font-weight: 600; }
-  .sess-cache .ok { color: var(--green); }
-  .sess-cache select { font-size: 0.6875rem; padding: 0.0625rem 0.25rem; margin-left: auto; }
-  @media (max-width: 720px) { .sc-grid { grid-template-columns: minmax(0, 1fr); } }
   .velocity-badge {
     font-size: 0.6875rem;
     font-weight: 500;
@@ -2365,25 +2311,7 @@ function renderHTML() {
     line-height: 1.6;
   }
   #tok-stats.stat-grid { grid-template-columns: repeat(4, 1fr); }
-  .tok-stat-sub { font-size: 0.5625rem; color: var(--muted); margin-top: 0.0625rem; }
-  .tok-savings-banner {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    font-size: 0.8125rem;
-    color: var(--muted);
-    margin-bottom: 1.25rem;
-    flex-wrap: wrap;
-  }
-  .tok-savings-banner select {
-    font-size: 0.75rem;
-    padding: 0.125rem 0.375rem;
-    border-radius: 4px;
-    border: 1px solid var(--border);
-    background: var(--card);
-    color: var(--foreground);
-  }
-  .tok-savings-val { color: var(--green); font-weight: 600; }
+  .tok-stat-sub { font-size: 0.6875rem; color: var(--muted); margin-top: 0.125rem; }
   .tok-trend { font-size: 0.6875rem; font-weight: 500; margin-top: 0.125rem; }
   .tok-trend.up { color: var(--red); }
   .tok-trend.down { color: var(--green); }
@@ -2562,7 +2490,9 @@ function renderHTML() {
     margin-top: 0.5rem;
     text-align: center;
   }
-  .savings-chart-total .saved { color: var(--green); font-weight: 600; }
+  .savings-chart-total .saved, .usage-title-val.saved { color: var(--green); font-weight: 600; }
+  .usage-title-val { float: right; font-weight: 600; }
+  .usage-title-val.over { color: var(--red); }
   .savings-chart-total .over { color: var(--red); font-weight: 600; }
 </style>
 </head>
@@ -2571,7 +2501,7 @@ function renderHTML() {
   <div class="header">
     <div class="header-left">
       <h1>Van Damme-o-Matic</h1>
-      <div class="header-sub"><span id="account-count">0</span> accounts connected<span id="current-strategy"></span><span id="probe-stats"></span></div>
+      <div class="header-sub"><span id="account-count">0</span> accounts<span id="current-strategy"></span></div>
     </div>
   </div>
 
@@ -2588,7 +2518,6 @@ function renderHTML() {
     <button class="tab" onclick="switchTab('usage')">Usage</button>
     <button class="tab" onclick="switchTab('activity')">Activity</button>
     <button class="tab" onclick="switchTab('config')">Config</button>
-    <button class="tab" onclick="switchTab('logs')">Logs</button>
   </div>
 
   <div id="tab-accounts" class="tab-content active">
@@ -2598,8 +2527,19 @@ function renderHTML() {
   </div>
 
   <div id="tab-activity" class="tab-content">
+    <div class="act-toolbar">
+      <div class="seg">
+        <button class="seg-btn active" id="act-btn-events" onclick="activityView('events')">Events</button>
+        <button class="seg-btn" id="act-btn-logs" onclick="activityView('logs')">Live logs</button>
+      </div>
+      <span class="sess-meta" id="log-status" style="display:none">Disconnected</span>
+      <button class="tok-export-btn" id="log-clear" style="display:none" onclick="clearLogs()">Clear</button>
+    </div>
     <div id="activity-wrap" class="activity-card">
-      <div id="activity-log" style="color:var(--muted);padding:2rem 0">No activity yet</div>
+      <div id="activity-log"><div style="color:var(--muted);padding:2rem 0">No activity yet</div></div>
+    </div>
+    <div id="logs-wrap" style="display:none">
+      <div id="log-container" style="background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:0.75rem;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:0.75rem;line-height:1.5;height:calc(100vh - 260px);overflow-y:auto;color:#c9d1d9"></div>
     </div>
   </div>
 
@@ -2622,40 +2562,21 @@ function renderHTML() {
     <div id="tok-empty" class="empty-state" style="display:none"></div>
     <div id="tok-content" style="display:none">
       <div id="tok-stats" class="stat-grid" style="margin-bottom:1rem"></div>
-      <div class="usage-card" style="margin-bottom:1rem" id="tok-savings-chart"></div>
-      <div class="usage-card" style="margin-bottom:1rem" id="tok-chart"></div>
       <div class="usage-card" style="margin-bottom:1rem">
-        <div class="usage-title">Plan value</div>
-        <div class="section-note">What each account's usage would cost at API prices (cache reads and writes included), against its subscription price for the same period.</div>
-        <div id="tok-plans"></div>
+        <div id="tok-savings-chart"></div>
+        <div id="tok-plans" style="margin-top:1.25rem"></div>
       </div>
       <div class="usage-card" style="margin-bottom:1rem">
-        <div class="usage-title">Cache efficiency &middot; last 30 days, all traffic</div>
-        <div class="section-note">Hit = share of prompt tokens read from cache: higher is cheaper and uses up limits slower. Rebuilt = share written to cache again; it rises when sessions move between accounts. The line is the daily hit rate.</div>
-        <div id="tok-cache"></div>
+        <div id="tok-chart"></div>
+        <div id="tok-models" style="margin-top:1rem"></div>
       </div>
       <div class="usage-card" style="margin-bottom:1rem">
-        <div class="usage-title">Model Breakdown</div>
-        <div id="tok-models"></div>
-      </div>
-      <div class="usage-card" style="margin-bottom:1rem">
-        <div class="usage-title">Account Breakdown</div>
+        <div class="usage-title">Accounts</div>
         <div id="tok-accounts"></div>
       </div>
       <div class="usage-card">
-        <div class="usage-title">Repository &amp; Branch</div>
+        <div class="usage-title">Repos &amp; branches</div>
         <div id="tok-repos"></div>
-      </div>
-    </div>
-    <div id="stats-section" class="usage-card" style="display:none;margin-top:1rem">
-      <div class="usage-title">Claude Code's own counters (this Mac, all time)</div>
-      <div id="stats-grid" class="stat-grid"></div>
-      <div>
-        <div class="chart-legend">
-          <div class="chart-legend-item"><span class="chart-legend-dot" style="background:var(--primary)"></span> Messages</div>
-          <div class="chart-legend-item"><span class="chart-legend-dot" style="background:var(--purple)"></span> Tokens</div>
-        </div>
-        <div id="chart" class="chart-container"></div>
       </div>
     </div>
   </div>
@@ -2689,7 +2610,6 @@ function renderHTML() {
       <div class="hist-toolbar">
         <input class="config-select hist-search" id="hist-q" placeholder='Search all sessions, e.g. vat portugal file:app.js branch:fix "exact words"' aria-label="Search sessions" oninput="histQueryChanged()" onkeydown="histSearchKey(event)">
         <select class="config-select" id="hist-project" onchange="histFilterChanged()" aria-label="Project"><option value="">All projects</option></select>
-        <select class="config-select" id="hist-account" onchange="histFilterChanged()" aria-label="Account"><option value="">All accounts</option></select>
         <select class="config-select" id="hist-days" onchange="histFilterChanged()" aria-label="Period">
           <option value="0">Any time</option><option value="1">Today</option><option value="7">7 days</option><option value="30">30 days</option><option value="90">90 days</option>
         </select>
@@ -2705,7 +2625,7 @@ function renderHTML() {
   </div>
 
   <div id="tab-artifacts" class="tab-content">
-    <div class="section-note">Claude Code publishes artifacts with its own login (the active account), not through the proxy. This list asks every account which artifacts it owns. Paste a link or type a title to find the owner.</div>
+    <div class="section-note" title="Claude Code publishes artifacts with its own login (the active account), not through the proxy, so vdm asks every account which artifacts it owns.">Which account owns each artifact. Paste a link or type a title to find the owner.</div>
     <div class="art-toolbar">
       <input class="config-select art-search" id="art-search" placeholder="Search title or paste an artifact link" aria-label="Search artifacts" oninput="renderArtifacts()" onkeydown="if (event.key === 'Escape') { this.value = ''; renderArtifacts(); }">
       <button class="tok-export-btn" id="art-refresh" onclick="refreshArtifactsNow()">Check now</button>
@@ -2729,6 +2649,7 @@ function renderHTML() {
           <div class="config-info">
             <div class="config-label">Auto-switch on rate limit</div>
             <div class="config-desc">Automatically switch to another account when the current one hits a 429 or 401</div>
+            <div class="config-desc" id="probe-stats" style="margin-top:0.375rem"></div>
           </div>
           <input type="checkbox" class="sw" id="toggle-autoswitch" aria-label="Auto-switch on rate limit" checked onchange="toggleSetting('autoSwitch', this.checked)">
         </div>
@@ -2776,7 +2697,7 @@ function renderHTML() {
             <option value="16">16</option>
           </select>
         </div>
-        <div id="strategy-list" class="strategy-list"></div>
+        <details class="strategy-more"><summary>Compare strategies</summary><div id="strategy-list" class="strategy-list"></div></details>
       </div>
 
       <div class="config-section">
@@ -2795,26 +2716,13 @@ function renderHTML() {
         <div class="config-row">
           <div class="config-info">
             <div class="config-label">Keep idle sessions' caches warm</div>
-            <div class="config-desc">Just before an open session's prompt cache expires, vdm resends its last request with "no answer needed", on the same account. That costs a cache read (a few % of a rebuild) and keeps the cache. How long to keep each session warm is learned from when you come back. On by default. Pings use a little of your plan's usage. Needs session affinity.</div>
+            <div class="config-desc">Just before an idle session's prompt cache expires, vdm resends its last request on the same account, with no answer. That costs a cache read (a few % of a rebuild) and keeps the cache. How long to keep it warm is learned from when you come back. Needs session affinity.</div>
             <div class="config-desc" id="keepwarm-learned" style="margin-top:0.375rem"></div>
           </div>
           <input type="checkbox" class="sw" id="toggle-keepwarm" aria-label="Keep caches warm" onchange="toggleSetting('keepWarm', this.checked)">
         </div>
       </div>
 
-
-      <div class="config-section">
-        <div class="config-section-title">Account Charts</div>
-        <div class="config-row">
-          <div class="config-info">
-            <div class="config-label">Hot line</div>
-            <div class="config-desc">Above this many tokens per 5 minutes (all models, incl. cache reads) an account's chart line turns red.</div>
-          </div>
-          <select class="config-select" id="sel-hot" onchange="saveHotLine(Number(this.value))">
-            <option value="5000000">5M</option><option value="10000000">10M</option><option value="25000000">25M</option><option value="50000000">50M</option><option value="100000000">100M</option>
-          </select>
-        </div>
-      </div>
 
       <div class="config-section">
         <div class="config-section-title">Session History</div>
@@ -2861,40 +2769,48 @@ function renderHTML() {
         </div>
       </div>
 
-      <div class="config-section">
-        <div class="config-section-title">Request Serialization <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
-        <div class="config-row">
-          <div class="config-info">
-            <div class="config-label">Serialize requests</div>
-            <div class="config-desc">Queue concurrent API requests to avoid 429 collisions from multiple sessions</div>
+      <details class="config-advanced">
+        <summary>Advanced</summary>
+        <div class="config-section">
+          <div class="config-section-title">Account Charts</div>
+          <div class="config-row">
+            <div class="config-info">
+              <div class="config-label">Hot line</div>
+              <div class="config-desc">Above this many tokens per 5 minutes (all models, incl. cache reads) an account's chart line turns red.</div>
+            </div>
+            <select class="config-select" id="sel-hot" onchange="saveHotLine(Number(this.value))">
+              <option value="5000000">5M</option><option value="10000000">10M</option><option value="25000000">25M</option><option value="50000000">50M</option><option value="100000000">100M</option>
+            </select>
           </div>
-          <input type="checkbox" class="sw" id="toggle-serialize" aria-label="Serialize requests" onchange="toggleSetting('serializeRequests', this.checked)">
         </div>
-        <div class="config-row" id="serialize-delay-ctrl" style="display:none">
-          <div class="config-info">
-            <div class="config-label">Delay between requests</div>
-            <div class="config-desc">Milliseconds to wait between dispatching queued requests</div>
+
+        <div class="config-section">
+          <div class="config-section-title">Request Serialization <span style="font-size:0.625rem;font-weight:500;color:var(--yellow);background:var(--yellow-soft);border:1px solid var(--yellow-border);border-radius:4px;padding:0.125rem 0.375rem;margin-left:0.375rem;vertical-align:middle">BETA</span></div>
+          <div class="config-row">
+            <div class="config-info">
+              <div class="config-label">Serialize requests</div>
+              <div class="config-desc">Queue concurrent API requests to avoid 429 collisions from multiple sessions</div>
+            </div>
+            <input type="checkbox" class="sw" id="toggle-serialize" aria-label="Serialize requests" onchange="toggleSetting('serializeRequests', this.checked)">
           </div>
-          <select class="config-select" id="sel-serialize-delay" onchange="changeSerializeDelay(Number(this.value))">
-            <option value="0">0 ms</option>
-            <option value="100">100 ms</option>
-            <option value="200">200 ms</option>
-            <option value="500">500 ms</option>
-            <option value="1000">1000 ms</option>
-          </select>
+          <div class="config-row" id="serialize-delay-ctrl" style="display:none">
+            <div class="config-info">
+              <div class="config-label">Delay between requests</div>
+              <div class="config-desc">Milliseconds to wait between dispatching queued requests</div>
+            </div>
+            <select class="config-select" id="sel-serialize-delay" onchange="changeSerializeDelay(Number(this.value))">
+              <option value="0">0 ms</option>
+              <option value="100">100 ms</option>
+              <option value="200">200 ms</option>
+              <option value="500">500 ms</option>
+              <option value="1000">1000 ms</option>
+            </select>
+          </div>
+          <div id="queue-stats" style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem;display:none"></div>
         </div>
-        <div id="queue-stats" style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem;display:none"></div>
-      </div>
+      </details>
 
     </div>
-  </div>
-
-  <div id="tab-logs" class="tab-content">
-    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:0.5rem">
-      <div style="font-size:0.8125rem;color:var(--muted)" id="log-status">Disconnected</div>
-      <button onclick="clearLogs()" style="background:var(--surface);border:1px solid var(--border);color:var(--muted);padding:0.25rem 0.75rem;border-radius:6px;cursor:pointer;font-size:0.75rem">Clear</button>
-    </div>
-    <div id="log-container" style="background:#0d1117;border:1px solid var(--border);border-radius:8px;padding:0.75rem;font-family:'SF Mono',Monaco,Consolas,monospace;font-size:0.75rem;line-height:1.5;height:calc(100vh - 220px);overflow-y:auto;color:#c9d1d9"></div>
   </div>
 
 </div>
@@ -2902,7 +2818,10 @@ function renderHTML() {
 <div id="toast" class="toast"></div>
 
 <script>
+var _actView = 'events';
+
 function switchTab(id) {
+  if (id === 'logs') { id = 'activity'; _actView = 'logs'; }   // the Logs tab is now part of Activity
   document.querySelectorAll('.tab').forEach(t => t.classList.remove('active'));
   document.querySelectorAll('.tab-content').forEach(t => t.classList.remove('active'));
   document.getElementById('tab-' + id).classList.add('active');
@@ -2912,13 +2831,30 @@ function switchTab(id) {
   if (id === 'artifacts') refreshArtifactsTab();
   if (id === 'history') refreshHistory();
   if (id === 'config') loadSettingsUI(); // may have changed via vdm or another tab
-  if (id === 'logs') connectLogStream();
+  if (id === 'activity') { activityView(_actView); return; }   // sets the URL itself
   const url = new URL(location);
   url.searchParams.set('tab', id);
   history.replaceState(null, '', url);
 }
 
+// Activity tab: grouped events, or the live proxy log
+function activityView(v) {
+  _actView = v;
+  var logs = v === 'logs';
+  document.getElementById('activity-wrap').style.display = logs ? 'none' : '';
+  document.getElementById('logs-wrap').style.display = logs ? '' : 'none';
+  document.getElementById('log-status').style.display = logs ? '' : 'none';
+  document.getElementById('log-clear').style.display = logs ? '' : 'none';
+  document.getElementById('act-btn-events').classList.toggle('active', !logs);
+  document.getElementById('act-btn-logs').classList.toggle('active', logs);
+  if (logs) connectLogStream();
+  const url = new URL(location);
+  url.searchParams.set('tab', logs ? 'logs' : 'activity');
+  history.replaceState(null, '', url);
+}
+
 function formatNum(n) {
+  if (n >= 1e9) return (n/1e9).toFixed(1) + 'B';
   if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
   if (n >= 1e3) return (n/1e3).toFixed(1) + 'K';
   return String(n);
@@ -2965,7 +2901,7 @@ function planBadge(subscriptionType, rateLimitTier) {
   let label, cls;
   if (sub === 'max' || tier.indexOf('max') !== -1) {
     cls = 'badge-max';
-    const m = tier.match(/(\d+)x/);
+    const m = tier.match(/(\\d+)x/);
     label = m ? 'MAX ' + m[1] + 'x' : 'MAX';
   } else if (sub === 'pro' || tier.indexOf('pro') !== -1) {
     cls = 'badge-pro';
@@ -3060,7 +2996,7 @@ function renderProbeStats(ps) {
   const el = document.getElementById('probe-stats');
   if (!ps || !ps.probeCount7d) { el.textContent = ''; return; }
   const totalTok = ps.inputTokens + ps.outputTokens;
-  el.innerHTML = ' · ' + formatNum(ps.probeCount7d) + ' probes (7d) · ~' + formatNum(totalTok) + ' tokens overhead';
+  el.textContent = 'Limit checks in the last 7 days: ' + formatNum(ps.probeCount7d) + ', about ' + formatNum(totalTok) + ' tokens.';
 }
 
 /**
@@ -3203,7 +3139,6 @@ function renderVelocityInline(p) {
 let _lastProfilesHash = '';
 var _cachedProfiles = [];
 let _lastActivityHash = '';
-let _lastStatsHash = '';
 let _firstRender = true;
 const _sparkCache = {};
 
@@ -3214,7 +3149,7 @@ function quickHash(obj) {
 async function refresh() {
   try {
     const resp = await fetch('/api/profiles');
-    const { profiles, stats, probeStats, allExhausted, earliestReset, rotationStrategy, balanceCap, sessionAffinity, sessionHistory, hotTokensPer5m, cacheCare, queueStats } = await resp.json();
+    const { profiles, probeStats, allExhausted, earliestReset, rotationStrategy, balanceCap, sessionAffinity, sessionHistory, hotTokensPer5m, queueStats } = await resp.json();
     HIST.enabled = !!sessionHistory;
     if (hotTokensPer5m) HOT_TOKENS = hotTokensPer5m;
     _cachedProfiles = profiles;
@@ -3230,8 +3165,8 @@ async function refresh() {
     document.getElementById('account-count').textContent = profiles.length;
     if (rotationStrategy) {
       const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first', balance: 'Balance' };
-      document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy) +
-        (sessionAffinity ? ' \\u00b7 session affinity on' : ' \\u00b7 session affinity off') + smartCacheHeadline(cacheCare);
+      document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy) + ' strategy' +
+        (sessionAffinity ? '' : ' \\u00b7 session affinity off');
     }
     if (probeStats) renderProbeStats(probeStats);
     // [BETA] Queue stats
@@ -3255,13 +3190,6 @@ async function refresh() {
       document.getElementById('exhausted-reset').textContent = earliestReset || 'unknown';
     } else {
       banner.style.display = 'none';
-    }
-    if (stats) {
-      const sh = quickHash(stats);
-      if (sh !== _lastStatsHash) {
-        _lastStatsHash = sh;
-        renderStats(stats);
-      }
     }
   } catch(e) { console.error('Refresh:', e); }
   try {
@@ -3321,13 +3249,15 @@ function renderAccounts(profiles, animate, balanceMode, balanceCap) {
   tickCountdowns();
 }
 
-function rateGroup(label, util, reset, extra) {
+// One limit window. 'side' sits on the countdown line (Fable's own weekly bar), so both
+// columns keep the same height and their charts line up.
+function rateGroup(label, util, reset, side, chart) {
   var pct = Math.round(util * 100);
   return '<div class="rate-group">' +
     '<div class="rate-head"><span class="rate-label">' + label + '</span><span class="rate-pct ' + pctClass(pct) + '">' + pct + '%</span></div>' +
     '<div class="rate-track"><div class="rate-fill ' + fillClass(util) + '" style="width:' + Math.min(pct, 100) + '%"></div></div>' +
-    '<div class="rate-reset" data-reset="' + reset + '"></div>' +
-    (extra || '') +
+    '<div class="rate-foot"><span class="rate-reset" data-reset="' + reset + '"></span>' + (side || '') + '</div>' +
+    (chart || '') +
   '</div>';
 }
 
@@ -3353,8 +3283,8 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
         '<span class="rate-pct ' + pctClass(o) + '">' + (blocked ? 'used up' : o + '%') + '</span></div>';
     }
     barsHtml = '<div class="rate-bars">' +
-      rateGroup('5h window', rl.fiveH.utilization, rl.fiveH.reset, spark5h) +
-      rateGroup('Weekly', rl.sevenD.utilization, rl.sevenD.reset, fable + spark7d) +
+      rateGroup('5h window', rl.fiveH.utilization, rl.fiveH.reset, '', spark5h) +
+      rateGroup('Weekly', rl.sevenD.utilization, rl.sevenD.reset, fable, spark7d) +
     '</div>';
   } else if (p.dormant) {
     barsHtml = '<div style="font-size:0.8125rem;color:var(--cyan);margin-top:0.25rem;font-weight:500">Dormant: its limit windows have not started</div>';
@@ -3362,13 +3292,16 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
     barsHtml = '<div style="font-size:0.8125rem;color:var(--muted);margin-top:0.25rem">Limits not known yet</div>';
   }
 
+  var backIn = function(until) { return ' <span class="muted">&middot; back in <span data-reset="' + until + '" data-short="1"></span></span>'; };
+  var what = p.blocked ? p.blocked.what : '';
   var blockedHtml = p.blocked
-    ? '<div class="blocked-banner">Used up: ' + escHtml(p.blocked.what) + ' <span class="muted">&middot; back in <span data-reset="' + p.blocked.until + '" data-short="1"></span>. New and moved sessions skip it.</span></div>'
+    ? '<div class="blocked-banner" title="New and moved sessions skip this account until then.">' +
+      escHtml(what === 'cooling down' ? 'Cooling down' : what.charAt(0).toUpperCase() + what.slice(1) + ' used up') + backIn(p.blocked.until) + '</div>'
     : '';
   // Weekly limit for one model family (Opus or Sonnet): other models keep using the account
   (p.modelBlocks || []).forEach(function(b) {
     var fam = b.family.charAt(0).toUpperCase() + b.family.slice(1);
-    blockedHtml += '<div class="blocked-banner model">' + escHtml(fam) + ' weekly limit used up <span class="muted">&middot; back in <span data-reset="' + b.until + '" data-short="1"></span>. Other models still use this account.</span></div>';
+    blockedHtml += '<div class="blocked-banner model" title="Other models still use this account.">' + escHtml(fam) + ' weekly limit used up' + backIn(b.until) + '</div>';
   });
 
   var animStyle = animate ? ' style="animation-delay:' + (i*0.05) + 's"' : ' style="animation:none"';
@@ -3380,16 +3313,15 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
       : '<div class="stale-msg">Login expired. Auto-refresh will retry shortly.</div>';
   }
   var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '');
+  var sessLink = accountSessionsLink(p);
   var buttonsHtml = '';
   if (!active) {
-    buttonsHtml = '<div style="margin-top:0.875rem;display:flex;justify-content:space-between;align-items:center">' +
-      '<button class="remove-btn" onclick="doRemove(\\'' + eName + '\\',event)">Remove</button>' +
+    buttonsHtml = '<div class="card-actions">' +
+      '<button class="remove-btn" onclick="doRemove(\\'' + eName + '\\',event)">Remove</button>' + sessLink +
       (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\'' + eName + '\\',event)">Refresh</button>'
                : '<button class="switch-btn" onclick="doSwitch(\\'' + eName + '\\',\\'' + displayName.replace(/'/g, "\\\\'") + '\\',event)">Switch to this account</button>') +
     '</div>';
   }
-  var cache = p.cache30d && p.cache30d.hit != null
-    ? '<span class="badge badge-soft" title="Share of prompt tokens read from cache over the last 30 days. Higher is cheaper.">cache ' + Math.round(p.cache30d.hit * 100) + '%</span>' : '';
   var arts = p.artifactCount
     ? '<button class="chip" onclick="openArtifactsFor(\\'' + eName + '\\')" title="Artifacts this account owns on claude.ai">' + p.artifactCount + ' artifact' + (p.artifactCount === 1 ? '' : 's') + '</button>' : '';
   return '<div class="' + cardClass + '"' + animStyle + ' data-name="' + escHtml(p.name) + '">' +
@@ -3400,7 +3332,7 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
         (active ? renderVelocityInline(p) : '') +
       '</div>' +
       '<div class="card-badges">' +
-        cache + arts +
+        arts +
         inflightBadge(p, balanceMode, balanceCap) +
         planBadge(p.subscriptionType, p.rateLimitTier) +
         (active ? '<span class="badge badge-active" title="Claude Code is logged in with this account; new sessions start here">Active</span>' : '') +
@@ -3408,7 +3340,7 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
     '</div>' +
     blockedHtml +
     barsHtml +
-    renderAccountSessions(p) +
+    (active && sessLink ? '<div class="card-actions">' + sessLink + '</div>' : '') +
     staleMsg +
     buttonsHtml +
   '</div>';
@@ -3461,57 +3393,45 @@ function evtTime(ts) {
   return d.getDate() + ' ' + MONTHS[d.getMonth()] + ' ' + time;
 }
 
+// Repeats close together (same move or switch, at most 15 minutes apart) become one line.
+var EVT_GROUP_MS = 15 * 60000;
+
+function activityGroups(log) {
+  var out = [], open = {};
+  log.forEach(function(e) {   // newest first
+    var key = (e.type === 'session-moved' || e.type === 'auto-switch') ? [e.type, e.from, e.to, e.reason].join('|') : null;
+    var g = key && open[key];
+    if (g && g.oldest - e.ts <= EVT_GROUP_MS) { g.items.push(e); g.oldest = e.ts; return; }
+    g = { e: e, items: [e], oldest: e.ts };
+    if (key) open[key] = g;
+    out.push(g);
+  });
+  return out;
+}
+
+function groupMsg(g) {
+  var e = g.e, n = g.items.length;
+  if (n === 1) return evtMsg(e);
+  if (e.type === 'auto-switch') return evtMsg(e) + ' <span class="evt-count">' + n + '&times;</span>';
+  var names = [];
+  g.items.forEach(function(x) { if (names.indexOf(x.session) === -1) names.push(x.session || '?'); });
+  var who = names.length === 1 ? 'Session <b>' + escHtml(names[0]) + '</b>' : '<b title="' + escHtml(names.join(', ')) + '">' + names.length + ' sessions</b>';
+  return who + ' moved from <b>' + escHtml(e.from || '?') + '</b> to <b>' + escHtml(e.to || '?') + '</b>: ' + escHtml(MOVE_REASON[e.reason] || e.reason || '') + ', cache rebuilt' +
+    (n > names.length ? ' <span class="evt-count">' + n + '&times;</span>' : '');
+}
+
 function renderActivity(log) {
   const el = document.getElementById('activity-log');
   if (!log.length) { el.innerHTML = '<div style="color:var(--muted);padding:2rem 0">No activity yet</div>'; return; }
-  el.innerHTML = log.map(e => {
-    const c = evtColors[e.type] || 'var(--muted)';
+  el.innerHTML = activityGroups(log).map(g => {
+    const c = evtColors[g.e.type] || 'var(--muted)';
+    const span = g.items.length > 1 ? ' title="' + escHtml(evtTime(g.oldest) + ' to ' + evtTime(g.e.ts)) + '"' : '';
     return '<div class="evt">' +
-      '<span class="evt-time">' + evtTime(e.ts) + '</span>' +
+      '<span class="evt-time"' + span + '>' + evtTime(g.e.ts) + '</span>' +
       '<span class="evt-dot" style="background:' + c + '"></span>' +
-      '<span class="evt-msg">' + evtMsg(e) + '</span>' +
+      '<span class="evt-msg">' + groupMsg(g) + '</span>' +
     '</div>';
   }).join('');
-}
-
-function formatChartDate(iso) {
-  const p = iso.split('-');
-  return parseInt(p[2],10) + ' ' + MONTHS[parseInt(p[1],10)-1];
-}
-
-function renderStats(stats) {
-  document.getElementById('stats-section').style.display = '';
-  const grid = document.getElementById('stats-grid');
-  const totalTokens = Object.values(stats.modelUsage||{}).reduce((s,m) => s + (m.inputTokens||0) + (m.outputTokens||0), 0);
-  const totalCache = Object.values(stats.modelUsage||{}).reduce((s,m) => s + (m.cacheReadInputTokens||0), 0);
-  grid.innerHTML = [
-    { v: formatNum(stats.totalSessions||0), l: 'Sessions' },
-    { v: formatNum(stats.totalMessages||0), l: 'Messages' },
-    { v: formatNum(totalTokens), l: 'Tokens' },
-    { v: formatNum(totalCache), l: 'Cache Reads' },
-  ].map(s => '<div class="stat-item"><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div></div>').join('');
-
-  const tokenMap = {};
-  (stats.dailyModelTokens||[]).forEach(d => {
-    tokenMap[d.date] = Object.values(d.tokensByModel||{}).reduce((s,v)=>s+v,0);
-  });
-  const daily = (stats.dailyActivity||[]).slice(-14);
-  if (daily.length) {
-    const maxMsg = Math.max(...daily.map(d => d.messageCount||0), 1);
-    const maxTok = Math.max(...daily.map(d => tokenMap[d.date]||0), 1);
-    const H = 115;
-    document.getElementById('chart').innerHTML = daily.map(d => {
-      const msgs = d.messageCount||0;
-      const toks = tokenMap[d.date]||0;
-      const hM = Math.max(3, (msgs/maxMsg)*H);
-      const hT = Math.max(3, (toks/maxTok)*H);
-      const lbl = formatChartDate(d.date);
-      return '<div class="chart-day"><div class="chart-bars">' +
-        '<div class="chart-bar msg-bar" style="height:'+hM+'px" data-tooltip="'+lbl+': '+formatNum(msgs)+' msgs"></div>' +
-        '<div class="chart-bar tok-bar" style="height:'+hT+'px" data-tooltip="'+lbl+': '+formatNum(toks)+' tokens"></div>' +
-      '</div><div class="chart-label">'+lbl+'</div></div>';
-    }).join('');
-  }
 }
 
 // Live countdowns ("2h 5m left") and relative times ("3m ago"), so cards don't need
@@ -3523,6 +3443,9 @@ function tickCountdowns() {
   });
   document.querySelectorAll('[data-ago]').forEach(el => {
     el.textContent = timeAgo(Number(el.dataset.ago));
+  });
+  document.querySelectorAll('[data-until]').forEach(el => {
+    el.textContent = minsUntil(Number(el.dataset.until));
   });
 }
 
@@ -3731,7 +3654,7 @@ function tokTotal(t) { return tokPrompt(t) + (t.output || 0); }
 async function refreshTokens(force) {
   var tab = document.getElementById('tab-usage');
   if (!tab || !tab.classList.contains('active')) return;
-  refreshSmartCache();
+  refreshSmartCache(force);
   if (!force && _usage && Date.now() - _usageFetchedAt < USAGE_REFRESH_MS) return;
   if (_tokFetching) { _tokNeedsRefresh = true; return; }
   _tokFetching = true;
@@ -3746,7 +3669,7 @@ async function refreshTokens(force) {
     if (!resp.ok) throw new Error('HTTP ' + resp.status);
     var data = await resp.json();
     _usageFetchedAt = Date.now();
-    var h = quickHash({ t: data.totals, s: data.series, p: data.plans, o: data.options, f: data.filter, c: data.cache30d && data.cache30d.overall });
+    var h = quickHash({ t: data.totals, s: data.series, p: data.plans, o: data.options, f: data.filter });
     if (h === _usageHash) return;
     _usageHash = h;
     _usage = data;
@@ -3792,7 +3715,6 @@ function renderUsage(d) {
   renderDailyChart(d);
   renderCostSavingsChart(d);
   renderPlanValue(d);
-  renderCacheEfficiency(d.cache30d);
   renderModelBreakdown(d);
   renderAccountBreakdown(d);
   renderRepoBranchBreakdown(d);
@@ -3822,7 +3744,8 @@ function renderTokenStats(d) {
   var t = d.totals, p = d.prevTotals || {};
   var total = tokTotal(t), prevTotal = tokTotal(p);
   var trendHtml = '';
-  if (prevTotal > 0) {
+  // No trend when the previous period has (almost) no data yet: "+51754%" helps no one
+  if (prevTotal > 0 && total < prevTotal * 10) {
     var pctChange = Math.round(((total - prevTotal) / prevTotal) * 100);
     if (pctChange !== 0) {
       trendHtml = '<div class="tok-trend ' + (pctChange > 0 ? 'up' : 'down') + '">' + (pctChange > 0 ? '&uarr;' : '&darr;') + ' ' + Math.abs(pctChange) + '% vs prev period</div>';
@@ -3831,17 +3754,14 @@ function renderTokenStats(d) {
   var prompt = tokPrompt(t);
   var writes = (t.cacheWrite5m || 0) + (t.cacheWrite1h || 0);
   var stats = [
-    { v: formatNum(total), l: 'Total tokens', sub: 'incl. cache', extra: trendHtml },
+    { v: formatNum(total), l: 'Tokens', extra: trendHtml,
+      tip: 'Incl. cache. Cache reads ' + formatNum(t.cacheRead) + ' · cache writes ' + formatNum(writes) + ' · uncached input ' + formatNum(t.input) + ' · output ' + formatNum(t.output) },
     { v: formatNum(t.requests), l: 'Requests' },
-    { v: formatPct(prompt ? t.cacheRead / prompt : null), l: 'Cache hit', sub: formatPct(prompt ? writes / prompt : null) + ' rebuilt' },
-    { v: formatCost(t.cost), l: 'API price', sub: 'same usage, pay-as-you-go' },
-    { v: formatNum(t.cacheRead), l: 'Cache reads' },
-    { v: formatNum(writes), l: 'Cache writes' },
-    { v: formatNum(t.input), l: 'Uncached input' },
-    { v: formatNum(t.output), l: 'Output' },
+    { v: formatPct(prompt ? t.cacheRead / prompt : null), l: 'Cache hit', tip: 'Share of prompt tokens read from cache. ' + formatPct(prompt ? writes / prompt : null) + ' were written to cache again.' },
+    { v: formatCost(t.cost), l: 'API price', tip: 'The same usage at pay-as-you-go API prices' },
   ];
   document.getElementById('tok-stats').innerHTML = stats.map(function(s) {
-    var h = '<div class="stat-item"><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div>';
+    var h = '<div class="stat-item"' + (s.tip ? ' title="' + escHtml(s.tip) + '"' : '') + '><div class="stat-val">' + s.v + '</div><div class="stat-label">' + s.l + '</div>';
     if (s.sub) h += '<div class="tok-stat-sub">' + s.sub + '</div>';
     if (s.extra) h += s.extra;
     return h + '</div>';
@@ -3881,9 +3801,6 @@ function renderDailyChart(d) {
   var buckets = bk.buckets;
   var sortedModels = Object.keys(d.byModel).sort();
   var maxTotal = Math.max.apply(null, buckets.map(function(b) { return b.total; })) || 1;
-  var legend = '<div class="chart-legend">' + sortedModels.map(function(m) {
-    return '<div class="chart-legend-item"><span class="chart-legend-dot" style="background:' + getModelColor(m, sortedModels) + '"></span> ' + escHtml(shortModel(m)) + '</div>';
-  }).join('') + '</div>';
   var labelEvery = Math.ceil(buckets.length / 16);
   var bars = '<div class="tok-chart-wrap">';
   buckets.forEach(function(b, k) {
@@ -3899,8 +3816,8 @@ function renderDailyChart(d) {
     bars += '<div class="tok-chart-label">' + (k % labelEvery === 0 ? bucketLabel(b.t, bk.groupMs) : '') + '</div></div>';
   });
   bars += '</div>';
-  var title = bk.groupMs < 86400000 ? 'Hourly Usage' : bk.groupMs === 86400000 ? 'Daily Usage' : 'Weekly Usage';
-  el.innerHTML = '<div class="usage-title">' + title + ' &middot; tokens by model, incl. cache</div>' + legend + bars;
+  var per = bk.groupMs < 86400000 ? 'per hour' : bk.groupMs === 86400000 ? 'per day' : 'per week';
+  el.innerHTML = '<div class="usage-title">Models &middot; tokens ' + per + '</div>' + bars;
 }
 
 // Cumulative API-price value of the usage vs the cumulative (prorated) plan price.
@@ -3910,10 +3827,10 @@ function renderCostSavingsChart(d) {
   var buckets = bk.buckets;
   var n = buckets.length;
   var showPlan = d.planComparable && d.planDaily > 0;
-  var planPerBucket = showPlan ? d.planDaily * bk.groupMs / 86400000 : 0;
-  var cumPlan = [], cumApi = [], runPlan = 0, runApi = 0;
+  var cumPlan = [], cumApi = [], runPlan = 0, runApi = 0, now = Date.now();
   buckets.forEach(function(b) {
-    runPlan += planPerBucket;
+    // Plan price only for the part of the bucket inside the period, so the total matches the table
+    if (showPlan) runPlan += Math.max(0, Math.min(b.t + bk.groupMs, now) - Math.max(b.t, d.since)) * d.planDaily / 86400000;
     runApi += b.cost;
     cumPlan.push(runPlan);
     cumApi.push(runApi);
@@ -3951,12 +3868,9 @@ function renderCostSavingsChart(d) {
     (showPlan ? '<div class="savings-chart-legend-item"><span class="savings-chart-legend-line dashed"></span>Plan price (prorated)</div>' : '') +
     '<div class="savings-chart-legend-item"><span class="savings-chart-legend-line solid"></span>Same usage at API prices</div></div>';
   var multiple = showPlan && cumPlan[n - 1] > 0 ? (cumApi[n - 1] / cumPlan[n - 1]) : null;
-  var total = showPlan
-    ? '<div class="savings-chart-total">Plans ' + formatCost(cumPlan[n - 1]) + ' vs API price ' + formatCost(cumApi[n - 1]) +
-      ' &middot; <span class="' + (multiple >= 1 ? 'saved' : 'over') + '">' + multiple.toFixed(1) + '&times; value</span></div>'
-    : '<div class="savings-chart-total">API price ' + formatCost(cumApi[n - 1]) + (d.planComparable ? '' : ' &middot; plan line hidden: a plan covers all of an account\\'s usage, not one repo, branch or model') + '</div>';
-  el.innerHTML = '<div class="usage-title">' + (showPlan ? 'Plan vs API price' : 'API price') + ' &middot; last ' + d.days + ' day' + (d.days === 1 ? '' : 's') + '</div>' + legend +
-    '<div class="savings-chart-container">' + svg + '</div>' + total;
+  var head = multiple != null ? ' <span class="usage-title-val ' + (multiple >= 1 ? 'saved' : 'over') + '">' + multiple.toFixed(1) + '&times; value</span>' : '';
+  el.innerHTML = '<div class="usage-title">' + (showPlan ? 'Plan value' : 'API price') + ' &middot; last ' + d.days + ' day' + (d.days === 1 ? '' : 's') + head + '</div>' + legend +
+    '<div class="savings-chart-container">' + svg + '</div>' + (showPlan ? '' : '<div class="savings-chart-total">API price ' + formatCost(cumApi[n - 1]) + '</div>');
 }
 
 function renderPlanValue(d) {
@@ -3965,66 +3879,30 @@ function renderPlanValue(d) {
     el.innerHTML = '<div class="notice">A plan covers all of an account\\'s usage, so it can\\'t be compared to one repo, branch or model. Clear those filters (an account filter is fine) to see plan value.</div>';
     return;
   }
+  // The server only sends accounts used in this period, so old accounts drop out by themselves
   var plans = (d.plans || []).slice().sort(function(a, b) { return b.apiCost - a.apiCost; });
-  if (!plans.length) { el.innerHTML = '<div class="section-note">No accounts.</div>'; return; }
+  var span = d.days === 1 ? 'the last day' : 'the last ' + d.days + ' days';
+  if (!plans.length) { el.innerHTML = '<div class="section-note">No account was used in ' + span + '.</div>'; return; }
   var sumPlan = 0, sumApi = 0;
+  var value = function(m) { return m == null ? '&ndash;' : '<span class="' + (m >= 1 ? 'val-good' : 'val-bad') + '">' + m.toFixed(1) + '&times;</span>'; };
   var rows = plans.map(function(p) {
     var mult = p.planCost ? p.apiCost / p.planCost : null;
     if (p.planCost) { sumPlan += p.planCost; sumApi += p.apiCost; }
     return '<tr><td class="name" title="' + escHtml(p.label) + '">' + escHtml(p.label) + '</td>' +
-      '<td>' + escHtml(p.monthly ? p.tier + ' ($' + p.monthly + '/mo)' : p.tier + ' (not supported)') + '</td>' +
+      '<td title="' + escHtml(p.monthly ? '$' + p.monthly + ' a month' : 'Plan value is only worked out for Max plans') + '">' + escHtml(p.tier) + '</td>' +
       '<td class="num">' + (p.planCost ? formatCost(p.planCost) : '&ndash;') + '</td>' +
       '<td class="num">' + formatCost(p.apiCost) + '</td>' +
-      '<td class="num">' + (mult == null ? '&ndash;' : '<span class="' + (mult >= 1 ? 'val-good' : 'val-bad') + '">' + mult.toFixed(1) + '&times;</span>') + '</td></tr>';
+      '<td class="num">' + value(mult) + '</td></tr>';
   }).join('');
-  var totalMult = sumPlan ? sumApi / sumPlan : null;
-  rows += '<tr><td class="name"><b>Total (Max plans)</b></td><td></td><td class="num"><b>' + formatCost(sumPlan) + '</b></td><td class="num"><b>' + formatCost(sumApi) + '</b></td>' +
-    '<td class="num">' + (totalMult == null ? '&ndash;' : '<span class="' + (totalMult >= 1 ? 'val-good' : 'val-bad') + '">' + totalMult.toFixed(1) + '&times;</span>') + '</td></tr>';
-  el.innerHTML = '<table class="plan-table"><thead><tr><th>Account</th><th>Plan</th><th class="num" title="Subscription price prorated to ' + d.days + ' days">Plan, ' + d.days + 'd</th><th class="num" title="The same tokens at pay-as-you-go API prices">API price</th><th class="num" title="API price divided by plan price">Value</th></tr></thead><tbody>' + rows + '</tbody></table>';
-}
-
-// Tiny 30-day trend line of cache hit % (gaps on days without traffic).
-function cacheSparkline(trend) {
-  var W = 90, H = 18, n = trend.length;
-  if (!n) return '';
-  var segs = [], cur = '';
-  trend.forEach(function(v, i) {
-    if (v == null) { if (cur) segs.push(cur); cur = ''; return; }
-    var x = (n > 1 ? i / (n - 1) : 0.5) * (W - 2) + 1;
-    var y = H - 1 - v * (H - 2);
-    cur += (cur ? ' L' : 'M') + x.toFixed(1) + ',' + y.toFixed(1);
-  });
-  if (cur) segs.push(cur);
-  var paths = segs.map(function(p) {
-    return p.indexOf('L') === -1 ? '<circle cx="' + p.slice(1).split(',')[0] + '" cy="' + p.split(',')[1] + '" r="1.5" fill="var(--primary)"/>'
-      : '<path d="' + p + '" fill="none" stroke="var(--primary)" stroke-width="1.25"/>';
-  }).join('');
-  return '<svg width="' + W + '" height="' + H + '" viewBox="0 0 ' + W + ' ' + H + '" style="flex-shrink:0">' +
-    '<line x1="0" y1="1" x2="' + W + '" y2="1" stroke="var(--border)" stroke-width="0.5"/>' + paths + '</svg>';
-}
-
-function renderCacheEfficiency(c) {
-  var el = document.getElementById('tok-cache');
-  if (!c || !c.overall || !c.overall.prompt) { el.innerHTML = '<div class="notice">No traffic in the last 30 days.</div>'; return; }
-  function row(name, g, bold) {
-    return '<div class="eff-row">' +
-      '<div class="eff-name" title="' + escHtml(name) + '">' + (bold ? '<b>' + escHtml(name) + '</b>' : escHtml(name)) + '</div>' +
-      cacheSparkline(g.trend) +
-      '<div class="eff-detail">' + formatNum(g.prompt) + ' prompt tokens &middot; ' + formatPct(g.rebuild) + ' rebuilt</div>' +
-      '<div class="eff-hit" title="Cache hit rate">' + formatPct(g.hit) + ' hit</div>' +
-    '</div>';
+  if (plans.length > 1) {
+    rows += '<tr class="total"><td class="name">Total</td><td></td><td class="num">' + formatCost(sumPlan) + '</td><td class="num">' + formatCost(sumApi) + '</td>' +
+      '<td class="num">' + value(sumPlan ? sumApi / sumPlan : null) + '</td></tr>';
   }
-  function rows(map, labelFn) {
-    return Object.keys(map).sort(function(a, b) { return map[b].prompt - map[a].prompt; }).map(function(k) {
-      return row(labelFn ? labelFn(k) : k, map[k]);
-    }).join('');
-  }
-  el.innerHTML = row('All traffic', c.overall, true) +
-    '<div class="eff-group">Per account</div>' + rows(c.byAccount) +
-    '<div class="eff-group">Per model</div>' + rows(c.byModel, shortModel);
+  el.innerHTML = '<div class="section-note">Only accounts used in ' + span + '.</div>' +
+    '<table class="plan-table"><thead><tr><th>Account</th><th>Plan</th><th class="num" title="Plan price for ' + span + '">Plan price</th><th class="num" title="The same tokens at pay-as-you-go API prices">API price</th><th class="num" title="API price divided by plan price">Value</th></tr></thead><tbody>' + rows + '</tbody></table>';
 }
 
-function breakdownRows(map, colorFn, labelFn) {
+function breakdownRows(map, colorFn, labelFn, noBar) {
   var keys = Object.keys(map).sort(function(a, b) { return map[b].cost - map[a].cost; });
   var grand = keys.reduce(function(s, k) { return s + map[k].cost; }, 0) || 1;
   var bar = '<div class="tok-proportion">' + keys.map(function(k, i) {
@@ -4036,17 +3914,18 @@ function breakdownRows(map, colorFn, labelFn) {
     return '<div class="tok-model-row">' +
       '<div class="tok-model-dot" style="background:' + colorFn(k, i) + '"></div>' +
       '<div class="tok-model-name" title="' + escHtml(k) + '">' + escHtml(labelFn ? labelFn(k) : k) + '</div>' +
-      '<div class="tok-model-detail">' + formatNum(m.requests) + ' calls &middot; ' + formatNum(prompt) + ' in (' + formatPct(prompt ? m.cacheRead / prompt : null) + ' cached) / ' + formatNum(m.output) + ' out</div>' +
+      '<div class="tok-model-detail" title="' + formatNum(prompt) + ' prompt tokens (' + formatPct(prompt ? m.cacheRead / prompt : null) + ' from cache) · ' + formatNum(m.output) + ' output">' +
+        formatNum(m.requests) + ' req &middot; ' + formatNum(prompt + (m.output || 0)) + ' tokens</div>' +
       '<div class="tok-model-cost">' + formatCost(m.cost) + '</div>' +
-      '<div class="tok-model-pct">' + Math.round(m.cost / grand * 100) + '%</div>' +
+      '<div class="tok-model-pct" title="Share of the API price">' + Math.round(m.cost / grand * 100) + '%</div>' +
     '</div>';
   }).join('');
-  return bar + rows + '<div class="section-note" style="margin:0.5rem 0 0">% = share of the API price.</div>';
+  return (noBar ? '' : bar) + rows;
 }
 
 function renderModelBreakdown(d) {
   var models = Object.keys(d.byModel).sort();
-  document.getElementById('tok-models').innerHTML = breakdownRows(d.byModel, function(k) { return getModelColor(k, models); }, shortModel);
+  document.getElementById('tok-models').innerHTML = breakdownRows(d.byModel, function(k) { return getModelColor(k, models); }, shortModel, true);
 }
 
 function renderAccountBreakdown(d) {
@@ -4139,47 +4018,34 @@ function money(n) {
   return (n < 0 ? '-' : '') + (a >= 100 ? '$' + Math.round(a).toLocaleString() : '$' + a.toFixed(2));
 }
 
-function smartCacheHeadline(c) {
-  if (!c || c.pct == null || !(c.saved > 0.005)) return '';
-  return ' · smart cache saved ' + Math.round(c.pct * 100) + '% (≈ ' + money(c.saved) + ' this week)';
-}
-
-async function refreshSmartCache() {
-  if (Date.now() - _scFetchedAt < 15000) return;
+async function refreshSmartCache(force) {
+  if (!force && Date.now() - _scFetchedAt < 15000) return;
   _scFetchedAt = Date.now();
-  try { renderSmartCache(await (await fetch('/api/cache-care')).json()); } catch (e) { /* next refresh */ }
+  try { renderSmartCache(await (await fetch('/api/cache-care?days=' + tokTimeRange())).json()); } catch (e) { /* next refresh */ }
 }
 
+// Three numbers for the Usage tab's period: what cache care saved, how often a kept cache was used,
+// what was still rebuilt. The split behind each number is in its tooltip.
 function renderSmartCache(d) {
   var el = document.getElementById('tok-smartcache');
-  if (!el || !d || !d.week) return;
-  var w = d.week, m = d.month;
-  var head = w.pct == null && w.pings > 0
-    ? '<div class="sc-big none">0%</div><div class="sc-sub">' + w.pings + ' keep-warm pings so far (' + money(w.pingCost) + '); no session has come back to a kept cache yet.</div>'
-    : w.pct == null
-    ? '<div class="sc-big none">–</div><div class="sc-sub">No cache savings or rebuilds recorded yet this week.</div>'
-    : w.saved < 0
-      ? '<div class="sc-big none">0%</div><div class="sc-sub">Keep-warm cost <b>≈ ' + money(-w.saved) + '</b> more than it saved this week (pings for sessions that did not come back in time).</div>'
-      : '<div class="sc-big">' + Math.round(w.pct * 100) + '%</div><div class="sc-sub">of prompt-cache rebuild cost avoided this week · <b>≈ ' + money(w.saved) + '</b> saved' +
-        (m.pct != null ? '<br>30 days: ' + Math.round(m.pct * 100) + '% · ≈ ' + money(m.saved) : '') + '</div>';
+  if (!el || !d || !d.period) return;
+  var w = d.period;
+  var title = '<div class="usage-title" title="Prompt-cache rebuilds vdm avoided, at API prices. On a subscription the same share of usage limits is saved.">Smart cache</div>';
+  var off = d.keepWarm ? '' : '<div class="sc-off">Keep-warm is off: idle sessions lose their cache after an hour. <button class="link-btn" onclick="switchTab(&quot;config&quot;)">Turn it on in Config</button></div>';
+  if (w.pct == null && !w.pings) { el.innerHTML = title + off + '<div class="section-note" style="margin:0">Nothing recorded in this period yet.</div>'; return; }
   var causes = Object.keys(w.rebuilds || {}).map(function(k) { return [k, w.rebuilds[k]]; }).sort(function(a, b) { return b[1].cost - a[1].cost; });
-  var lost = causes.length ? causes.slice(0, 6).map(function(c) {
-    return '<div class="sc-cause"><span class="sc-cause-name">' + escHtml(SC_CAUSE[c[0]] || c[0]) + '</span>' +
-      '<span class="sc-num">' + c[1].count + '× · ' + money(c[1].cost) + '</span></div>';
-  }).join('') : '<div class="sc-sub">None this week.</div>';
-  var L = d.learned || {};
-  var learned = 'Keeps idle sessions warm up to ' + (L.hours ? L.hours.opus : '?') + ' h (Opus) · ' + (L.hours ? L.hours.fable : '?') + ' h (Fable) · ' +
-    (L.source === 'yours' ? 'learned from your ' + (L.periods || 0).toLocaleString() + ' idle periods' : 'starting estimate until 50 of your idle periods are seen (' + (L.periods || 0) + ' so far)');
-  el.innerHTML = '<div class="usage-title">Smart cache</div>' +
-    '<div class="section-note">Prompt-cache rebuilds vdm avoided, at API prices. On a subscription the same share of usage limits is saved.</div>' +
-    (d.keepWarm ? '' : '<div class="sc-off">Keep-warm is off: idle sessions lose their cache after an hour. <button class="link-btn" onclick="switchTab(&quot;config&quot;)">Turn it on in Config</button></div>') +
-    '<div class="sc-head">' + head + '</div>' +
-    '<div class="sc-grid">' +
-      '<div class="sc-cell"><div class="sc-cell-title">Keep-warm</div>' + w.pings + ' pings · ' + money(w.pingCost) + '<br>' + w.warmResumes + ' returns to a warm cache · <b class="sc-num">' + money(w.keepWarmSaved) + '</b> saved</div>' +
-      '<div class="sc-cell"><div class="sc-cell-title">Session affinity</div>' + w.affinityMoves + ' account moves avoided · <b class="sc-num">' + money(w.affinitySaved) + '</b> saved</div>' +
-      '<div class="sc-cell"><div class="sc-cell-title">Still rebuilt · ' + money(w.rebuildCost) + '</div>' + lost + '</div>' +
-    '</div>' +
-    '<div class="sc-learned">' + escHtml(learned) + (d.stats ? ' · ' + d.stats.kept + ' sessions held, ' + d.stats.memoryMB + ' MB · ' + d.stats.pingsLastHour + ' pings in the last hour' : '') + '</div>';
+  var tile = function(v, label, sub, tip, cls) {
+    return '<div class="stat-item" title="' + escHtml(tip) + '"><div class="stat-val' + (cls ? ' ' + cls : '') + '">' + v + '</div><div class="stat-label">' + label + '</div>' +
+      (sub ? '<div class="tok-stat-sub">' + escHtml(sub) + '</div>' : '') + '</div>';
+  };
+  var savedTip = 'Keep-warm: ' + w.warmResumes + ' returns to a warm cache saved ' + money(w.keepWarmSaved) + '; its ' + w.pings + ' pings cost ' + money(w.pingCost) + '.' +
+    (w.affinityMoves ? ' Session affinity: ' + w.affinityMoves + ' account moves avoided saved ' + money(w.affinitySaved) + '.' : '');
+  var lostTip = causes.length ? 'Rebuilds that still happened, by cause:\\n' + causes.map(function(c) { return (SC_CAUSE[c[0]] || c[0]) + ': ' + c[1].count + '× · ' + money(c[1].cost); }).join('\\n') : 'No rebuilds.';
+  el.innerHTML = title + off + '<div class="stat-grid sc-tiles">' +
+    tile(money(w.saved), 'saved', w.pct != null ? Math.round(w.pct * 100) + '% of rebuild cost' : '', savedTip, w.saved > 0.005 ? 'good' : w.saved < -0.005 ? 'bad' : '') +
+    tile(String(w.warmResumes), 'kept caches used', w.pings + ' pings · ' + money(w.pingCost), 'A kept cache is used when a session comes back to it. Pings keep it warm.') +
+    tile(money(w.rebuildCost), 'still rebuilt', causes.length ? 'mostly: ' + (SC_CAUSE[causes[0][0]] || causes[0][0]) : '', lostTip) +
+  '</div>';
 }
 
 async function loadKeepWarmLearned() {
@@ -4193,26 +4059,31 @@ async function loadKeepWarmLearned() {
 
 function minsUntil(t) { var m = Math.max(0, Math.round((t - Date.now()) / 60000)); return m >= 60 ? Math.floor(m / 60) + 'h ' + (m % 60) + 'm' : m + 'm'; }
 
-function sessionCacheLine(s) {
-  var c = s.cache;
+// A session's cache in one short phrase ("cache warm", "kept warm", "warm 23m", "cache cold"); details in tooltips.
+function sessionCacheState(c) {
   if (!c || !c.state) return '';
+  var warmFor = function(why) {
+    return '<span title="' + escHtml('The cache expires in this time' + (why ? ': ' + why : '')) + '">warm <span data-until="' + c.expiresAt + '">' + minsUntil(c.expiresAt) + '</span></span>';
+  };
   var state;
   if (c.state === 'active') state = '<span class="ok">cache warm</span>';
-  else if (c.state === 'kept' && c.small) state = 'cache warm for ' + minsUntil(c.expiresAt) + ' · small, not kept warm';
-  else if (c.state === 'kept') state = '<span class="ok">kept warm</span> · next ping in ' + minsUntil(c.nextPingAt) + (c.limit ? ' · ' + c.pingsThisIdle + ' of ' + c.limit : '');
-  else if (c.state === 'warm') state = 'cache warm for ' + minsUntil(c.expiresAt) + (c.small ? ' · small, not kept warm' : '');
-  else if (c.state === 'stopped') state = 'cache warm for ' + minsUntil(c.expiresAt) + ' · keep-warm stopped: ' + escHtml(SC_STOP[c.stopped] || c.stopped || '');
+  else if (c.state === 'kept' && !c.small) state = '<span class="ok" title="' + escHtml('vdm pings it before it expires. Next ping in ' + minsUntil(c.nextPingAt) + (c.limit ? ' (' + c.pingsThisIdle + ' of ' + c.limit + ')' : '')) + '">kept warm</span>';
+  else if (c.state === 'kept' || c.state === 'warm') state = warmFor(c.small ? 'too small to keep warm' : '');
+  else if (c.state === 'stopped') state = warmFor('keep-warm stopped, ' + (SC_STOP[c.stopped] || c.stopped || ''));
   else state = 'cache cold';
-  var extra = [];
-  if (c.saved > 0.005) extra.push('saved ≈ ' + money(c.saved));
   var rb = Object.keys(c.rebuilds || {});
   if (rb.length) {
     var n = rb.reduce(function(a, k) { return a + c.rebuilds[k]; }, 0);
-    extra.push('rebuilt ' + n + '×' + (c.lastRebuild ? ' (last: ' + escHtml(SC_CAUSE[c.lastRebuild.cause] || c.lastRebuild.cause) + ')' : ''));
+    var last = c.lastRebuild ? 'Last cause: ' + (SC_CAUSE[c.lastRebuild.cause] || c.lastRebuild.cause) : '';
+    state += ' &middot; <span title="' + escHtml('Times the whole prompt cache was written again. ' + last) + '">rebuilt ' + n + '&times;</span>';
   }
-  var modeSel = '<select class="config-select" data-id="' + escHtml(s.id) + '" onchange="setCacheMode(this.dataset.id, this.value)" aria-label="Keep this session warm" title="Auto: learned limit. Keep warm: until the break-even. Never: no pings.">' +
-    ['auto', 'pin', 'never'].map(function(v) { return '<option value="' + v + '"' + (c.mode === v ? ' selected' : '') + '>' + ({ auto: 'Auto', pin: 'Keep warm', never: 'Never' })[v] + '</option>'; }).join('') + '</select>';
-  return '<div class="sess-cache"><span>' + state + (extra.length ? ' · ' + extra.join(' · ') : '') + '</span>' + modeSel + '</div>';
+  return '<span class="sess-cache">' + state + '</span>';
+}
+
+function sessionCacheMode(s) {
+  var mode = (s.cache && s.cache.mode) || 'auto';
+  return '<select class="config-select sess-mode" data-id="' + escHtml(s.id) + '" onchange="setCacheMode(this.dataset.id, this.value)" aria-label="Keep this session warm" title="Keep-warm for this session. Auto: learned limit. Keep warm: until the break-even. Never: no pings.">' +
+    ['auto', 'pin', 'never'].map(function(v) { return '<option value="' + v + '"' + (mode === v ? ' selected' : '') + '>' + ({ auto: 'Auto', pin: 'Keep warm', never: 'Never' })[v] + '</option>'; }).join('') + '</select>';
 }
 
 async function setCacheMode(sid, mode) {
@@ -4231,10 +4102,8 @@ function histParams() {
   var q = document.getElementById('hist-q').value.trim();
   if (q) p.set('q', q);
   var project = document.getElementById('hist-project').value;
-  var account = document.getElementById('hist-account').value;
   var days = document.getElementById('hist-days').value;
   if (project) p.set('project', project);
-  if (account) p.set('account', account);
   if (days && days !== '0') p.set('days', days);
   if (document.getElementById('hist-auto').checked) p.set('automated', '1');
   p.set('offset', String(HIST.offset));
@@ -4317,16 +4186,14 @@ function baseName(p) { var a = String(p || '').split('/'); return a[a.length - 1
 function histRow(s) {
   var where = [s.project, s.branch].filter(Boolean).join(' · ');
   var badges = (s.live ? '<span class="pill pill-running" title="This Claude Code session is still open">running</span>' : '') +
-    (!s.original ? '<span class="pill pill-saved" title="Claude Code deleted its copy. vdm kept this one.">saved copy</span>' : '') +
-    (s.compactions ? '<span class="pill pill-soft" title="Compacted ' + s.compactions + ' times">compacted ×' + s.compactions + '</span>' : '');
+    (!s.original ? '<span class="pill pill-saved" title="Claude Code deleted its copy. vdm kept this one.">saved copy</span>' : '');
   var text = s.snippet ? histSnippet(s.snippet) : (s.firstPrompt ? '“' + escHtml(s.firstPrompt) + '”' : '<span style="color:var(--muted)">No messages</span>');
   var last = !s.snippet && s.lastPrompt && s.lastPrompt !== s.firstPrompt ? '<div class="hist-last">Last: “' + escHtml(s.lastPrompt) + '”</div>' : '';
-  var chips = s.accounts.slice(0, 3).map(function(a) { return '<span class="hist-chip acct" title="' + a.requests + ' requests via the proxy">' + escHtml(a.label) + '</span>'; }).join('') +
-    s.topFiles.map(function(f) { return '<span class="hist-chip" title="' + escHtml(f) + '">' + escHtml(baseName(f)) + '</span>'; }).join('');
+  var chips = s.topFiles.map(function(f) { return '<span class="hist-chip" title="' + escHtml(f) + '">' + escHtml(baseName(f)) + '</span>'; }).join('');
   return '<div class="hist-row' + (HIST.open === s.id ? ' sel' : '') + '" tabindex="0" data-id="' + s.id + '" data-seq="' + (s.hitSeq == null ? '' : s.hitSeq) + '" onclick="histOpen(this.dataset.id, this.dataset.seq)" onkeydown="if (event.key === &quot;Enter&quot;) histOpen(this.dataset.id, this.dataset.seq)">' +
     '<div class="hist-top"><span class="hist-title" title="' + escHtml(s.title) + '">' + escHtml(s.title) + '</span>' + badges +
-      '<span class="hist-cost" title="What this session would cost at API prices (incl. subagents)">' + formatCost(s.cost) + '</span></div>' +
-    '<div class="hist-sub">' + escHtml(where || s.cwd) + (where ? ' · ' : ' · ') + agoSpan(s.lastAt) + ' · ' + s.userTurns + (s.userTurns === 1 ? ' message' : ' messages') + (s.agents ? ' · ' + s.agents + ' subagents' : '') + '</div>' +
+      '<span class="sess-meta">' + agoSpan(s.lastAt) + '</span></div>' +
+    '<div class="hist-sub">' + escHtml(where || s.cwd) + ' · ' + s.userTurns + (s.userTurns === 1 ? ' message' : ' messages') + '</div>' +
     '<div class="hist-text">' + text + '</div>' + last +
     (chips ? '<div class="hist-chips">' + chips + '</div>' : '') +
   '</div>';
@@ -4344,7 +4211,6 @@ function renderHistory() {
 
   var f = d.facets || { projects: [], accounts: [] };
   histFill('hist-project', f.projects.map(function(p) { return { value: p, label: p }; }), 'All projects');
-  histFill('hist-account', f.accounts.map(function(a) { return { value: a.name, label: a.label }; }), 'All accounts');
 
   var st = [];
   if (d.module === false) st.push('<span class="warn">history.mjs is missing: run <code>vdm upgrade</code></span>');
@@ -4355,8 +4221,8 @@ function renderHistory() {
     st.push('Saving your sessions… <span class="hist-progress"><div style="width:' + pct + '%"></div></span> ' + d.backfill.done + ' / ' + d.backfill.total);
   } else if (d.state === 'starting' || d.state === 'restarting') st.push('Starting…');
   var storage = d.storage || { own: 0, shared: 0 };
-  st.push('<b>' + (d.count || 0) + '</b> sessions saved · ' + fmtBytes(storage.own) + ' on disk' +
-    (storage.shared ? ' <span title="Hard links to files Claude Code still has: no extra space until Claude Code deletes them">(+' + fmtBytes(storage.shared) + ' shared with Claude Code)</span>' : ''));
+  st.push('<span title="' + escHtml(fmtBytes(storage.own) + ' on disk' + (storage.shared ? ', plus ' + fmtBytes(storage.shared) + ' shared with Claude Code (hard links: no extra space until Claude Code deletes them)' : '')) + '"><b>' +
+    (d.count || 0) + '</b> sessions saved · ' + fmtBytes(storage.own) + '</span>');
   if (d.search) st.push(d.total + ' found' + (d.search.partial ? ' (search stopped early: add words to narrow it)' : ''));
   if (d.automatedHidden) st.push(d.automatedHidden + ' automated hidden');
   if (d.error) st.push('<span class="warn">' + escHtml(d.error) + '</span>');
@@ -4481,7 +4347,6 @@ function renderHistDetail(d) {
       '<div class="hd-btns"><button class="hbtn" onclick="histResume()">' + (d.needsRestore ? 'Restore session file' : 'Copy resume command') + '</button></div>' +
       '<code class="hd-cmd" title="' + escHtml(d.commands.resume) + '">' + escHtml(d.commands.resume) + '</code>';
   }
-  var accounts = d.accounts.map(function(a) { return escHtml(a.label) + ' <span style="color:var(--muted)">(' + a.requests + ' req)</span>'; }).join(', ');
   var files = d.files.slice(0, 12).map(function(f) { return '<div title="' + escHtml(f[0]) + '">' + escHtml(f[0].replace(d.cwd + '/', '')) + (f[1] > 1 ? ' <span style="color:var(--muted)">×' + f[1] + '</span>' : '') + '</div>'; }).join('') +
     (d.files.length > 12 ? '<div style="color:var(--muted)">+' + (d.files.length - 12) + ' more</div>' : '');
   var links = (d.allLinks || []).map(function(l) { return '<a href="' + escHtml(l) + '" target="_blank" rel="noopener">' + escHtml(l.replace('https://', '')) + '</a>'; }).join('<br>');
@@ -4506,7 +4371,6 @@ function renderHistDetail(d) {
       histFact('Size', d.userTurns + ' of your messages · ' + (st.claudeMsgs || 0) + ' replies · ' + (st.toolCalls || 0) + ' tool calls' + (d.compactions ? ' · compacted ×' + d.compactions : '')) +
       histFact('Cost', formatCost(d.cost) + ' <span style="color:var(--muted)">at API prices (from the transcript' + (d.agents ? ', incl. ' + d.agents + ' subagents' : '') + ')</span>') +
       histFact('Models', models) +
-      histFact('Accounts', accounts) +
       histFact('Files changed', files ? '<div class="hd-files">' + files + '</div>' : '') +
       histFact('Links', links) +
     '</dl>' +
@@ -4682,7 +4546,7 @@ setInterval(refresh, 5000);
 setInterval(tickCountdowns, 1000);
 // Restore tab from URL query param
 const _initTab = new URLSearchParams(location.search).get('tab');
-if (_initTab && document.getElementById('tab-' + _initTab)) switchTab(_initTab);
+if (_initTab && (_initTab === 'logs' || document.getElementById('tab-' + _initTab))) switchTab(_initTab);
 
 // ── Log stream ──
 let _logES = null;
@@ -4783,27 +4647,22 @@ function cachePct(hit) {
   return hit == null ? '&ndash; cache' : Math.round(hit * 100) + '% cache';
 }
 
-// Sessions block on an account card: who ran through this account in the last 24h.
-function renderAccountSessions(p) {
-  var list = p.sessions || [];
-  if (!list.length) return '';
-  var warm = list.filter(function(s) { return s.pinnedHere; }).length;
-  var rows = list.slice(0, 5).map(function(s) {
-    var title = affTitle(s.affinity, s.warmMoves1h, s.cacheHit, s.share) + (s.title ? ' · ' + s.title : '');
-    return '<div class="sess-row" title="' + escHtml(title) + '">' +
-      '<span class="sess-here' + (s.pinnedHere ? '' : ' away') + '" title="' + (s.pinnedHere ? 'Warm here: this session is pinned to this account right now' : 'Not pinned here now') + '"></span>' +
-      affBars(s.affinity, title) +
-      '<span class="sess-name">' + escHtml(s.label) + '</span>' +
-      '<span class="sess-meta">' + s.requests + ' req &middot; ' + cachePct(s.cacheHit) + ' &middot; ' + agoSpan(s.lastAt) + '</span></div>';
-  }).join('');
+// An account card's sessions as one link to the Sessions tab.
+function accountSessionsLink(p) {
+  var c = p.sessions || { total: 0, warm: [] };
+  if (!c.total) return '';
   var eName = p.name.replace(/'/g, "\\\\'");
-  var more = list.length > 5 ? '<button class="link-btn" onclick="openSessionsFor(\\'' + eName + '\\')">Show all ' + list.length + '</button>' : '';
-  return '<div class="acct-sessions"><div class="acct-sessions-head"><span>Sessions</span>' +
-    '<span title="Green dot = pinned here now with a warm cache">' + warm + ' warm here &middot; ' + list.length + ' in 24h</span></div>' + rows + more + '</div>';
+  return '<button class="link-btn sess-link" onclick="openSessionsFor(\\'' + eName + '\\')" title="Show these sessions in the Sessions tab">' +
+    'Sessions: ' + c.warm.length + ' warm &middot; ' + c.total + ' in 24h &rarr;</button>';
 }
 
 var _sessions = null;
 var _sessionsHash = '';
+var _sessMoreOpen = {};   // session id -> its folded account rows are open (kept across re-renders)
+
+function sessMoreToggle(el) {
+  if (el.open) _sessMoreOpen[el.dataset.id] = 1; else delete _sessMoreOpen[el.dataset.id];
+}
 var _sessionsError = '';
 
 async function refreshSessions() {
@@ -4832,12 +4691,6 @@ function openSessionsFor(name) {
   renderSessions();
 }
 
-function moveLine(m) {
-  return '<div class="sess-move' + (m.warm ? ' warm' : '') + '">' + agoSpan(m.ts) + ' &middot; ' + escHtml(m.fromLabel) + ' &rarr; ' + escHtml(m.toLabel) +
-    ' &middot; ' + escHtml(MOVE_REASON[m.reason] || m.reason) + (m.agent !== 'main' ? ' (subagent)' : '') +
-    (m.warm ? ' &middot; cache rebuilt' : ' &middot; cache was already cold') + '</div>';
-}
-
 function sessionCard(s) {
   var a = s.affinity;
   var title = affTitle(a.level, a.warmMoves1h, a.cacheHit, a.share);
@@ -4845,30 +4698,37 @@ function sessionCard(s) {
   var branch = s.meta.branch && s.label.indexOf(s.meta.branch + ':') !== 0 ? s.meta.branch : '';
   var where = [s.meta.repoName, branch].filter(Boolean).join(' · ');
   var sub = s.meta.autoTitle ? s.meta.autoTitle + (where ? ' · ' + where : '') : where;
-  var warmLanes = s.lanes.filter(function(l) { return l.warm; });
-  var subagents = warmLanes.filter(function(l) { return l.agent !== 'main'; }).length;
-  var on = 'On <b>' + escHtml(s.homeLabel || '?') + '</b>' + (subagents ? ' &middot; ' + subagents + ' subagent' + (subagents === 1 ? '' : 's') + ' warm' : '');
-  var total = s.accounts.reduce(function(n, x) { return n + x.requests; }, 0) || 1;
-  var accts = s.accounts.map(function(x) {
-    var prompt = x.input + x.cacheRead + x.cacheWrite;
-    return '<div class="sess-acct-row"><span class="sess-acct-name" title="' + escHtml(x.label) + '">' + escHtml(x.label) + '</span>' +
-      '<span class="sess-acct-bar" title="' + Math.round(x.requests / total * 100) + '% of this session\\'s requests"><div style="width:' + (x.requests / total * 100).toFixed(1) + '%"></div></span>' +
-      '<span class="sess-meta">' + x.requests + ' req &middot; ' + cachePct(prompt ? x.cacheRead / prompt : null) + ' &middot; ' + formatCost(x.cost) + '</span></div>';
-  }).join('');
-  var moves = s.moves.length ? '<div class="sess-moves">' + s.moves.slice(0, 3).map(moveLine).join('') +
-    (s.moves.length > 3 ? '<div>+' + (s.moves.length - 3) + ' earlier moves</div>' : '') + '</div>' : '';
+  var subagents = s.lanes.filter(function(l) { return l.warm && l.agent !== 'main'; }).length;
+  var on = 'On <b>' + escHtml(s.homeLabel || '?') + '</b>' + (s.model ? ' &middot; ' + escHtml(shortModel(s.model)) : '') +
+    (subagents ? ' &middot; ' + subagents + ' subagent' + (subagents === 1 ? '' : 's') : '');
+  // Which accounts served this session: only worth showing once it used more than one.
+  // Top 3, the rest folded away. Fixed grid columns, so every bar has the same length.
+  var accts = '';
+  if (s.accounts.length > 1) {
+    var total = s.accounts.reduce(function(n, x) { return n + x.requests; }, 0) || 1;
+    var row = function(x) {
+      var prompt = x.input + x.cacheRead + x.cacheWrite;
+      return '<span class="sess-acct-name" title="' + escHtml(x.label) + '">' + escHtml(x.label) + '</span>' +
+        '<span class="sess-acct-bar" title="' + Math.round(x.requests / total * 100) + '% of this session\\'s requests"><span style="width:' + (x.requests / total * 100).toFixed(1) + '%"></span></span>' +
+        '<span class="sess-meta">' + x.requests + ' req &middot; ' + cachePct(prompt ? x.cacheRead / prompt : null) + '</span>';
+    };
+    var rest = s.accounts.slice(3);
+    accts = '<div class="sess-accts">' + s.accounts.slice(0, 3).map(row).join('') + '</div>' +
+      (rest.length ? '<details class="sess-more" data-id="' + escHtml(s.id) + '" ontoggle="sessMoreToggle(this)"' + (_sessMoreOpen[s.id] ? ' open' : '') + '>' +
+        '<summary>' + rest.length + ' more account' + (rest.length === 1 ? '' : 's') + '</summary><div class="sess-accts">' + rest.map(row).join('') + '</div></details>' : '');
+  }
   var arts = s.artifacts && s.artifacts.length
     ? ' <button class="chip" onclick="openArtifactSearch(\\'claude.ai/artifact/' + escHtml(s.artifacts[s.artifacts.length - 1]) + '\\')" title="Find who owns the latest artifact linked in this session">' + (s.artifacts.length === 1 ? 'artifact' : 'latest of ' + s.artifacts.length + ' artifacts') + '</button>' : '';
   return '<div class="sess-card">' +
     '<div class="sess-card-top">' +
       '<span class="sess-card-title" title="' + escHtml(s.id) + '">' + escHtml(s.label) + '</span>' +
-      (s.live ? '<span class="pill pill-running" title="This Claude Code session is still open">running</span>' : '') +
+      (s.live ? '' : '<span class="pill pill-soft" title="This Claude Code session is closed. Its cache is still warm.">closed</span>') +
       (HIST.enabled ? '<button class="chip" data-id="' + escHtml(s.id) + '" onclick="openHistoryFor(this.dataset.id)" title="Search, read and continue this session">history</button>' : '') +
       '<span class="sess-meta">' + agoSpan(s.lastAt) + '</span></div>' +
     (sub ? '<div class="sess-sub" title="' + escHtml(sub) + '">' + escHtml(sub) + '</div>' : '') +
-    '<div class="sess-aff-line">' + affBars(a.level, title) + '<span><b>' + (AFF_TEXT[a.level] || a.level) + '</b> &middot; ' + on + ' &middot; ' + cachePct(a.cacheHit) +
-      ' &middot; ' + s.requests + ' req' + (s.model ? ' &middot; ' + escHtml(shortModel(s.model)) : '') + '</span>' + arts + '</div>' +
-    '<div class="sess-accts">' + accts + '</div>' + sessionCacheLine(s) + moves +
+    '<div class="sess-aff-line">' + affBars(a.level, title) + '<span class="sess-on">' + on + '</span>' +
+      sessionCacheState(s.cache) + arts + sessionCacheMode(s) + '</div>' +
+    accts +
   '</div>';
 }
 
@@ -4880,7 +4740,7 @@ function sessionLine(s) {
     affBars(a.level, title) +
     '<span class="sess-name">' + escHtml(s.label) + '</span>' +
     (s.live ? '<span class="pill pill-running">running</span>' : '') +
-    '<span class="sess-meta">last on ' + escHtml(s.homeLabel || '?') + ' &middot; ' + s.requests + ' req' + (s.moves.length ? ' &middot; ' + s.moves.length + ' move' + (s.moves.length === 1 ? '' : 's') : '') + ' &middot; ' + agoSpan(s.lastAt) + '</span></div>';
+    '<span class="sess-meta">on ' + escHtml(s.homeLabel || '?') + ' &middot; ' + agoSpan(s.lastAt) + '</span></div>';
 }
 
 function renderSessions() {
@@ -4891,10 +4751,9 @@ function renderSessions() {
     el.innerHTML = _sessionsError ? '<div class="empty-state err-state">' + escHtml(_sessionsError) + '</div>' : '<div class="empty-state">Loading...</div>';
     return;
   }
-  note.innerHTML = data.affinity
-    ? 'Each Claude Code session, and each of its subagents, stays on one account while its prompt cache is warm. <span style="color:var(--red)">Red</span> moves rebuilt a warm cache on another account.' +
-      (_sessionsError ? ' <span class="err-state">' + escHtml(_sessionsError) + '</span>' : '')
-    : 'Session affinity is <b>off</b> (Config): sessions are tracked, but not kept on one account.';
+  note.innerHTML = (data.affinity ? '' : 'Session affinity is <b>off</b> (Config): sessions are tracked, but not kept on one account. ') +
+    (_sessionsError ? '<span class="err-state">' + escHtml(_sessionsError) + '</span>' : '');
+  note.style.display = note.innerHTML ? '' : 'none';
   var sel = document.getElementById('sess-account');
   var names = {};
   data.sessions.forEach(function(s) { s.accounts.forEach(function(x) { names[x.name] = x.label; }); });
@@ -4908,14 +4767,14 @@ function renderSessions() {
   var list = data.sessions.filter(function(s) { return !acct || s.accounts.some(function(x) { return x.name === acct; }); });
   var activeNow = list.filter(function(s) { return s.lanes.some(function(l) { return l.warm; }); });
   var earlier = list.filter(function(s) { return !s.lanes.some(function(l) { return l.warm; }); });
-  document.getElementById('sess-counts').textContent = activeNow.length + ' active now · ' + earlier.length + ' earlier (last 24h)';
+  document.getElementById('sess-counts').textContent = activeNow.length + ' active · ' + earlier.length + ' earlier (24h)';
   if (!list.length) {
     el.innerHTML = '<div class="empty-state">' + (acct ? 'No sessions used this account in the last 24 hours.' : 'No sessions in the last 24 hours. A session shows up after its first request through the proxy.') + '</div>';
     return;
   }
   var html = '';
-  if (activeNow.length) html += '<div class="sess-section-title">Active now (cache warm)</div>' + activeNow.map(sessionCard).join('');
-  if (earlier.length) html += '<div class="sess-section-title">Earlier (cache expired)</div>' + earlier.map(sessionLine).join('');
+  if (activeNow.length) html += '<div class="sess-section-title">Active now</div>' + activeNow.map(sessionCard).join('');
+  if (earlier.length) html += '<div class="sess-section-title" title="Their caches have expired">Earlier</div>' + earlier.map(sessionLine).join('');
   el.innerHTML = html;
   tickCountdowns();
 }
@@ -4925,7 +4784,7 @@ function updateSessionsBadge(profiles) {
   if (!badge) return;
   var live = {};
   (profiles || []).forEach(function(p) {
-    (p.sessions || []).forEach(function(s) { if (s.pinnedHere) live[s.id] = 1; });
+    ((p.sessions && p.sessions.warm) || []).forEach(function(id) { live[id] = 1; });
   });
   var n = Object.keys(live).length;
   badge.textContent = n;
@@ -6291,34 +6150,19 @@ function isSessionLive(sid) {
   return readSessionRegistry().has(sid);
 }
 
-// Compact per-session view for one account's card.
+// Sessions on one account's card: how many ran through it in the last 24 h, and which are warm there now.
 function accountSessions(name, now = Date.now()) {
   const dayAgo = now - 24 * 60 * 60 * 1000;
-  const out = [];
+  const warm = [];
+  let total = 0;
   for (const s of sessionStore.all()) {
     const here = s.accounts[name];
-    const lanesHere = Object.values(s.lanes).filter(l => l.account === name);
-    const warmHere = lanesHere.some(l => now - l.lastAt < l.ttlMs);
+    const warmHere = Object.values(s.lanes).some(l => l.account === name && now - l.lastAt < l.ttlMs);
     if (!warmHere && (!here || here.lastAt < dayAgo)) continue;
-    const aff = sessionAffinity(s, now);
-    out.push({
-      id: s.id,
-      label: sessionLabel(s.meta, s.id),
-      title: s.meta.autoTitle || s.meta.name || '',
-      repo: s.meta.repo ? basename(s.meta.repo) : '',
-      branch: s.meta.branch || '',
-      live: isSessionLive(s.id),
-      pinnedHere: warmHere,
-      requests: here?.requests || 0,
-      lastAt: here?.lastAt || s.lastAt,
-      affinity: aff.level,
-      cacheHit: aff.cacheHit,
-      warmMoves1h: aff.warmMoves1h,
-      share: aff.share,
-    });
+    total++;
+    if (warmHere) warm.push(s.id);
   }
-  out.sort((a, b) => (b.pinnedHere - a.pinnedHere) || (b.lastAt - a.lastAt));
-  return out;
+  return { total, warm };
 }
 
 // Full session list for the Sessions tab.
@@ -6491,17 +6335,6 @@ function recordProxyUsage({ sid, agent, acct, model, usage, ttlMs }) {
   recordUsage({ ts: Date.now(), account: acct?.id || acct?.label || acct?.name || 'unknown', model, repo, branch, usage });
 }
 
-// Rolling 30-day prompt-cache efficiency (per account / per model, daily trend).
-// Memoized for a minute: /api/profiles asks for it every 5 seconds.
-let _cache30d = { at: 0, data: null };
-function cacheReport30d() {
-  const now = Date.now();
-  if (_cache30d.data && now - _cache30d.at < 60_000) return _cache30d.data;
-  const since = Math.floor((now - 29 * 86400000) / 86400000) * 86400000; // 30 UTC days incl. today
-  _cache30d = { at: now, data: cacheEfficiency(loadUsageRows(since, now), { since, until: now }) };
-  return _cache30d.data;
-}
-
 // Usage tab report: current period vs previous period, plus plan value per account.
 function usageReport(params) {
   const days = Math.min(Math.max(parseInt(params.get('days') || '7', 10) || 7, 1), 400);
@@ -6515,6 +6348,7 @@ function usageReport(params) {
   const prev = summarizeUsage(rows, { since: since - days * 86400000, until: since, filter }).totals;
 
   // Plan value: each Max account's prorated subscription vs the API price of what it used.
+  // Only accounts used in this period: an account that is no longer used drops out by itself.
   const MONTH_DAYS = 30.4375;
   const plans = loadAllAccountTokens().map(a => {
     const o = a.creds?.claudeAiOauth || {};
@@ -6527,12 +6361,12 @@ function usageReport(params) {
       apiCost: used?.cost || 0,
       requests: used?.requests || 0,
     };
-  }).filter(p => !filter.account || p.key === filter.account);
+  }).filter(p => p.requests > 0 && (!filter.account || p.key === filter.account));
   const planDaily = plans.reduce((sum, p) => sum + (p.monthly ? p.monthly / MONTH_DAYS : 0), 0);
   // A plan covers all of an account's usage: comparing it to one repo/branch/model is meaningless
   const planComparable = !filter.repo && !filter.branch && !filter.model;
 
-  return { days, since, bucketMs, filter, ...cur, prevTotals: prev, plans, planDaily, planComparable, cache30d: cacheReport30d() };
+  return { days, since, bucketMs, filter, ...cur, prevTotals: prev, plans, planDaily, planComparable };
 }
 
 // ─────────────────────────────────────────────────
@@ -7295,25 +7129,15 @@ async function keepWarmTick() {
 setInterval(() => { keepWarmTick().catch(e => log('error', `Keep-warm: ${e.message}`)); }, KEEP_WARM_TICK_MS).unref?.();
 setInterval(() => saveCacheCare(), 60_000).unref?.();
 
-/** One line for the header: what cache care saved this week. */
-function cacheCareHeadline() {
-  const w = cacheLedger.summary(Date.now() - 7 * 86400000);
-  return { keepWarm: settings.keepWarm === true, pct: w.pct, saved: w.saved, rebuildCost: w.rebuildCost };
-}
-
-function cacheCareReport() {
-  const now = Date.now();
+/** What cache care saved and what was still rebuilt over the last `days` days (the Usage tab's period). */
+function cacheCareReport(days = 7) {
+  days = Math.min(Math.max(days || 7, 1), 400);
   return {
     keepWarm: settings.keepWarm === true,
     learned: learnedKeepWarm(),
-    week: cacheLedger.summary(now - 7 * 86400000),
-    month: cacheLedger.summary(now - 30 * 86400000),
+    days,
+    period: cacheLedger.summary(Date.now() - days * 86400000),
     probe: cacheCare.probe,
-    stats: {
-      lanes: keepWarmPlanner.all().length,
-      kept: [..._lastBodies.entries()].filter(([k, v]) => k.endsWith('|main') && v.tokens >= KEEP_WARM_MIN_TOKENS).length,
-      memoryMB: Math.round(_bodyBytes / 1e5) / 10, pingsLastHour: cacheCare.recentPings.filter(t => now - t < HOUR_MS).length,
-    },
   };
 }
 

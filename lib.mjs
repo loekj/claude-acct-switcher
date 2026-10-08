@@ -1483,42 +1483,6 @@ export function artifactRefMatches(ref, slug) {
   return (slug.length >= 8 && ref.endsWith(slug)) || (ref.length >= 8 && slug.endsWith(ref));
 }
 
-/**
- * Prompt-cache efficiency over a window, overall and per account / per model, with a
- * daily trend. hit = cache reads / prompt tokens (uncached input + reads + writes);
- * rebuild = cache writes / prompt tokens (cache paid for again, e.g. after a move).
- * Trend values are null on days without traffic.
- */
-export function cacheEfficiency(rows, { since = 0, until = Infinity, bucketMs = 86400000 } = {}) {
-  const start = Math.floor(since / bucketMs) * bucketMs;
-  const slots = Number.isFinite(until) ? Math.max(1, Math.ceil((until - start) / bucketMs)) : 1;
-  const blank = () => ({ prompt: 0, read: 0, write: 0, requests: 0, trend: Array.from({ length: slots }, () => ({ prompt: 0, read: 0 })) });
-  const overall = blank();
-  const byAccount = {}, byModel = {};
-  const add = (g, r, prompt, write, slot) => {
-    g.prompt += prompt; g.read += r.cacheRead || 0; g.write += write; g.requests += r.requests || 0;
-    if (slot >= 0 && slot < slots) { g.trend[slot].prompt += prompt; g.trend[slot].read += r.cacheRead || 0; }
-  };
-  for (const r of rows) {
-    if (r.h < since || r.h >= until) continue;
-    const write = (r.cacheWrite5m || 0) + (r.cacheWrite1h || 0);
-    const prompt = (r.input || 0) + (r.cacheRead || 0) + write;
-    if (!prompt) continue;
-    const slot = Math.floor((r.h - start) / bucketMs);
-    add(overall, r, prompt, write, slot);
-    add(byAccount[r.account] || (byAccount[r.account] = blank()), r, prompt, write, slot);
-    add(byModel[r.model] || (byModel[r.model] = blank()), r, prompt, write, slot);
-  }
-  const finish = (g) => ({
-    prompt: g.prompt, read: g.read, write: g.write, requests: g.requests,
-    hit: g.prompt ? g.read / g.prompt : null,
-    rebuild: g.prompt ? g.write / g.prompt : null,
-    trend: g.trend.map(t => (t.prompt ? t.read / t.prompt : null)),
-  });
-  const mapAll = (o) => Object.fromEntries(Object.entries(o).map(([k, g]) => [k, finish(g)]));
-  return { start, bucketMs, overall: finish(overall), byAccount: mapAll(byAccount), byModel: mapAll(byModel) };
-}
-
 // ─────────────────────────────────────────────────
 // Local-only access (dashboard + proxy)
 // ─────────────────────────────────────────────────
