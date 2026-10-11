@@ -5309,16 +5309,53 @@ function isEmptyBody400(statusCode, bodyBuffer) {
   return statusCode === 400 && (!bodyBuffer || bodyBuffer.length === 0);
 }
 
+// ── Passthrough send ──
+// Forward with the client's own auth. A success streams straight to the client (reading
+// it in full first would cut long answers off). An error is read in full for the caller.
+// With `freeAccount`, a 429 that says the login is used up is retried once on the best
+// available account: Claude Code still holds the login it started with, and vdm may have
+// moved the work off that account because it is used up.
+// Returns { res, resBuf } for an error, or null when the response was streamed (or the
+// client left).
+async function _passthroughSend(clientReq, clientRes, body, fwd, { label, timeout, freeAccount }) {
+  let res = await forwardToAnthropic(clientReq.method, clientReq.url, fwd, body, timeout);
+  if (res.statusCode >= 400) {
+    const resBuf = await drainResponse(res);
+    if (!freeAccount || res.statusCode !== 429 || parseRateLimitHeaders(res.headers).status !== 'rejected') {
+      return { res, resBuf };
+    }
+    const used = String(fwd['authorization'] || '').replace(/^Bearer\s+/i, '');
+    const usedAcct = loadAllAccountTokens().find(a => a.token === used);
+    const usedName = usedAcct ? (usedAcct.label || usedAcct.name) : 'the session login';
+    if (usedAcct) markAccountRejected(used, usedName, res.headers);
+    const next = pickBestAccount(new Set([used]), extractModel(body));
+    if (!next) return { res, resBuf };
+    log('fallback', `${label}: ${usedName} is used up — sending on ${next.label || next.name}`);
+    try {
+      res = await forwardToAnthropic(clientReq.method, clientReq.url, { ...fwd, authorization: `Bearer ${next.token}` }, body, timeout);
+    } catch (e) {
+      log('error', `${label}: retry on ${next.label || next.name} failed: ${e.message}`);
+      return { res, resBuf };
+    }
+    if (res.statusCode >= 400) return { res, resBuf: await drainResponse(res) };
+  }
+  if (clientRes.destroyed || clientRes.writableEnded || clientRes.headersSent) { res.destroy(); return null; }
+  clientRes.writeHead(res.statusCode, res.headers);
+  await pipeAndWait(res, clientRes);
+  return null;
+}
+
 // ── Smart passthrough ──
 // Shared logic for proxy-disabled and circuit-breaker passthrough modes.
-// 1. Forward to Anthropic with provided auth
+// 1. Forward to Anthropic with provided auth (circuit breaker: a used-up login moves to a free account)
 // 2. If 400-empty-body → read fresh token from keychain (bypass cache), retry
 // 3. If still 400-empty-body → return 401 to trigger Claude Code re-auth
 // 4. Otherwise → forward response as-is
 async function _smartPassthrough(clientReq, clientRes, body, fwd, label) {
-  const res = await forwardToAnthropic(clientReq.method, clientReq.url, fwd, body, PROXY_TIMEOUT);
-  // Drain body to inspect for empty-body 400
-  const resBuf = await drainResponse(res);
+  const sent = await _passthroughSend(clientReq, clientRes, body, fwd,
+    { label, timeout: PROXY_TIMEOUT, freeAccount: label === 'circuit-breaker' && (!!settings.autoSwitch || isBalanceMode()) });
+  if (!sent) return;
+  const { res, resBuf } = sent;
   if (isEmptyBody400(res.statusCode, resBuf)) {
     log('fallback', `${label}: 400-empty-body detected — trying fresh keychain token`);
     // Bypass cache: read directly from keychain
@@ -5385,9 +5422,15 @@ async function _passthroughFallback(clientReq, clientRes, body, reason) {
     fwd['anthropic-beta'] = betas.join(',');
     log('fallback', `Proxy recovery exhausted (${reason}) — passthrough with original auth`);
     // Short timeout: we've already spent time on recovery, don't stall further
-    const res = await forwardToAnthropic(clientReq.method, clientReq.url, fwd, body, 15_000);
-    // Drain body to check for empty-body 400
-    const resBuf = await drainResponse(res);
+    const sent = await _passthroughSend(clientReq, clientRes, body, fwd,
+      { label: `Passthrough (${reason})`, timeout: 15_000, freeAccount: !!settings.autoSwitch || isBalanceMode() });
+    if (!sent) {
+      // Streamed to the client (or it left) — reset failure counters
+      _consecutiveExhausted = 0;
+      _consecutive400s = 0;
+      return true;
+    }
+    const { res, resBuf } = sent;
     if (isEmptyBody400(res.statusCode, resBuf)) {
       log('fallback', `Passthrough (${reason}): 400-empty-body — trying fresh keychain token`);
       invalidateTokenCache();
@@ -7614,30 +7657,11 @@ async function handleProxyRequest(clientReq, clientRes) {
       }
     }
 
-    // Network failure after retry  - try switching to another account before giving up
+    // Network failure after retry. It says nothing about the account (DNS down after sleep,
+    // Wi-Fi drop): every account goes down the same pipe. So don't move sessions (their
+    // caches would be lost) and don't pass through (that sends Claude Code's own login,
+    // which can be a used-up account). Answer 502: Claude Code retries it with backoff.
     if (lastNetworkError) {
-      if (settings.autoSwitch || balanceMode) {
-        const next = balanceMode ? await balanceSwitch(triedTokens) : pickNext();
-        if (next) {
-          log(balanceMode ? 'balance' : 'switch', `  → network error on ${acctName}, switching to ${next.label || next.name}`);
-          if (!balanceMode && failedIsActive()) {
-            try {
-              await withSwitchLock(() => {
-                writeKeychain(next.creds);
-                invalidateTokenCache();
-              });
-            } catch (e) {
-              log('warn', `Keychain write failed during network-error switch: ${e.message}`);
-            }
-          }
-          token = next.token;
-          pinLane(next, 'network-error');
-          logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: 'network-error' });
-          continue;
-        }
-      }
-      // All accounts tried or autoSwitch off — try passthrough fallback
-      if (await _passthroughFallback(clientReq, clientRes, body, 'network-error-all-exhausted')) return;
       clientRes.writeHead(502, { 'Content-Type': 'application/json' });
       clientRes.end(JSON.stringify({ type: 'error', error: { type: 'proxy_error', message: `Upstream unreachable: ${lastNetworkError.message}` } }));
       return;
