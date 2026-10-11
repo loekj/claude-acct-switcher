@@ -202,9 +202,11 @@ Credentials live in the macOS Keychain. The proxy reads the active token, replac
 
 The proxy is designed to never kill your Claude Code sessions, even when things go wrong:
 
-**Passthrough fallback** — When all proxy recovery strategies fail (expired tokens, network errors, auth failures), the request is forwarded with the original client auth header. This lets Claude Code reach the real API and trigger its own re-auth flow, instead of receiving an opaque error that permanently kills the session.
+**Passthrough fallback** — When all proxy recovery strategies fail (expired tokens, auth failures), the request is forwarded with the original client auth header. This lets Claude Code reach the real API and trigger its own re-auth flow, instead of receiving an opaque error that permanently kills the session. If that login is used up, the request goes to the best free account instead.
 
-**Circuit breaker** — After 3 consecutive total failures, the proxy auto-disables into passthrough mode for 2 minutes. All requests go straight to Anthropic with the client's own auth. After the cooldown, proxy mode is re-engaged automatically.
+**Network errors** — When Anthropic can't be reached (DNS down after sleep, Wi-Fi drop), the proxy answers 502 and Claude Code retries. Sessions stay on their accounts: another account would go down the same pipe.
+
+**Circuit breaker** — After 3 consecutive total failures, the proxy auto-disables into passthrough mode for 2 minutes. All requests go straight to Anthropic with the client's own auth (a used-up login still moves to a free account). After the cooldown, proxy mode is re-engaged automatically.
 
 **400 error recovery** — When the API returns 400 (which can mean bad tokens, expired OAuth, or malformed headers), four escalating strategies are tried:
 
