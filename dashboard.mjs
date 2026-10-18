@@ -287,6 +287,12 @@ import {
   computeExpiresAt,
   buildUpdatedCreds,
   shouldRefreshToken,
+  newerStoredToken,
+  limitFreeAt,
+  allUsedUp,
+  usedUpAnswer,
+  formatResetAt,
+  createRoute,
   createPerAccountLock,
   ROTATION_STRATEGIES,
   ROTATION_INTERVALS,
@@ -746,6 +752,7 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
 async function loadProfiles() {
   const activeCreds = readKeychain();
   const activeFp = activeCreds ? getFingerprint(activeCreds) : '';
+  const routeName = routeAccount()?.name || null;
 
   let files;
   try {
@@ -773,7 +780,8 @@ async function loadProfiles() {
         try { email = (await readFile(join(ACCOUNTS_DIR, `${name}.label`), 'utf8')).trim(); } catch {}
       }
 
-      const isActive = fp === activeFp;
+      const isLogin = fp === activeFp;               // Claude Code's own login (keychain)
+      const isActive = routeName ? routeName === name : isLogin; // where new requests go
 
       // Rate limit fetching strategy:
       // - Active account: always get fresh data (from probe cache or proxy state)
@@ -822,17 +830,17 @@ async function loadProfiles() {
       // Check if the proxy has marked this account as expired (e.g. via 401)
       const proxyExpired = !!(accountState.get(oauth.accessToken)?.expired);
 
-      // For the active account, prefer the live keychain's subscription/tier data
+      // For the login account, prefer the live keychain's subscription/tier data
       // over stale stored files (which may predate Claude Code populating these fields).
       const activeOauth = activeCreds?.claudeAiOauth || {};
-      const subType = (isActive && activeOauth.subscriptionType) ? activeOauth.subscriptionType
+      const subType = (isLogin && activeOauth.subscriptionType) ? activeOauth.subscriptionType
         : (oauth.subscriptionType || 'unknown');
-      const rlTier = (isActive && activeOauth.rateLimitTier) ? activeOauth.rateLimitTier
+      const rlTier = (isLogin && activeOauth.rateLimitTier) ? activeOauth.rateLimitTier
         : (oauth.rateLimitTier || 'unknown');
 
       // Backfill: if the stored file has stale/missing tier data but keychain has it,
       // update the file so the data persists even when this account is inactive.
-      if (isActive && activeOauth.rateLimitTier && activeOauth.rateLimitTier !== oauth.rateLimitTier) {
+      if (isLogin && activeOauth.rateLimitTier && activeOauth.rateLimitTier !== oauth.rateLimitTier) {
         try {
           const updatedCreds = { ...creds, claudeAiOauth: { ...oauth, subscriptionType: subType, rateLimitTier: rlTier } };
           writeFileSync(join(ACCOUNTS_DIR, file), JSON.stringify(updatedCreds, null, 2));
@@ -847,6 +855,7 @@ async function loadProfiles() {
         rateLimitTier: rlTier,
         expiresAt,
         isActive,
+        isLogin,
         fingerprint: fp,
         rateLimits,
         dormant,
@@ -933,17 +942,27 @@ async function handleAPI(req, res) {
       p.modelBlocks = modelBlocks(p.name);
     }
     const probeStats = getProbeStats();
-    // Check if all accounts are exhausted
+    // Every account used up (else: Fable used up on every account)
     const allAccounts = loadAllAccountTokens();
-    const allExhausted = allAccounts.length > 0 &&
-      allAccounts.every(a => !isAccountAvailable(a.token, a.expiresAt));
-    const earliestReset = allExhausted ? getEarliestReset() : null;
+    const allOut = allUsedUp(allAccounts, accountState, null);
+    const out = allOut || allUsedUp(allAccounts, accountState, 'fable');
+    const usedUp = out ? { fable: !allOut, until: formatResetAt(out.at), first: out.account.label || out.account.name } : null;
     json(res, {
-      profiles, probeStats, allExhausted, earliestReset,
+      profiles, probeStats, usedUp,
       rotationStrategy: settings.rotationStrategy, balanceCap: settings.maxConcurrentPerAccount || 8,
       sessionAffinity: settings.sessionAffinity !== false, sessionHistory: settings.sessionHistory === true, hotTokensPer5m: settings.hotTokensPer5m,
       queueStats: getQueueStats(),
     });
+    return true;
+  }
+
+  // Forget the known limits: the next request tries each account once more (for a limit
+  // that came back early, e.g. after buying extra usage)
+  if (url.pathname === '/api/limits/clear' && req.method === 'POST') {
+    for (const a of loadAllAccountTokens()) accountState.remove(a.token);
+    log('switch', 'Limits cleared by hand: the next request tries each account once');
+    logActivity('limits-cleared', {});
+    json(res, { ok: true });
     return true;
   }
 
@@ -961,6 +980,7 @@ async function handleAPI(req, res) {
       const creds = JSON.parse(raw);
       writeKeychain(creds);
       invalidateTokenCache();
+      routePointer.reset(); // requests follow the new login
       // A manual switch moves every session: release all affinity pins
       sessionStore.unpinAll('manual-switch');
       markSessionsDirty();
@@ -2158,6 +2178,7 @@ function renderHTML() {
     0%, 100% { border-color: hsl(0 50% 30%); }
     50% { border-color: hsl(0 70% 50%); }
   }
+  .exhausted-retry { margin-left: auto; }
   .exhausted-icon {
     width: 22px; height: 22px;
     border-radius: 50%;
@@ -2507,7 +2528,8 @@ function renderHTML() {
 
   <div id="exhausted-banner" class="exhausted-banner" style="display:none">
     <span class="exhausted-icon">!</span>
-    <span>All accounts rate-limited. Next available: <strong id="exhausted-reset"> -</strong></span>
+    <span id="exhausted-text"></span>
+    <button class="tok-export-btn exhausted-retry" onclick="retryLimits()" title="vdm skips used-up accounts until their reset. Click when a limit came back early (for example after buying extra usage): your next prompt tries each account once.">Try again</button>
   </div>
 
   <div class="tabs">
@@ -3149,7 +3171,7 @@ function quickHash(obj) {
 async function refresh() {
   try {
     const resp = await fetch('/api/profiles');
-    const { profiles, probeStats, allExhausted, earliestReset, rotationStrategy, balanceCap, sessionAffinity, sessionHistory, hotTokensPer5m, queueStats } = await resp.json();
+    const { profiles, probeStats, usedUp, rotationStrategy, balanceCap, sessionAffinity, sessionHistory, hotTokensPer5m, queueStats } = await resp.json();
     HIST.enabled = !!sessionHistory;
     if (hotTokensPer5m) HOT_TOKENS = hotTokensPer5m;
     _cachedProfiles = profiles;
@@ -3185,9 +3207,11 @@ async function refresh() {
     }
     // Exhausted banner
     const banner = document.getElementById('exhausted-banner');
-    if (allExhausted) {
+    if (usedUp) {
       banner.style.display = '';
-      document.getElementById('exhausted-reset').textContent = earliestReset || 'unknown';
+      banner.title = 'First free: ' + usedUp.first + '. Until then vdm answers Claude Code at once with the reset time, so it stops instead of retrying.';
+      document.getElementById('exhausted-text').innerHTML = (usedUp.fable ? 'Fable is used up on every account until ' : 'Every account is used up until ') +
+        '<strong>' + escHtml(usedUp.until) + '</strong>' + (usedUp.fable ? '. Other models still work.' : '.');
     } else {
       banner.style.display = 'none';
     }
@@ -3317,7 +3341,7 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
   var buttonsHtml = '';
   if (!active) {
     buttonsHtml = '<div class="card-actions">' +
-      '<button class="remove-btn" onclick="doRemove(\\'' + eName + '\\',event)">Remove</button>' + sessLink +
+      (p.isLogin ? '' : '<button class="remove-btn" onclick="doRemove(\\'' + eName + '\\',event)">Remove</button>') + sessLink +
       (isStale ? '<button class="refresh-btn" onclick="doRefresh(\\'' + eName + '\\',event)">Refresh</button>'
                : '<button class="switch-btn" onclick="doSwitch(\\'' + eName + '\\',\\'' + displayName.replace(/'/g, "\\\\'") + '\\',event)">Switch to this account</button>') +
     '</div>';
@@ -3335,7 +3359,8 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
         arts +
         inflightBadge(p, balanceMode, balanceCap) +
         planBadge(p.subscriptionType, p.rateLimitTier) +
-        (active ? '<span class="badge badge-active" title="Claude Code is logged in with this account; new sessions start here">Active</span>' : '') +
+        (active ? '<span class="badge badge-active" title="' + (p.isLogin ? 'Claude Code is logged in with this account; new sessions start here' : 'New sessions start here. Claude Code stays logged in with another account, so its artifacts keep working') + '">Active</span>' : '') +
+        (p.isLogin && !active ? '<span class="badge" title="Claude Code is logged in with this account. Artifacts and claude.ai connectors use it, so vdm keeps the login here while other accounts take the requests.">Login</span>' : '') +
       '</div>' +
     '</div>' +
     blockedHtml +
@@ -4816,6 +4841,15 @@ async function refreshArtifactsTab() {
   renderArtifacts();
 }
 
+async function retryLimits() {
+  try {
+    var resp = await fetch('/api/limits/clear', { method: 'POST' });
+    if (!resp.ok) throw new Error('HTTP ' + resp.status);
+    document.getElementById('exhausted-banner').style.display = 'none';
+    showToast('Limits cleared. Your next prompt tries each account once.');
+  } catch (e) { showToast('Could not clear the limits: ' + e.message); }
+}
+
 async function refreshArtifactsNow() {
   var btn = document.getElementById('art-refresh');
   btn.disabled = true;
@@ -5063,6 +5097,37 @@ function invalidateTokenCache() {
   _kcCacheAt = 0;
 }
 
+// ── Login vs route (see createRoute in lib.mjs) ──
+
+const routePointer = createRoute();
+
+/** The account Claude Code is logged in with (null when its token is in no account file). */
+function loginAccount(accounts = loadAllAccountTokens()) {
+  const t = getActiveToken();
+  return (t && accounts.find(a => a.token === t)) || null;
+}
+
+/** Where new requests go: the route account, else the login account. */
+function routeAccount(accounts = loadAllAccountTokens()) {
+  const login = loginAccount(accounts);
+  const name = routePointer.resolve(accounts.map(a => a.name), login?.name || null);
+  return (name && accounts.find(a => a.name === name)) || login;
+}
+
+/** Send new requests to this account. Claude Code's login stays where it is. */
+function setRoute(acct) {
+  if (acct) routePointer.set(acct.name, loginAccount()?.name || null);
+}
+
+/** Move Claude Code's own login to this account (the route follows). */
+async function setLogin(acct) {
+  await withSwitchLock(() => {
+    writeKeychain(acct.creds);
+    invalidateTokenCache();
+  });
+  routePointer.reset();
+}
+
 // ── Per-account state ──
 // Map<token, { name, limited, expired, resetAt, retryAfter,
 //              utilization5h, utilization7d, updatedAt }>
@@ -5264,9 +5329,49 @@ function pickBestAccount(excludeTokens = new Set(), model = null) {
   return _pickBestAccount(loadAllAccountTokens(), accountState, excludeTokens, model);
 }
 
-// Fallback: pick any untried account even if marked limited (in case state is stale)
-function pickAnyUntried(excludeTokens) {
-  return _pickAnyUntried(loadAllAccountTokens(), excludeTokens);
+// Fallback: any untried account that no known limit blocks (e.g. one whose token only needs
+// a refresh). An account used up until a known reset is skipped: trying it again can only
+// get the same 429.
+function pickAnyUntried(excludeTokens, model = null, { recheck = false } = {}) {
+  const open = loadAllAccountTokens().filter(a => recheck || limitFreeAt(accountState.get(a.token), model).at === 0);
+  return _pickAnyUntried(open, excludeTokens);
+}
+
+// While every account is used up, requests get the answer without a try. Once every 15
+// minutes one request tries each account again: that catches a limit that ended early
+// (extra usage bought, an early reset) without a click.
+const USED_UP_RECHECK_MS = parseInt(process.env.CSW_USED_UP_RECHECK_MS || '', 10) || 15 * 60 * 1000; // env: tests
+let _usedUpCheckedAt = 0; // when the accounts were last really tried while all used up
+
+/**
+ * Every account is used up for this model: answer with the limit and its reset at once, so
+ * Claude Code shows it and stops, instead of retrying for minutes (each retry trying every
+ * account again). Returns false when some account can still take the request.
+ */
+let _usedUpSaid = { key: '', at: 0 };
+function answerUsedUp(clientRes, model, { tried = false } = {}) {
+  const accounts = loadAllAccountTokens();
+  const first = allUsedUp(accounts, accountState, model);
+  if (!first) return false;
+  if (tried) _usedUpCheckedAt = Date.now();
+  const label = first.account.label || first.account.name;
+  // Only this model's own bucket (Fable) is used up everywhere: other models still work
+  const otherModels = !!model && !allUsedUp(accounts, accountState, null);
+  const { headers, body } = usedUpAnswer({ ...first, label }, { total: accounts.length, model, otherModels });
+  const what = otherModels ? `${model} used up on all accounts` : 'all accounts used up';
+  // Side calls arrive in bursts: say it once a minute
+  const key = `${what}|${first.at}`;
+  if (key !== _usedUpSaid.key || Date.now() - _usedUpSaid.at > 60_000) {
+    _usedUpSaid = { key, at: Date.now() };
+    log('switch', `  → ${what} until ${formatResetAt(first.at)} (${label} first) — told Claude Code to stop`);
+    logEvent('all-exhausted', { model: otherModels ? model : undefined, until: first.at });
+    notify('All Accounts Used Up', `${otherModels ? model + ' is' : 'Every account is'} used up until ${formatResetAt(first.at)}`);
+  }
+  if (!clientRes.headersSent && !clientRes.writableEnded) {
+    clientRes.writeHead(429, headers);
+    clientRes.end(body);
+  }
+  return true;
 }
 
 // ── Build forwarding headers ──
@@ -5607,7 +5712,7 @@ function migrateAccountState(oldToken, newToken, oldFp, newFp, name) {
  * Main refresh orchestrator for a single account.
  * Wrapped in per-account lock to prevent concurrent refreshes.
  */
-async function refreshAccountToken(accountName, { force = false } = {}) {
+async function refreshAccountToken(accountName, { force = false, staleToken = null } = {}) {
   return refreshLock.withLock(accountName, async () => {
     // 1. Re-read credentials from disk (may have been refreshed by concurrent request)
     let rawCreds;
@@ -5627,7 +5732,12 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
     let accountLabel = accountName;
     try { accountLabel = readFileSync(join(ACCOUNTS_DIR, `${accountName}.label`), 'utf8').trim() || accountName; } catch {}
 
-    // 2. Check if still needs refresh (double-check after lock)
+    // 2. The caller failed on an older token than the stored one: another refresh already
+    //    replaced it. Use that; refreshing again revokes it under the requests now using it.
+    const newer = newerStoredToken(oauth, staleToken);
+    if (newer) return { ok: true, reused: true, accessToken: newer, expiresAt: oauth.expiresAt };
+
+    // 2b. Check if still needs refresh (double-check after lock)
     //    Skip this check when force=true (e.g. 401/400 from API means token is invalid
     //    regardless of what the stored expiresAt says)
     if (!force && !shouldRefreshToken(oauth.expiresAt, REFRESH_BUFFER_MS)) {
@@ -5709,6 +5819,38 @@ async function refreshAccountToken(accountName, { force = false } = {}) {
 
 const REFRESH_FAILURE_TTL = 2 * 60 * 60 * 1000; // 2 hours
 
+/**
+ * Where to move a dead login: `preferred` (the account taking the requests) when it can stay
+ * logged in, else another such account. Usage limits do not matter for a login; a refresh
+ * token on record as rejected, or a token that failed with a 401, does.
+ */
+function loginTarget(preferred, deadToken) {
+  const ok = (a) => a && a.token !== deadToken && refreshFailures.get(a.name)?.retriable !== false
+    && !accountState.get(a.token)?.expired;
+  if (ok(preferred)) return preferred;
+  return loadAllAccountTokens().find(ok) || null;
+}
+
+// Claude Code's own login can no longer refresh (its refresh token was rejected). Requests may
+// not reach it to notice (the route can be elsewhere), so move it to a working account here:
+// Claude Code's artifacts, connectors and own calls need a live login. Only while the keychain
+// still holds this account's token: if Claude Code refreshed the login itself, it is fine.
+async function moveDeadLogin(acct) {
+  if (refreshFailures.get(acct.name)?.retriable !== false || acct.token !== getActiveToken()) return;
+  const target = loginTarget(routeAccount(), acct.token);
+  if (!target) return;
+  try {
+    await setLogin(target);
+  } catch (e) {
+    log('warn', `Keychain write failed while moving the login: ${e.message}`);
+    return;
+  }
+  const from = acct.label || acct.name, to = target.label || target.name;
+  log('switch', `${from}: login can no longer refresh → Claude Code now logged in as ${to}`);
+  logEvent('auto-switch', { from, to, reason: 'login-dead' });
+  notify('Account Switched', `${from} login expired → ${to}`);
+}
+
 async function refreshSweep(label = 'refresh-bg') {
   const accounts = loadAllAccountTokens();
   for (const acct of accounts) {
@@ -5721,7 +5863,8 @@ async function refreshSweep(label = 'refresh-bg') {
       }
       log(label, `${acct.label || acct.name}: token near expiry, refreshing...`);
       try {
-        await refreshAccountToken(acct.name);
+        const r = await refreshAccountToken(acct.name);
+        if (!r.ok) await moveDeadLogin(acct);
       } catch (e) {
         log(label, `${acct.label || acct.name}: background refresh error: ${e.message}`);
         const failFp = getFingerprintFromToken(acct.token);
@@ -7424,19 +7567,20 @@ async function handleProxyRequest(clientReq, clientRes) {
     if (!affinityOn || !acct) return;
     noteMove(sid, sessionStore.pin(sid, agent, acct.name, { reason, ttlMs }));
   };
-  // Retry target outside balance mode: a session follows the active (keychain) account
-  // when it can take the request, else the least-used available account.
+  let usedUpRecheck = false; // this request tries used-up accounts again (the 15-minute check)
+  // Retry target outside balance mode: a session follows the route account when it can
+  // take the request, else the least-used available account.
   const pickNext = () => {
     if (affinityOn) {
-      const active = allAccounts.find(a => a.token === getActiveToken());
+      const active = routeAccount();
       if (active && !triedTokens.has(active.token) && isAccountAvailable(active.token, active.expiresAt, model)) return active;
     }
-    return pickBestAccount(triedTokens, model) || pickAnyUntried(triedTokens);
+    return pickBestAccount(triedTokens, model) || pickAnyUntried(triedTokens, model, { recheck: usedUpRecheck });
   };
-  // The keychain account is Claude Code's own login and where new sessions start. Only
-  // move it when the failing account IS the keychain account  - a pinned session failing
-  // elsewhere must not drag every other session along.
-  const failedIsActive = () => !affinityOn || token === getActiveToken();
+  // The route account is where new sessions start. Only move the route when the failing
+  // account IS the route account  - a pinned session failing elsewhere must not drag
+  // every other session along.
+  const failedIsActive = () => !affinityOn || token === (routeAccount()?.token || getActiveToken());
 
   // Switch accounts in balance mode: release the current slot, then acquire one on a
   // different (untried) account. Returns the new account, or null when exhausted/aborted.
@@ -7450,9 +7594,23 @@ async function handleProxyRequest(clientReq, clientRes) {
     return slot.account;
   };
 
-  // Start with active keychain token, apply rotation strategy
-  let token = getActiveToken();
-  const activeAcct = allAccounts.find(a => a.token === token);
+  // Every account is used up for this model until a known reset: say so at once (every 15
+  // minutes, try them all once more instead)
+  if ((balanceMode || settings.autoSwitch) && clientReq.method === 'POST' && /^\/v1\/messages(\?|$)/.test(clientReq.url || '')
+      && allUsedUp(loadAllAccountTokens(), accountState, model)) {
+    if (Date.now() - _usedUpCheckedAt < USED_UP_RECHECK_MS) {
+      if (answerUsedUp(clientRes, model)) return;
+    } else {
+      usedUpRecheck = true;
+      _usedUpCheckedAt = Date.now();
+      log('switch', 'Every account is used up: trying each once more (15-minute check)');
+    }
+  }
+
+  // Start on the route account (Claude Code's login unless a limit moved the route),
+  // apply rotation strategy
+  const activeAcct = routeAccount(allAccounts);
+  let token = activeAcct?.token || getActiveToken();
   let affinityAlt = null; // where the strategy would have sent a warm lane that affinity kept home
 
   if (balanceMode) {
@@ -7485,7 +7643,7 @@ async function handleProxyRequest(clientReq, clientRes) {
     // For the savings figure only: where would the strategy have sent it?
     const alt = _pickByStrategy({
       strategy: settings.rotationStrategy || 'conserve', intervalMin: settings.rotationIntervalMin || 60,
-      currentToken: getActiveToken(), lastRotationTime, accounts: allAccounts, stateManager: accountState,
+      currentToken: activeAcct?.token || getActiveToken(), lastRotationTime, accounts: allAccounts, stateManager: accountState,
       excludeTokens: new Set(), model,
     }).account;
     if (alt && alt.name !== pinned.name) affinityAlt = alt.name;
@@ -7502,7 +7660,7 @@ async function handleProxyRequest(clientReq, clientRes) {
     });
 
     // The active account only lacks room for this model (e.g. its Fable bucket is used
-    // up): route this request elsewhere, but keep the keychain  - everyone else is fine.
+    // up): route this request elsewhere, but keep the route  - everyone else is fine.
     const activeOnlyLacksModel = activeAcct && isAccountAvailable(activeAcct.token, activeAcct.expiresAt)
       && !isAccountAvailable(activeAcct.token, activeAcct.expiresAt, model);
     if (strategyPick && activeOnlyLacksModel && strategyPick.name !== activeAcct.name) {
@@ -7520,14 +7678,8 @@ async function handleProxyRequest(clientReq, clientRes) {
       if (!isSameAccount) {
         log('proactive', `${oldName} → switch to ${pickName} (${reason})`);
       }
-      try {
-        await withSwitchLock(() => {
-          writeKeychain(strategyPick.creds);
-          invalidateTokenCache();
-        });
-      } catch (e) {
-        log('warn', `Keychain write failed during proactive switch: ${e.message}`);
-      }
+      // Only the route moves: Claude Code's login (artifacts, connectors) stays put
+      setRoute(strategyPick);
       token = strategyPick.token;
       lastRotationTime = Date.now();
       if (!isSameAccount) {
@@ -7735,6 +7887,7 @@ async function handleProxyRequest(clientReq, clientRes) {
           return;
         }
         // Genuine rate limit across all accounts — surface the exhaustion.
+        if (answerUsedUp(clientRes, model, { tried: true })) return;
         log('balance', '  → all accounts rate limited, returning 429');
         logEvent('all-exhausted', {});
         notify('All Accounts Exhausted', `All ${allAccounts.length} accounts rate-limited. Reset: ${getEarliestReset()}`);
@@ -7772,17 +7925,8 @@ async function handleProxyRequest(clientReq, clientRes) {
       if (next) {
         log('switch', `  → switching to ${next.label || next.name}`);
         // A model-only limit (Fable bucket) leaves the account fine for everyone else.
-        if (failedIsActive() && !modelOnly) {
-          try {
-            await withSwitchLock(() => {
-              writeKeychain(next.creds);
-              invalidateTokenCache();
-              invalidateAccountsCache();
-            });
-          } catch (e) {
-            log('warn', `Keychain write failed during 429 switch: ${e.message}`);
-          }
-        }
+        // A limit moves the route only; Claude Code's login stays put.
+        if (failedIsActive() && !modelOnly) setRoute(next);
         token = next.token;
         pinLane(next, '429-limit');
         logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '429' });
@@ -7791,6 +7935,7 @@ async function handleProxyRequest(clientReq, clientRes) {
       }
 
       // All exhausted
+      if (answerUsedUp(clientRes, model, { tried: true })) return;
       log('switch', '  → all accounts exhausted, returning 429');
       logEvent('all-exhausted', {});
       notify('All Accounts Exhausted', `All ${allAccounts.length} accounts rate-limited. Reset: ${getEarliestReset()}`);
@@ -7816,9 +7961,11 @@ async function handleProxyRequest(clientReq, clientRes) {
         refreshAttempted.add(acctName);
         log('refresh', `${acctName}: attempting token refresh after 401...`);
         try {
-          const refreshResult = await refreshAccountToken(acct.name, { force: true });
+          // Concurrent requests that failed on the same old token reuse the new one
+          const refreshResult = await refreshAccountToken(acct.name, { force: true, staleToken: token });
+          if (refreshResult.reused) refreshAttempted.delete(acctName); // no refresh spent: one stays allowed
           if (refreshResult.ok && !refreshResult.skipped) {
-            log('refresh', `${acctName}: refresh succeeded, retrying request`);
+            log('refresh', refreshResult.reused ? `${acctName}: already refreshed, retrying with the new token` : `${acctName}: refresh succeeded, retrying request`);
             // Re-read the account to get new token
             invalidateAccountsCache();
             const refreshedAccounts = loadAllAccountTokens();
@@ -7851,18 +7998,21 @@ async function handleProxyRequest(clientReq, clientRes) {
         return;
       }
 
+      // Claude Code's own login is dead only when its refresh token was rejected; a refresh
+      // that failed on the network leaves the login in place (its artifacts stay reachable)
+      const loginDied = token === getActiveToken() && refreshFailures.get(acct?.name)?.retriable === false;
       const next = balanceMode ? await balanceSwitch(triedTokens) : pickNext();
       if (next) {
         log(balanceMode ? 'balance' : 'switch', `  → switching to ${next.label || next.name}`);
-        if (!balanceMode && failedIsActive()) {
+        if (loginDied) {
+          // Move it: Claude Code needs a working login
           try {
-            await withSwitchLock(() => {
-              writeKeychain(next.creds);
-              invalidateTokenCache();
-            });
+            await setLogin(loginTarget(next, token) || next);
           } catch (e) {
             log('warn', `Keychain write failed during 401 switch: ${e.message}`);
           }
+        } else if (!balanceMode && failedIsActive()) {
+          setRoute(next);
         }
         token = next.token;
         pinLane(next, '401');
@@ -7871,6 +8021,8 @@ async function handleProxyRequest(clientReq, clientRes) {
         continue;
       }
 
+      // The others are only used up until a known reset: say that, re-auth would not help
+      if (answerUsedUp(clientRes, model, { tried: true })) return;
       // No valid accounts left — try passthrough so Claude Code can re-auth
       log('switch', '  → no valid accounts remain — trying passthrough fallback');
       notify('All Tokens Expired', 'No valid accounts remain — trying passthrough');
@@ -7987,7 +8139,7 @@ async function handleProxyRequest(clientReq, clientRes) {
         const toRefresh = allAccounts.filter(a => !refreshAttempted.has(a.label || a.name));
         for (const a of toRefresh) refreshAttempted.add(a.label || a.name);
         const results = await Promise.allSettled(
-          toRefresh.map(a => refreshAccountToken(a.name, { force: true }))
+          toRefresh.map(a => refreshAccountToken(a.name, { force: true, staleToken: a.token }))
         );
         for (let i = 0; i < results.length; i++) {
           if (results[i].status === 'rejected') {
@@ -8010,9 +8162,10 @@ async function handleProxyRequest(clientReq, clientRes) {
         refreshAttempted.add(acctName);
         log('refresh', `${acctName}: attempting token refresh after 400...`);
         try {
-          const refreshResult = await refreshAccountToken(acct.name, { force: true });
+          const refreshResult = await refreshAccountToken(acct.name, { force: true, staleToken: token });
+          if (refreshResult.reused) refreshAttempted.delete(acctName); // no refresh spent: one stays allowed
           if (refreshResult.ok && !refreshResult.skipped) {
-            log('refresh', `${acctName}: refresh succeeded, retrying request`);
+            log('refresh', refreshResult.reused ? `${acctName}: already refreshed, retrying with the new token` : `${acctName}: refresh succeeded, retrying request`);
             invalidateAccountsCache();
             const refreshedAccounts = loadAllAccountTokens();
             const refreshedAcct = refreshedAccounts.find(a => a.name === acct.name);
@@ -8033,16 +8186,7 @@ async function handleProxyRequest(clientReq, clientRes) {
         const next = balanceMode ? await balanceSwitch(triedTokens) : pickNext();
         if (next) {
           log(balanceMode ? 'balance' : 'switch', `  → 400 on ${acctName}, switching to ${next.label || next.name}`);
-          if (!balanceMode && failedIsActive()) {
-            try {
-              await withSwitchLock(() => {
-                writeKeychain(next.creds);
-                invalidateTokenCache();
-              });
-            } catch (e) {
-              log('warn', `Keychain write failed during 400 switch: ${e.message}`);
-            }
-          }
+          if (!balanceMode && failedIsActive()) setRoute(next);
           token = next.token;
           pinLane(next, '400');
           logEvent('auto-switch', { from: acctName, to: next.label || next.name, reason: '400-error' });
