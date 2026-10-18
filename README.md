@@ -142,7 +142,7 @@ Saved sessions live in `~/.claude/account-switcher/history/` (only you can read 
 
 #### Artifacts
 
-Claude Code publishes artifacts with its own login (the account in the Keychain), not through the proxy. The Artifacts tab asks every account which artifacts it owns (every 15 minutes, or on demand). Paste an artifact link to find its owner. Artifact links seen in a session's messages are linked to that session.
+Claude Code publishes and edits artifacts with its own login (the account in the Keychain), not through the proxy. So vdm keeps that login in place: when an account hits a limit, only the requests move to another account, and your artifacts stay reachable. The login moves only when its token dies or you switch by hand. The card of that account shows a **Login** badge while requests run on another account. The Artifacts tab asks every account which artifacts it owns (every 15 minutes, or on demand). Paste an artifact link to find its owner. Artifact links seen in a session's messages are linked to that session.
 
 #### Usage
 
@@ -178,7 +178,7 @@ vdm config history-keep <days>    # Delete saved sessions older than this (0 = f
 | **Drain first** | Use highest 5hr utilization first |
 | **Balance** | Put new sessions on the least-loaded account, capped per account |
 
-All strategies skip accounts whose 5h or weekly window is used up. Per-model weekly limits (Fable, and weekly Opus or Sonnet limits) only steer that model's requests away; other models keep using the account. With session affinity on, the strategy only places new and idle sessions.
+All strategies skip accounts whose 5h or weekly window is used up. Per-model weekly limits (Fable, and weekly Opus or Sonnet limits) only steer that model's requests away; other models keep using the account. When every account is used up for a request's model, vdm does not try them again: it answers at once with the first reset time, so Claude Code shows it and stops instead of retrying for minutes. If only Fable is used up everywhere, other models keep working. The dashboard then shows a banner with **Try again**, for a limit that came back early (for example after buying extra usage): your next prompt tries each account once. With session affinity on, the strategy only places new and idle sessions.
 
 ## How It Works
 
@@ -196,7 +196,7 @@ Claude Code  ──ANTHROPIC_BASE_URL──>  Local Proxy (:3334)  ──>  api.
                                           '-- Circuit breaker auto-disables on repeated failures
 ```
 
-Credentials live in the macOS Keychain. The proxy reads the active token, replaces the auth header, and forwards to Anthropic. On 429, it writes the next account's credentials to the Keychain and retries — Claude Code picks up the change seamlessly.
+Credentials live in the macOS Keychain. The proxy replaces the auth header with the chosen account's token and forwards to Anthropic. On 429, it retries on the next account and sends new requests there. The Keychain login (which Claude Code's artifacts and claude.ai connectors use) stays where it is; vdm moves it only when its token can no longer be refreshed.
 
 ### Proxy Resilience
 

@@ -25,6 +25,12 @@ import {
   computeExpiresAt,
   buildUpdatedCreds,
   shouldRefreshToken,
+  newerStoredToken,
+  createRoute,
+  limitFreeAt,
+  allUsedUp,
+  usedUpAnswer,
+  formatResetAt,
   createPerAccountLock,
 } from '../lib.mjs';
 
@@ -821,5 +827,183 @@ describe('createPerAccountLock', () => {
     // Should still be able to acquire lock
     const result = await lock.withLock('acct1', async () => 'ok');
     assert.equal(result, 'ok');
+  });
+});
+
+// ─────────────────────────────────────────────────
+// newerStoredToken (no refresh storm)
+// ─────────────────────────────────────────────────
+
+describe('newerStoredToken', () => {
+  const now = 1_000_000;
+  it('returns the stored token when an earlier refresh replaced the failed one', () => {
+    assert.equal(newerStoredToken({ accessToken: 'new', expiresAt: now + 60_000 }, 'old', now), 'new');
+  });
+  it('returns null when the stored token is the one that failed (a real refresh is needed)', () => {
+    assert.equal(newerStoredToken({ accessToken: 'old', expiresAt: now + 60_000 }, 'old', now), null);
+  });
+  it('returns null when the stored token has expired', () => {
+    assert.equal(newerStoredToken({ accessToken: 'new', expiresAt: now - 1 }, 'old', now), null);
+  });
+  it('returns null without a failed token or a stored token', () => {
+    assert.equal(newerStoredToken({ accessToken: 'new', expiresAt: now + 1 }, null, now), null);
+    assert.equal(newerStoredToken({}, 'old', now), null);
+    assert.equal(newerStoredToken(null, 'old', now), null);
+  });
+  it('treats a missing expiry as valid', () => {
+    assert.equal(newerStoredToken({ accessToken: 'new' }, 'old', now), 'new');
+  });
+});
+
+// ─────────────────────────────────────────────────
+// createRoute (login vs route)
+// ─────────────────────────────────────────────────
+
+describe('createRoute', () => {
+  const names = ['a', 'b', 'c'];
+  it('follows the login until a route is set', () => {
+    const r = createRoute();
+    assert.equal(r.resolve(names, 'a'), null);
+  });
+  it('keeps the route while the login stays the same', () => {
+    const r = createRoute();
+    r.set('b', 'a');
+    assert.equal(r.resolve(names, 'a'), 'b');
+    assert.equal(r.resolve(names, 'a'), 'b');
+  });
+  it('a route onto the login account is no route', () => {
+    const r = createRoute();
+    r.set('a', 'a');
+    assert.equal(r.resolve(names, 'a'), null);
+  });
+  it('clears when Claude Code logs in elsewhere', () => {
+    const r = createRoute();
+    r.set('b', 'a');
+    assert.equal(r.resolve(names, 'c'), null);
+    assert.equal(r.resolve(names, 'a'), null); // stays cleared
+  });
+  it('keeps the route while the login token is in no account file', () => {
+    const r = createRoute();
+    r.set('b', 'a');
+    assert.equal(r.resolve(names, null), 'b');
+    assert.equal(r.resolve(names, 'a'), 'b');
+  });
+  it('does not clear when the login was unknown when the route was set', () => {
+    const r = createRoute();
+    r.set('b', null);
+    assert.equal(r.resolve(names, 'a'), 'b'); // adopts 'a' as the login
+    assert.equal(r.resolve(names, 'c'), null); // a later change still clears
+  });
+  it('clears when the route account is removed', () => {
+    const r = createRoute();
+    r.set('b', 'a');
+    assert.equal(r.resolve(['a', 'c'], 'a'), null);
+  });
+  it('reset clears the route', () => {
+    const r = createRoute();
+    r.set('b', 'a');
+    r.reset();
+    assert.equal(r.resolve(names, 'a'), null);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// Used-up accounts (stop at once, Fable aware)
+// ─────────────────────────────────────────────────
+
+describe('limitFreeAt', () => {
+  const now = 1_800_000_000_000;
+  const nowSec = now / 1000;
+  it('free when nothing is known', () => {
+    assert.deepEqual(limitFreeAt(undefined, null, now), { at: 0 });
+  });
+  it('a rejected claim blocks until its reset', () => {
+    const s = { limited: true, limitedUntil: nowSec + 600, claim: 'seven_day' };
+    assert.deepEqual(limitFreeAt(s, null, now), { at: nowSec + 600, claim: 'seven_day' });
+  });
+  it('a passed reset is free again', () => {
+    assert.deepEqual(limitFreeAt({ limited: true, limitedUntil: nowSec - 1 }, null, now), { at: 0 });
+  });
+  it('the latest of several refusals counts', () => {
+    const s = { limited: true, limitedUntil: nowSec + 100, claim: 'five_hour', modelLimits: { fable: nowSec + 900 } };
+    assert.deepEqual(limitFreeAt(s, 'claude-fable-5', now), { at: nowSec + 900, claim: 'seven_day_overage_included' });
+  });
+  it('the Fable bucket only blocks Fable', () => {
+    const s = { modelLimits: { fable: nowSec + 500 } };
+    assert.deepEqual(limitFreeAt(s, 'claude-sonnet-5-5', now), { at: 0 });
+    assert.deepEqual(limitFreeAt(s, 'claude-fable-5', now), { at: nowSec + 500, claim: 'seven_day_overage_included' });
+  });
+  it('usage at 100% on an answer the server still gave is no refusal', () => {
+    const s = { utilization5h: 1, resetAt: nowSec + 100, utilization7d: 1.2, resetAt7d: nowSec + 900, utilization7dOI: 1, resetAt7dOI: nowSec + 50 };
+    assert.deepEqual(limitFreeAt(s, 'claude-fable-5', now), { at: 0 });
+  });
+  it('a per-model limit only blocks that family', () => {
+    const s = { modelLimits: { opus: nowSec + 300 } };
+    assert.deepEqual(limitFreeAt(s, 'claude-opus-5-5', now), { at: nowSec + 300, claim: 'seven_day_opus' });
+    assert.deepEqual(limitFreeAt(s, 'claude-sonnet-5-5', now), { at: 0 });
+  });
+  it('a dead login cannot come free by waiting', () => {
+    assert.equal(limitFreeAt({ expired: true }, null, now).at, Infinity);
+  });
+});
+
+describe('allUsedUp', () => {
+  const now = 1_800_000_000_000;
+  const nowSec = now / 1000;
+  const sm = (m) => ({ get: (t) => m[t] });
+  const accts = [{ token: 'a', name: 'a' }, { token: 'b', name: 'b' }];
+  it('null while one account is free', () => {
+    assert.equal(allUsedUp(accts, sm({ a: { limited: true, limitedUntil: nowSec + 60 } }), null, now), null);
+  });
+  it('the account that comes free first', () => {
+    const r = allUsedUp(accts, sm({
+      a: { limited: true, limitedUntil: nowSec + 600, claim: 'seven_day' },
+      b: { limited: true, limitedUntil: nowSec + 60, claim: 'five_hour' },
+    }), null, now);
+    assert.equal(r.account.name, 'b');
+    assert.equal(r.at, nowSec + 60);
+    assert.equal(r.claim, 'five_hour');
+  });
+  it('Fable used up everywhere stops Fable only', () => {
+    const m = sm({ a: { modelLimits: { fable: nowSec + 50 } }, b: { modelLimits: { fable: nowSec + 90 } } });
+    assert.equal(allUsedUp(accts, m, 'claude-fable-5', now).at, nowSec + 50);
+    assert.equal(allUsedUp(accts, m, 'claude-sonnet-5-5', now), null);
+  });
+  it('dead logins are no limit to wait for', () => {
+    assert.equal(allUsedUp(accts, sm({ a: { expired: true }, b: { expired: true } }), null, now), null);
+    const r = allUsedUp(accts, sm({ a: { expired: true }, b: { limited: true, limitedUntil: nowSec + 60 } }), null, now);
+    assert.equal(r.account.name, 'b');
+  });
+});
+
+describe('usedUpAnswer', () => {
+  const now = Date.UTC(2026, 9, 17, 12, 0, 0);
+  const nowSec = now / 1000;
+  it('tells Claude Code the reset and not to retry', () => {
+    const { headers, body } = usedUpAnswer({ at: nowSec + 3600, claim: 'five_hour', label: 'b@x' }, { total: 8, now });
+    assert.equal(headers['retry-after'], '3600');
+    assert.equal(headers['x-should-retry'], 'false');
+    assert.equal(headers['anthropic-ratelimit-unified-status'], 'rejected');
+    assert.equal(headers['anthropic-ratelimit-unified-reset'], String(nowSec + 3600));
+    assert.equal(headers['anthropic-ratelimit-unified-representative-claim'], 'five_hour');
+    const j = JSON.parse(body);
+    assert.equal(j.error.type, 'rate_limit_error');
+    assert.match(j.error.message, /All 8 accounts are used up/);
+  });
+  it('names the model when other models still work', () => {
+    const { body } = usedUpAnswer({ at: nowSec + 60, claim: null, label: 'a' }, { total: 2, model: 'claude-fable-5', otherModels: true, now });
+    assert.match(JSON.parse(body).error.message, /claude-fable-5 is used up on all 2 accounts.*\/model/);
+  });
+  it('no claim header without a claim', () => {
+    const { headers } = usedUpAnswer({ at: nowSec + 60, claim: null, label: 'a' }, { total: 2, now });
+    assert.equal('anthropic-ratelimit-unified-representative-claim' in headers, false);
+  });
+});
+
+describe('formatResetAt', () => {
+  const now = Date.UTC(2026, 9, 17, 12, 0, 0);
+  it('time only within a day, weekday after', () => {
+    assert.match(formatResetAt(now / 1000 + 3600, now), /^\d{2}:\d{2}$/);
+    assert.match(formatResetAt(now / 1000 + 3 * 86400, now), /^[A-Z][a-z]{2} \d{2}:\d{2}$/);
   });
 });

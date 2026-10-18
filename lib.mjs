@@ -154,6 +154,76 @@ export function isAccountExhausted(acctState, model = null, now = Date.now()) {
   return false;
 }
 
+const FAMILY_CLAIMS = Object.fromEntries(Object.entries(MODEL_CLAIMS).map(([claim, family]) => [family, claim]));
+
+/**
+ * When an account can take a request for `model` again, judged only by what the server
+ * refused (a 429 and its reset): { at: 0 } = now; { at, claim } = once the limit `claim`
+ * resets (epoch seconds; the latest of the refusals that block it); { at: Infinity } = not by
+ * waiting (its login failed with a 401). Usage at 100% read from an answer the server still
+ * gave (extra usage, a rounding) is no refusal, and a token that only needs a refresh is free.
+ */
+export function limitFreeAt(s, model = null, now = Date.now()) {
+  if (!s) return { at: 0 };
+  if (s.expired) return { at: Infinity };
+  const nowSec = Math.floor(now / 1000);
+  let at = 0, claim = null;
+  const block = (until, c) => { if (until && until > nowSec && until > at) { at = until; claim = c; } };
+  if (s.limited) {
+    if (s.retryAfter && s.retryAfter >= now) block(Math.ceil(s.retryAfter / 1000), null);
+    if (s.limitedUntil) block(s.limitedUntil, s.claim || null);
+    else block(s.resetAt, 'five_hour');
+  }
+  const family = modelFamily(model);
+  if (family) block(s.modelLimits?.[family], FAMILY_CLAIMS[family]);
+  return at ? { at, claim } : { at: 0 };
+}
+
+/**
+ * Every account is blocked by a limit for `model`: the one that comes free first
+ * ({ at, claim, account }). Null when some account can take the request (or only needs a
+ * token refresh), and when every login is dead (that is no limit to wait for).
+ */
+export function allUsedUp(accounts, stateManager, model = null, now = Date.now()) {
+  let first = null;
+  for (const a of accounts) {
+    const f = limitFreeAt(stateManager.get(a.token), model, now);
+    if (f.at === 0) return null;
+    if (f.at !== Infinity && (!first || f.at < first.at)) first = { ...f, account: a };
+  }
+  return first;
+}
+
+/** A reset time for people: "14:05" within a day, else "Sat 14:05". */
+export function formatResetAt(atSec, now = Date.now()) {
+  const d = new Date(atSec * 1000);
+  const time = d.toLocaleTimeString('en-GB', { hour: '2-digit', minute: '2-digit' });
+  return atSec * 1000 - now < 20 * 3600e3 ? time : `${d.toLocaleDateString('en-GB', { weekday: 'short' })} ${time}`;
+}
+
+/**
+ * The 429 for "every account is used up": the limit headers of the account that comes free
+ * first, so Claude Code shows the reset and stops (a bare 429 makes it retry for minutes,
+ * and each retry would try every account again). `otherModels`: only this model's bucket is
+ * used up everywhere; other models still work.
+ */
+export function usedUpAnswer({ at, claim, label }, { total, model = null, otherModels = false, now = Date.now() } = {}) {
+  const nowSec = Math.floor(now / 1000);
+  const when = formatResetAt(at, now);
+  const headers = {
+    'content-type': 'application/json',
+    'retry-after': String(Math.max(1, at - nowSec)),
+    'x-should-retry': 'false',
+    'anthropic-ratelimit-unified-status': 'rejected',
+    'anthropic-ratelimit-unified-reset': String(at),
+  };
+  if (claim) headers['anthropic-ratelimit-unified-representative-claim'] = claim;
+  const message = otherModels
+    ? `${model} is used up on all ${total} accounts until ${when} (${label} first). Other models still work: switch with /model.`
+    : `All ${total} accounts are used up until ${when} (${label} first). Send your prompt again after that.`;
+  return { headers, body: JSON.stringify({ type: 'error', error: { type: 'rate_limit_error', message } }) };
+}
+
 /** Highest utilization among the windows a request for `model` draws from (0-1). */
 export function usageScore(acctState, model = null) {
   if (!acctState) return 0;
@@ -217,7 +287,9 @@ export function createAccountStateManager() {
     if (rl.fiveH) { next.utilization5h = rl.fiveH.utilization; next.resetAt = rl.fiveH.reset; }
     if (rl.sevenD) { next.utilization7d = rl.sevenD.utilization; next.resetAt7d = rl.sevenD.reset; }
     if (rl.sevenDOI) { next.utilization7dOI = rl.sevenDOI.utilization; next.resetAt7dOI = rl.sevenDOI.reset; }
-    const until = rl.reset > nowSec ? rl.reset : 0;
+    // The claim's reset, else the 429's own retry-after
+    const retryAfter = Number(headers['retry-after']) || 0;
+    const until = rl.reset > nowSec ? rl.reset : (retryAfter > 0 ? nowSec + Math.ceil(retryAfter) : 0);
     const family = MODEL_CLAIMS[rl.claim];
     if (family) {
       next.modelLimits = { ...(prev.modelLimits || {}), [family]: until || nowSec + 3600 };
@@ -940,6 +1012,53 @@ export function createPerAccountLock() {
   }
 
   return { withLock };
+}
+
+/**
+ * A request failed (401/400) on `staleToken`. When the stored token is a different one that has
+ * not expired, an earlier refresh already replaced it: returns that token to retry with.
+ * Refreshing again would revoke it under every other request that just picked it up, and a run
+ * of such refreshes ends with the refresh token rejected and the account taken for dead.
+ */
+export function newerStoredToken(stored, staleToken, now = Date.now()) {
+  const t = stored?.accessToken;
+  if (!staleToken || !t || t === staleToken) return null;
+  if (stored.expiresAt && stored.expiresAt <= now) return null;
+  return t;
+}
+
+// ─────────────────────────────────────────────────
+// Login vs route
+// ─────────────────────────────────────────────────
+//
+// The keychain holds Claude Code's own login. Its Artifact tool and claude.ai connectors call
+// Anthropic with that login directly, not through the proxy, so moving the login makes what the
+// old login owns (its artifacts) unreachable. A used-up limit therefore only moves the route:
+// the account the proxy sends new requests to. The login moves when its token dies or the user
+// switches by hand.
+
+/**
+ * The route pointer. `resolve` returns the route account's name, or null for "the login
+ * account". A new login (claude /login, `vdm switch`) or a removed account clears it.
+ */
+export function createRoute() {
+  let name = null;  // route account; null = the login account
+  let login = null; // the login account when the route was set
+  return {
+    resolve(accountNames, loginName) {
+      if (!name) return null;
+      // Login unknown (its token is in no account file yet): keep the route
+      if (loginName && login && loginName !== login) name = null;
+      else if (!accountNames.includes(name)) name = null;
+      if (name && loginName && !login) login = loginName;
+      return name;
+    },
+    set(target, loginName) {
+      name = target && target !== loginName ? target : null;
+      if (loginName) login = loginName;
+    },
+    reset() { name = null; },
+  };
 }
 
 // ─────────────────────────────────────────────────

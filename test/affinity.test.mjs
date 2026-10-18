@@ -94,6 +94,14 @@ describe('createAccountStateManager (unified headers)', () => {
     assert.equal(isAccountAvailable('t', 0, sm, (NOW_S + 7201) * 1000), true);
   });
 
+  it('markRejected without a reset header blocks for the 429 retry-after', () => {
+    const sm = createAccountStateManager();
+    const r = sm.markRejected('t', 'a', { ...H({ status: 'rejected', 'representative-claim': 'five_hour' }), 'retry-after': '3600' }, NOW);
+    assert.equal(r.until, NOW_S + 3600);
+    const r2 = createAccountStateManager().markRejected('t', 'a', H({ status: 'rejected' }), NOW);
+    assert.equal(r2.until, NOW_S + 300); // nothing known: short back-off
+  });
+
   it('a later Fable reading below 100% clears the Fable block', () => {
     const sm = createAccountStateManager();
     sm.markRejected('t', 'a', H({ status: 'rejected', 'representative-claim': 'seven_day_overage_included', reset: NOW_S + 3600 }), NOW);

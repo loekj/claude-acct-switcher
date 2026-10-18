@@ -470,6 +470,15 @@ cmd_switch() {
     return 1
   fi
 
+  # A running dashboard does the switch: it also moves its request route and the sessions
+  # (the login can already be this account while requests run on another)
+  if curl -s --max-time 3 -X POST "http://localhost:$DASHBOARD_PORT/api/switch" \
+       -H 'Content-Type: application/json' -d "{\"name\":\"$name\"}" 2>/dev/null | grep -q '"ok":true'; then
+    echo -e "${GREEN}✓${NC} Switched to ${BOLD}$name${NC}"
+    echo -e "${DIM}  All Claude Code sessions will use this account on their next API call.${NC}"
+    return 0
+  fi
+
   # Check if already active
   local active_fp=$(get_active_fingerprint 2>/dev/null)
   local target_fp=$(get_profile_fingerprint "$file" 2>/dev/null)
