@@ -256,6 +256,7 @@ import {
   createBalanceLimiter,
   parseRateLimitHeaders,
   modelFamily,
+  liveUtil,
   createSessionStore,
   sessionAffinity,
   sessionLabel,
@@ -351,6 +352,9 @@ function fetchAccountEmail(token) {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
+        // '' = the server answered without an email; null = no real answer (no network,
+        // server error, busy), so the caller waits and asks again
+        if (res.statusCode >= 500 || res.statusCode === 429) { resolve(null); return; }
         try {
           const d = JSON.parse(data);
           const name = d.organization_name || '';
@@ -359,8 +363,8 @@ function fetchAccountEmail(token) {
         } catch { resolve(''); }
       });
     });
-    req.on('error', () => resolve(''));
-    req.on('timeout', () => { req.destroy(); resolve(''); });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
     req.end();
   });
 }
@@ -369,14 +373,16 @@ function fetchAccountEmail(token) {
 const emailCache = new Map(); // fingerprint -> { email, fetchedAt }
 const EMAIL_CACHE_TTL = 5 * 60 * 1000; // 5 minutes
 
+const EMAIL_RETRY_MS = 60 * 1000;     // a failed lookup (dead login, no network) waits this long
+
 async function getEmailForToken(token, fp) {
   const cached = emailCache.get(fp);
-  if (cached && Date.now() - cached.fetchedAt < EMAIL_CACHE_TTL) {
+  if (cached && Date.now() - cached.fetchedAt < (cached.email ? EMAIL_CACHE_TTL : EMAIL_RETRY_MS)) {
     return cached.email;
   }
-  const email = await fetchAccountEmail(token);
-  if (email) emailCache.set(fp, { email, fetchedAt: Date.now() });
-  return email;
+  const got = await fetchAccountEmail(token);
+  emailCache.set(fp, { email: got || '', answered: got !== null, fetchedAt: Date.now() });
+  return got || '';
 }
 
 // ─────────────────────────────────────────────────
@@ -405,13 +411,38 @@ function logActivity(type, detail = {}) {
   const cutoff = Date.now() - ACTIVITY_MAX_AGE;
   while (activityLog.length > 0 && activityLog[activityLog.length - 1].ts < cutoff) activityLog.pop();
   if (activityLog.length > ACTIVITY_MAX_ENTRIES) activityLog.length = ACTIVITY_MAX_ENTRIES;
-  // Persist async  - fire and forget
-  writeFile(ACTIVITY_LOG_FILE, JSON.stringify(activityLog)).catch(() => {});
+  saveActivitySoon();
+}
+
+// One write at a time, through a temp file: two overlapping writes once left extra text
+// at the end of the file, and the whole log was lost at the next start.
+let _activitySaveTimer = null;
+function saveActivitySoon() {
+  if (_activitySaveTimer) return;
+  _activitySaveTimer = setTimeout(writeActivityFile, 250);
+  _activitySaveTimer.unref?.();
+}
+function writeActivityFile() {
+  clearTimeout(_activitySaveTimer);
+  _activitySaveTimer = null;
+  try {
+    writeFileSync(ACTIVITY_LOG_FILE + '.tmp', JSON.stringify(activityLog));
+    renameSync(ACTIVITY_LOG_FILE + '.tmp', ACTIVITY_LOG_FILE);
+  } catch {}
 }
 
 // Check if the current keychain creds match a saved profile.
 // If not, auto-save them as a new account.
-async function autoDiscoverAccount() {
+let _discoverWait = { fp: null, answeredSince: 0 };
+const DISCOVER_NAMELESS_AFTER_MS = Number(process.env.CSW_DISCOVER_NAMELESS_MS) || 10 * 60 * 1000; // env: tests
+// One run at a time: two requests at once both saw an unknown login and saved it twice.
+let _discoverRun = null;
+function autoDiscoverAccount() {
+  if (!_discoverRun) _discoverRun = discoverAccountOnce().finally(() => { _discoverRun = null; });
+  return _discoverRun;
+}
+
+async function discoverAccountOnce() {
   const creds = readKeychain();
   if (!creds?.claudeAiOauth?.accessToken) return;
   const fp = getFingerprint(creds);
@@ -472,7 +503,22 @@ async function autoDiscoverAccount() {
     } catch { /* skip */ }
   }
 
-  // Truly new account  - save it
+  // Truly new account  - save it. Without its email it may be a known account whose
+  // lookup failed (no network after waking up): wait, the next request asks again.
+  // A nameless copy would only turn into a dead "auto-N" card later.
+  // If the server keeps answering without an email (not a network problem), save it
+  // without a name after 10 minutes, so the account is still used.
+  const scopes = creds.claudeAiOauth.scopes;
+  if (!email && (!Array.isArray(scopes) || scopes.includes('user:profile'))) {
+    if (_discoverWait.fp !== fp) {
+      _discoverWait = { fp, answeredSince: 0 };
+      console.log('[auto-discover] New login, but its email lookup failed: waiting before saving it');
+    }
+    const answered = emailCache.get(fp)?.answered === true;
+    if (answered && !_discoverWait.answeredSince) _discoverWait.answeredSince = Date.now();
+    if (!answered || Date.now() - _discoverWait.answeredSince < DISCOVER_NAMELESS_AFTER_MS) return;
+    console.log('[auto-discover] The server gives no email for this login: saving it without a name');
+  }
   let idx = 1;
   while (existsSync(join(ACCOUNTS_DIR, `auto-${idx}.json`))) idx++;
 
@@ -762,6 +808,7 @@ async function loadProfiles() {
   }
 
   const profiles = [];
+  const refreshOf = new Map(); // name → refresh token (for the dedup pass; never sent out)
   for (const file of files) {
     const name = basename(file, '.json');
     try {
@@ -769,6 +816,7 @@ async function loadProfiles() {
       const creds = JSON.parse(raw);
       const oauth = creds.claudeAiOauth || {};
       const fp = getFingerprint(creds);
+      if (oauth.refreshToken) refreshOf.set(name, oauth.refreshToken);
 
       // Resolve display name: try live API, then persisted .label file, then account name
       let email = '';
@@ -778,6 +826,10 @@ async function loadProfiles() {
       }
       if (!email) {
         try { email = (await readFile(join(ACCOUNTS_DIR, `${name}.label`), 'utf8')).trim(); } catch {}
+      }
+      if (!email) {
+        // Learned later (rememberAccountEmail writes only .email)
+        try { email = (await readFile(join(ACCOUNTS_DIR, `${name}.email`), 'utf8')).trim(); } catch {}
       }
 
       const isLogin = fp === activeFp;               // Claude Code's own login (keychain)
@@ -867,47 +919,70 @@ async function loadProfiles() {
     }
   }
 
-  // Dedup pass: if two profiles resolved to the same email, keep the one with
-  // the newest expiresAt and remove the other from disk. This handles duplicates
-  // created when autoDiscover ran while email fetch was failing.
-  const seen = new Map(); // email → profile index
-  const toRemove = [];
+  // Dedup pass: two profiles with the same email or the same refresh token are one
+  // account (copies made while the email lookup failed). Keep the one with the newest
+  // expiresAt and remove the other from disk.
+  const seen = new Map(); // 'email:…' / 'rt:…' → profile index
+  const toRemove = new Set();
+  const removeFiles = (loser, why) => {
+    try {
+      unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.json`));
+      try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.label`)); } catch {}
+      try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.email`)); } catch {}
+      log('dedup', `Removed account "${loser.name}": ${why}`);
+      return true;
+    } catch (e) {
+      log('warn', `Failed to remove account file "${loser.name}": ${e.message}`);
+      return false;
+    }
+  };
   for (let i = 0; i < profiles.length; i++) {
     const p = profiles[i];
-    // Only dedup by real email labels (skip bare account names like "auto-1")
-    if (!p.label || p.label === p.name) continue;
-    const prev = seen.get(p.label);
-    if (prev !== undefined) {
-      const prevP = profiles[prev];
-      // Keep the one with the newer expiresAt; on tie, keep the active one
-      const keepNew = (p.expiresAt > prevP.expiresAt) || (p.expiresAt === prevP.expiresAt && p.isActive);
-      const loserIdx = keepNew ? prev : i;
-      const loser = profiles[loserIdx];
-      toRemove.push(loserIdx);
-      try {
-        unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.json`));
-        try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.label`)); } catch {}
-        try { unlinkSync(join(ACCOUNTS_DIR, `${loser.name}.email`)); } catch {}
-        sessionStore.renameAccount(loser.name, keepNew ? p.name : prevP.name);
-        markSessionsDirty();
-        log('dedup', `Removed duplicate account "${loser.name}" (same email as "${keepNew ? p.name : prevP.name}")`);
-      } catch (e) {
-        log('warn', `Failed to remove duplicate account file "${loser.name}": ${e.message}`);
-      }
-      if (keepNew) seen.set(p.label, i);
-    } else {
-      seen.set(p.label, i);
+    const rt = refreshOf.get(p.name);
+    // Only real email labels count (skip bare account names like "auto-1")
+    const keys = [rt && `rt:${rt}`, p.label && p.label !== p.name && `email:${p.label}`].filter(Boolean);
+    const prev = keys.map(k => seen.get(k)).find(x => x !== undefined && !toRemove.has(x));
+    if (prev === undefined) { keys.forEach(k => seen.set(k, i)); continue; }
+    const prevP = profiles[prev];
+    // Keep the one with the newer expiresAt; on tie, keep the active one. Never remove the login.
+    let keepNew = (p.expiresAt > prevP.expiresAt) || (p.expiresAt === prevP.expiresAt && p.isActive);
+    if (p.isLogin) keepNew = true; else if (prevP.isLogin) keepNew = false;
+    const loserIdx = keepNew ? prev : i;
+    const loser = profiles[loserIdx], winner = keepNew ? p : prevP;
+    if (removeFiles(loser, `same account as "${winner.name}"`)) {
+      sessionStore.renameAccount(loser.name, winner.name);
+      markSessionsDirty();
+      toRemove.add(loserIdx);
     }
+    if (keepNew) keys.forEach(k => seen.set(k, i));
   }
-  if (toRemove.length > 0) {
+
+  // A nameless account ("auto-N", no email in .label or .email) whose login is expired and
+  // whose refresh token the OAuth server rejected (invalid_grant, for 30 minutes: not one odd
+  // answer) can never work again, and nothing tells which account it was: remove it.
+  // Logging in again with /login adds that account back, with its email.
+  for (let i = 0; i < profiles.length; i++) {
+    const p = profiles[i];
+    if (toRemove.has(i) || p.label !== p.name || p.isLogin || p.isActive) continue;
+    const since = p.refreshFailed?.rejectedSince || 0;
+    const dead = p.expiresAt && p.expiresAt < Date.now() && since && Date.now() - since >= DEAD_LOGIN_AFTER_MS;
+    if (!dead || !removeFiles(p, 'nameless login that can no longer refresh')) continue;
+    sessionStore.unpinAccount(p.name);
+    markSessionsDirty();
+    refreshFailures.delete(p.name);
+    logActivity('account-removed', { name: p.name, reason: 'dead-login' });
+    toRemove.add(i);
+  }
+
+  if (toRemove.size > 0) {
     invalidateAccountsCache();
-    // Return profiles with duplicates removed
-    const removeSet = new Set(toRemove);
-    return profiles.filter((_, i) => !removeSet.has(i));
+    return profiles.filter((_, i) => !toRemove.has(i));
   }
 
   return profiles;
 }
+
+const DEAD_LOGIN_AFTER_MS = Number(process.env.CSW_DEAD_LOGIN_MS) || 30 * 60 * 1000; // env: tests
 
 // ─────────────────────────────────────────────────
 // API handlers
@@ -1616,8 +1691,9 @@ function renderHTML() {
   .rate-bars {
     display: grid;
     grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
-    gap: 3rem;
+    column-gap: 3rem;
   }
+  .rate-row2 { margin-top: 0.5rem; }
   .rate-group {}
   .rate-head {
     display: flex;
@@ -1668,6 +1744,7 @@ function renderHTML() {
     font-variant-numeric: tabular-nums;
     white-space: nowrap;
   }
+  .rate-fresh { color: var(--green); cursor: help; }
 
   .switch-btn {
     padding: 0.5rem 1.125rem;
@@ -1874,6 +1951,7 @@ function renderHTML() {
   .hist-row:hover, .hist-row:focus-visible { border-color: var(--primary); outline: none; }
   .hist-row.sel { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
   .hist-top { display: flex; align-items: center; gap: 0.5rem; }
+  .hbtn.hist-copy { padding: 0.1875rem 0.5rem; font-size: 0.75rem; flex-shrink: 0; white-space: nowrap; }
   .hist-title { flex: 1; min-width: 0; font-weight: 600; font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .hist-sub { font-size: 0.75rem; color: var(--muted); margin-top: 0.125rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .hist-text { font-size: 0.8125rem; margin-top: 0.375rem; line-height: 1.45; color: var(--foreground); overflow: hidden; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-word; }
@@ -1991,10 +2069,6 @@ function renderHTML() {
   }
   .blocked-banner .muted { color: var(--muted); font-weight: 400; }
   .blocked-banner.model { background: var(--yellow-soft); border-color: var(--yellow-border); color: hsl(32 80% 38%); }
-  /* Fable's own weekly limit, on the countdown line of the weekly column */
-  .rate-sub { display: flex; align-items: center; gap: 0.375rem; flex: 0 1 55%; min-width: 0; font-size: 0.6875rem; color: var(--muted); }
-  .rate-sub .rate-track { flex: 1; min-width: 1.5rem; height: 3px; }
-  .rate-sub .rate-pct { font-size: 0.6875rem; white-space: nowrap; }
 
   /* ── Sessions tab ── */
   .sess-toolbar { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; flex-wrap: wrap; }
@@ -2894,10 +2968,14 @@ function pctClass(pct) {
   return 'pct-ok';
 }
 
+// A limit window whose reset time has passed: it is over, and the next request starts a new one.
+const FRESH_TEXT = 'Fresh: starts when used';
+const FRESH_TITLE = 'The last window ended, so this limit is empty again. A new window starts with the next request. Use outside vdm (claude.ai, other computers) shows here after vdm sends a request.';
+
 function formatTimeLeft(resetUnix) {
-  if (!resetUnix) return 'rolling window';
+  if (!resetUnix) return 'Not started';
   const diff = resetUnix - Math.floor(Date.now() / 1000);
-  if (diff <= 0) return 'resetting...';
+  if (diff <= 0) return FRESH_TEXT;
   const h = Math.floor(diff / 3600);
   const m = Math.floor((diff % 3600) / 60);
   if (h > 24) return Math.floor(h/24) + 'd ' + (h%24) + 'h left';
@@ -3273,15 +3351,19 @@ function renderAccounts(profiles, animate, balanceMode, balanceCap) {
   tickCountdowns();
 }
 
-// One limit window. 'side' sits on the countdown line (Fable's own weekly bar), so both
-// columns keep the same height and their charts line up.
-function rateGroup(label, util, reset, side, chart) {
-  var pct = Math.round(util * 100);
-  return '<div class="rate-group">' +
-    '<div class="rate-head"><span class="rate-label">' + label + '</span><span class="rate-pct ' + pctClass(pct) + '">' + pct + '%</span></div>' +
-    '<div class="rate-track"><div class="rate-fill ' + fillClass(util) + '" style="width:' + Math.min(pct, 100) + '%"></div></div>' +
-    '<div class="rate-foot"><span class="rate-reset" data-reset="' + reset + '"></span>' + (side || '') + '</div>' +
-    (chart || '') +
+// One limit window: name and percent, bar, countdown. Once the reset time has passed, the
+// window is over: the account is fresh and its next request starts a new window.
+function rateGroup(label, util, reset, opts) {
+  opts = opts || {};
+  var ended = !opts.usedUp && reset && reset <= Date.now() / 1000;
+  var pct = opts.usedUp ? 100 : ended ? 0 : Math.round(util * 100);
+  var foot = ended
+    ? '<span class="rate-reset rate-fresh" title="' + FRESH_TITLE + '">' + FRESH_TEXT + '</span>'
+    : '<span class="rate-reset" data-reset="' + reset + '"></span>';
+  return '<div class="rate-group' + (opts.cls ? ' ' + opts.cls : '') + '"' + (opts.title ? ' title="' + opts.title + '"' : '') + '>' +
+    '<div class="rate-head"><span class="rate-label">' + label + '</span><span class="rate-pct ' + pctClass(pct) + '">' + (opts.usedUp ? 'used up' : pct + '%') + '</span></div>' +
+    '<div class="rate-track"><div class="rate-fill ' + fillClass(pct / 100) + '" style="width:' + Math.min(pct, 100) + '%"></div></div>' +
+    '<div class="rate-foot">' + foot + '</div>' +
   '</div>';
 }
 
@@ -3296,20 +3378,21 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
     var tp = p.throughput || {};
     var spark5h = renderUsageChart(tp.day, 24*60*60*1000, 'hours', CHART_SCALE.day, 'hot-' + i + '-d');
     var spark7d = renderUsageChart(tp.week, 7*24*60*60*1000, 'days', CHART_SCALE.week, 'hot-' + i + '-w');
-    // Fable has its own weekly bucket (only on accounts whose responses carry it)
-    var fable = '';
+    // A grid: the bars, then (on accounts with its own weekly bucket) Fable under Weekly,
+    // then the charts, so both charts start at the same height.
+    var cells = [
+      rateGroup('5h window', rl.fiveH.utilization, rl.fiveH.reset),
+      rateGroup('Weekly', rl.sevenD.utilization, rl.sevenD.reset),
+    ];
     if (rl.sevenDOI) {
-      var blocked = rl.fableBlockedUntil && rl.fableBlockedUntil > Date.now() / 1000;
-      var o = blocked ? 100 : Math.round(rl.sevenDOI.utilization * 100);
-      fable = '<div class="rate-sub" title="Fable has its own weekly limit on this account. When it is used up, only Fable requests move to another account.">' +
-        '<span>Fable</span>' +
-        '<div class="rate-track"><div class="rate-fill ' + fillClass(o / 100) + '" style="width:' + Math.min(o, 100) + '%"></div></div>' +
-        '<span class="rate-pct ' + pctClass(o) + '">' + (blocked ? 'used up' : o + '%') + '</span></div>';
+      var fableUntil = rl.fableBlockedUntil && rl.fableBlockedUntil > Date.now() / 1000 ? rl.fableBlockedUntil : 0;
+      cells.push('<div></div>', rateGroup('Fable weekly', rl.sevenDOI.utilization, fableUntil || rl.sevenDOI.reset, {
+        usedUp: !!fableUntil, cls: 'rate-row2',
+        title: 'Fable has its own weekly limit on this account. When it is used up, only Fable requests move to another account.',
+      }));
     }
-    barsHtml = '<div class="rate-bars">' +
-      rateGroup('5h window', rl.fiveH.utilization, rl.fiveH.reset, '', spark5h) +
-      rateGroup('Weekly', rl.sevenD.utilization, rl.sevenD.reset, fable, spark7d) +
-    '</div>';
+    cells.push('<div>' + spark5h + '</div>', '<div>' + spark7d + '</div>');
+    barsHtml = '<div class="rate-bars">' + cells.join('') + '</div>';
   } else if (p.dormant) {
     barsHtml = '<div style="font-size:0.8125rem;color:var(--cyan);margin-top:0.25rem;font-weight:500">Dormant: its limit windows have not started</div>';
   } else {
@@ -3399,6 +3482,7 @@ function evtMsg(e) {
     case 'auth-expired': return '<b>' + (e.account||'?') + '</b> token expired';
     case 'all-exhausted': return 'All accounts exhausted';
     case 'account-discovered': return 'Discovered <b>' + (e.label||e.name||'?') + '</b>';
+    case 'account-removed': return 'Removed <b>' + escHtml(e.name||'?') + '</b>' + (e.reason === 'dead-login' ? ': a nameless login that can no longer refresh' : '');
     case 'account-renamed': return 'Renamed <b>' + (e.name||'?') + '</b> to <b>' + (e.label||'?') + '</b>';
     case 'settings-changed': return 'Settings updated';
     case 'upgrade': return 'Upgraded to <b>' + (e.to||'?') + '</b>';
@@ -3464,7 +3548,7 @@ function renderActivity(log) {
 function tickCountdowns() {
   document.querySelectorAll('[data-reset]').forEach(el => {
     const t = formatTimeLeft(Number(el.dataset.reset));
-    el.textContent = el.dataset.short ? t.replace(/ left$/, '') : t;
+    el.textContent = el.dataset.short ? (t === FRESH_TEXT ? 'a moment' : t.replace(/ left$/, '')) : t;
   });
   document.querySelectorAll('[data-ago]').forEach(el => {
     el.textContent = timeAgo(Number(el.dataset.ago));
@@ -4215,9 +4299,12 @@ function histRow(s) {
   var text = s.snippet ? histSnippet(s.snippet) : (s.firstPrompt ? '“' + escHtml(s.firstPrompt) + '”' : '<span style="color:var(--muted)">No messages</span>');
   var last = !s.snippet && s.lastPrompt && s.lastPrompt !== s.firstPrompt ? '<div class="hist-last">Last: “' + escHtml(s.lastPrompt) + '”</div>' : '';
   var chips = s.topFiles.map(function(f) { return '<span class="hist-chip" title="' + escHtml(f) + '">' + escHtml(baseName(f)) + '</span>'; }).join('');
+  // Copy the resume command straight from the list (no full copy saved: nothing to resume)
+  var copy = s.resume && (s.original || s.rawMode !== 'none')
+    ? '<button class="hbtn hist-copy" data-id="' + s.id + '" title="' + escHtml(s.resume) + '" onclick="event.stopPropagation(); histCopyResume(this.dataset.id)" onkeydown="event.stopPropagation()">Copy resume</button>' : '';
   return '<div class="hist-row' + (HIST.open === s.id ? ' sel' : '') + '" tabindex="0" data-id="' + s.id + '" data-seq="' + (s.hitSeq == null ? '' : s.hitSeq) + '" onclick="histOpen(this.dataset.id, this.dataset.seq)" onkeydown="if (event.key === &quot;Enter&quot;) histOpen(this.dataset.id, this.dataset.seq)">' +
     '<div class="hist-top"><span class="hist-title" title="' + escHtml(s.title) + '">' + escHtml(s.title) + '</span>' + badges +
-      '<span class="sess-meta">' + agoSpan(s.lastAt) + '</span></div>' +
+      '<span class="sess-meta">' + agoSpan(s.lastAt) + '</span>' + copy + '</div>' +
     '<div class="hist-sub">' + escHtml(where || s.cwd) + ' · ' + s.userTurns + (s.userTurns === 1 ? ' message' : ' messages') + '</div>' +
     '<div class="hist-text">' + text + '</div>' + last +
     (chips ? '<div class="hist-chips">' + chips + '</div>' : '') +
@@ -4505,6 +4592,22 @@ async function histCopyPrompt() {
     } catch (e) { showToast('Could not write the handoff'); return; }
   }
   histCopy(HIST.handoff.prompt, 'Prompt copied: paste it into a new Claude session');
+}
+
+// The list's Copy button. The copy happens first, while the click still counts (browsers
+// refuse a copy after a slow request). A session Claude Code deleted is then put back.
+async function histCopyResume(id) {
+  var s = HIST.rows.find(function(r) { return r.id === id; });
+  if (!s || !s.resume) return;
+  await histCopy(s.resume, s.original ? 'Command copied: run it in a terminal' : 'Command copied. Putting the session file back…');
+  if (s.original) return;
+  try {
+    var r = await fetch('/api/history/' + id + '/restore', { method: 'POST' });
+    var x = await r.json();
+    if (!r.ok) { showToast(x.error || 'Restore failed: the command will not work yet'); return; }
+    s.original = true;
+    showToast('Ready: run the copied command in a terminal');
+  } catch (e) { showToast('Restore failed: the command will not work yet'); }
 }
 
 async function histResume() {
@@ -5768,7 +5871,12 @@ async function refreshAccountToken(accountName, { force = false, staleToken = nu
 
     if (!result.ok) {
       log('refresh', `${accountName}: refresh failed after retries: ${result.error}`);
-      refreshFailures.set(accountName, { error: result.error, retriable: !!result.retriable, ts: Date.now(), fp: oldFp });
+      const prevFail = refreshFailures.get(accountName);
+      refreshFailures.set(accountName, {
+        error: result.error, retriable: !!result.retriable, ts: Date.now(), fp: oldFp,
+        // first time the OAuth server rejected this token (invalid_grant), for the dead-login cleanup
+        rejectedSince: result.rejected ? (prevFail?.rejectedSince && prevFail.fp === oldFp ? prevFail.rejectedSince : Date.now()) : 0,
+      });
       logActivity('refresh-failed', { account: accountLabel, error: result.error, retriable: !!result.retriable });
       return { ok: false, error: result.error };
     }
@@ -7268,7 +7376,7 @@ async function sendKeepWarmPing(l, snap, acct) {
 function nearLimit(acct) {
   const st = accountState.get(acct.token);
   if (!st) return false;
-  return (st.utilization5h || 0) >= KEEP_WARM_NEAR_LIMIT.fiveH || (st.utilization7d || 0) >= KEEP_WARM_NEAR_LIMIT.sevenD;
+  return liveUtil(st.utilization5h, st.resetAt) >= KEEP_WARM_NEAR_LIMIT.fiveH || liveUtil(st.utilization7d, st.resetAt7d) >= KEEP_WARM_NEAR_LIMIT.sevenD;
 }
 
 /** Every 20 s: notice closed sessions (learning), then send the pings that are due. */
@@ -8385,6 +8493,7 @@ function shutdown(signal) {
   try { saveSessions(true); } catch {}
   try { if (_historyDirty) writeHistoryFile(); } catch {}
   try { if (_throughputDirty) writeThroughputFile(); } catch {}
+  if (_activitySaveTimer) writeActivityFile();
   try { saveCacheCare(true); } catch {}
   if (_artifactLinksDirty) try { saveArtifacts(); } catch {}
   try { stopHistory(); } catch {}

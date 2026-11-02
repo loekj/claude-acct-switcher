@@ -32,6 +32,10 @@ import {
   usedUpAnswer,
   formatResetAt,
   createPerAccountLock,
+  liveUtil,
+  usageScore,
+  scoreAccountConserve,
+  pickConserve,
 } from '../lib.mjs';
 
 // ─────────────────────────────────────────────────
@@ -1005,5 +1009,48 @@ describe('formatResetAt', () => {
   it('time only within a day, weekday after', () => {
     assert.match(formatResetAt(now / 1000 + 3600, now), /^\d{2}:\d{2}$/);
     assert.match(formatResetAt(now / 1000 + 3 * 86400, now), /^[A-Z][a-z]{2} \d{2}:\d{2}$/);
+  });
+});
+
+// ─────────────────────────────────────────────────
+// A window whose reset time has passed is over (fresh)
+// ─────────────────────────────────────────────────
+
+describe('liveUtil and ended windows', () => {
+  const now = 1_800_000_000;
+  const sm = (states) => ({ get: (t) => states[t] });
+
+  it('is 0 once the reset time has passed, else the stored value', () => {
+    assert.equal(liveUtil(1, now - 1, now), 0);
+    assert.equal(liveUtil(1, now, now), 0);
+    assert.equal(liveUtil(0.7, now + 60, now), 0.7);
+    assert.equal(liveUtil(0.3, 0, now), 0.3);   // reset unknown: keep the reading
+    assert.equal(liveUtil(undefined, now + 60, now), 0);
+  });
+
+  it('usageScore ignores ended windows', () => {
+    const st = { utilization5h: 0.9, resetAt: now - 10, utilization7d: 0.4, resetAt7d: now + 1000, utilization7dOI: 1, resetAt7dOI: now - 5 };
+    assert.equal(usageScore(st, null, now * 1000), 0.4);
+    assert.equal(usageScore(st, 'claude-fable-5-1', now * 1000), 0.4);
+  });
+
+  it('conserve keeps a fresh week for later instead of picking it first', () => {
+    const t = Math.floor(Date.now() / 1000);
+    const states = {
+      ended: { utilization7d: 1, resetAt7d: t - 3600, utilization5h: 0, resetAt: 0 },   // last week was full, now fresh
+      busy: { utilization7d: 0.5, resetAt7d: t + 86400, utilization5h: 0.2, resetAt: t + 3600 },
+    };
+    assert.equal(scoreAccountConserve('ended', sm(states)), 0);
+    const accounts = [{ name: 'ended', token: 'ended' }, { name: 'busy', token: 'busy' }];
+    assert.equal(pickConserve(accounts, sm(states)).name, 'busy');
+  });
+});
+
+describe('parseRefreshResponse: rejected refresh token', () => {
+  it('marks only invalid_grant as rejected', () => {
+    assert.equal(parseRefreshResponse(400, '{"error":"invalid_grant","error_description":"Refresh token not found or invalid"}').rejected, true);
+    assert.equal(parseRefreshResponse(403, '<html>blocked</html>').rejected, false);
+    assert.equal(parseRefreshResponse(400, '{"error":"invalid_request"}').rejected, false);
+    assert.equal(parseRefreshResponse(503, '{"error":"invalid_grant"}').rejected, false);
   });
 });
