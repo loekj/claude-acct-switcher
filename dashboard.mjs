@@ -244,7 +244,7 @@ function writeKeychain(creds) {
 }
 
 import https from 'node:https';
-import { execFile, fork } from 'node:child_process';
+import { execFile, fork, spawn } from 'node:child_process';
 import { setPriority, userInfo } from 'node:os';
 import { createReadStream } from 'node:fs';
 import zlib from 'node:zlib';
@@ -360,6 +360,9 @@ function fetchAccountEmail(token) {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
+        // '' = the server answered without an email; null = no real answer (no network,
+        // server error, busy), so the caller waits and asks again
+        if (res.statusCode >= 500 || res.statusCode === 429) { resolve(null); return; }
         try {
           const d = JSON.parse(data);
           const name = d.organization_name || '';
@@ -368,8 +371,8 @@ function fetchAccountEmail(token) {
         } catch { resolve(''); }
       });
     });
-    req.on('error', () => resolve(''));
-    req.on('timeout', () => { req.destroy(); resolve(''); });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
     req.end();
   });
 }
@@ -385,9 +388,9 @@ async function getEmailForToken(token, fp) {
   if (cached && Date.now() - cached.fetchedAt < (cached.email ? EMAIL_CACHE_TTL : EMAIL_RETRY_MS)) {
     return cached.email;
   }
-  const email = await fetchAccountEmail(token);
-  emailCache.set(fp, { email, fetchedAt: Date.now() });
-  return email;
+  const got = await fetchAccountEmail(token);
+  emailCache.set(fp, { email: got || '', answered: got !== null, fetchedAt: Date.now() });
+  return got || '';
 }
 
 // ─────────────────────────────────────────────────
@@ -438,7 +441,8 @@ function writeActivityFile() {
 
 // Check if the current keychain creds match a saved profile.
 // If not, auto-save them as a new account.
-let _discoverWaitFp = null;
+let _discoverWait = { fp: null, answeredSince: 0 };
+const DISCOVER_NAMELESS_AFTER_MS = Number(process.env.CSW_DISCOVER_NAMELESS_MS) || 10 * 60 * 1000; // env: tests
 // One run at a time: two requests at once both saw an unknown login and saved it twice.
 let _discoverRun = null;
 function autoDiscoverAccount() {
@@ -510,11 +514,18 @@ async function discoverAccountOnce() {
   // Truly new account  - save it. Without its email it may be a known account whose
   // lookup failed (no network after waking up): wait, the next request asks again.
   // A nameless copy would only turn into a dead "auto-N" card later.
+  // If the server keeps answering without an email (not a network problem), save it
+  // without a name after 10 minutes, so the account is still used.
   const scopes = creds.claudeAiOauth.scopes;
   if (!email && (!Array.isArray(scopes) || scopes.includes('user:profile'))) {
-    if (_discoverWaitFp !== fp) console.log('[auto-discover] New login, but its email lookup failed: waiting before saving it');
-    _discoverWaitFp = fp;
-    return;
+    if (_discoverWait.fp !== fp) {
+      _discoverWait = { fp, answeredSince: 0 };
+      console.log('[auto-discover] New login, but its email lookup failed: waiting before saving it');
+    }
+    const answered = emailCache.get(fp)?.answered === true;
+    if (answered && !_discoverWait.answeredSince) _discoverWait.answeredSince = Date.now();
+    if (!answered || Date.now() - _discoverWait.answeredSince < DISCOVER_NAMELESS_AFTER_MS) return;
+    console.log('[auto-discover] The server gives no email for this login: saving it without a name');
   }
   let idx = 1;
   while (existsSync(join(ACCOUNTS_DIR, `auto-${idx}.json`))) idx++;
@@ -792,7 +803,9 @@ async function getRateLimitsForToken(token, fp, { allowProbe = true } = {}) {
 // Data loaders
 // ─────────────────────────────────────────────────
 
-async function loadProfiles() {
+// light: only what is known already (no rate-limit probes, no email lookups). The menu bar
+// icon polls with it all day; a full load would send probe requests on idle accounts.
+async function loadProfiles({ light = false } = {}) {
   const activeCreds = readKeychain();
   const activeFp = activeCreds ? getFingerprint(activeCreds) : '';
   const routeName = routeAccount()?.name || null;
@@ -817,12 +830,16 @@ async function loadProfiles() {
 
       // Resolve display name: try live API, then persisted .label file, then account name
       let email = '';
-      if (oauth.accessToken) {
+      if (oauth.accessToken && !light) {
         email = await getEmailForToken(oauth.accessToken, fp);
         rememberAccountEmail(name, email);
       }
       if (!email) {
         try { email = (await readFile(join(ACCOUNTS_DIR, `${name}.label`), 'utf8')).trim(); } catch {}
+      }
+      if (!email) {
+        // Learned later (rememberAccountEmail writes only .email)
+        try { email = (await readFile(join(ACCOUNTS_DIR, `${name}.email`), 'utf8')).trim(); } catch {}
       }
 
       const isLogin = fp === activeFp;               // Claude Code's own login (keychain)
@@ -859,7 +876,7 @@ async function loadProfiles() {
           // else: no state at all  - probe once to discover
         }
 
-        rateLimits = await getRateLimitsForToken(oauth.accessToken, fp, { allowProbe });
+        rateLimits = await getRateLimitsForToken(oauth.accessToken, fp, { allowProbe: allowProbe && !light });
       }
 
       // Clear stale refresh failures only if the token fingerprint has actually
@@ -950,13 +967,15 @@ async function loadProfiles() {
     if (keepNew) keys.forEach(k => seen.set(k, i));
   }
 
-  // A nameless account ("auto-N") whose login is expired and whose refresh token was
-  // rejected can never work again, and nothing tells which account it was: remove it.
+  // A nameless account ("auto-N", no email in .label or .email) whose login is expired and
+  // whose refresh token the OAuth server rejected (invalid_grant, for 30 minutes: not one odd
+  // answer) can never work again, and nothing tells which account it was: remove it.
   // Logging in again with /login adds that account back, with its email.
   for (let i = 0; i < profiles.length; i++) {
     const p = profiles[i];
     if (toRemove.has(i) || p.label !== p.name || p.isLogin || p.isActive) continue;
-    const dead = p.expiresAt && p.expiresAt < Date.now() && p.refreshFailed && p.refreshFailed.retriable === false;
+    const since = p.refreshFailed?.rejectedSince || 0;
+    const dead = p.expiresAt && p.expiresAt < Date.now() && since && Date.now() - since >= DEAD_LOGIN_AFTER_MS;
     if (!dead || !removeFiles(p, 'nameless login that can no longer refresh')) continue;
     sessionStore.unpinAccount(p.name);
     markSessionsDirty();
@@ -972,6 +991,8 @@ async function loadProfiles() {
 
   return profiles;
 }
+
+const DEAD_LOGIN_AFTER_MS = Number(process.env.CSW_DEAD_LOGIN_MS) || 30 * 60 * 1000; // env: tests
 
 // ─────────────────────────────────────────────────
 // API handlers
@@ -993,7 +1014,7 @@ async function handleAPI(req, res) {
   }
 
   if (url.pathname === '/api/profiles' && req.method === 'GET') {
-    const profiles = await loadProfiles();
+    const profiles = await loadProfiles({ light: url.searchParams.get('light') === '1' });
     // Attach utilization history + velocity to each profile
     for (const p of profiles) {
       p.throughput = accountThroughput(p);
@@ -5952,7 +5973,12 @@ async function refreshAccountToken(accountName, { force = false, staleToken = nu
 
     if (!result.ok) {
       log('refresh', `${accountName}: refresh failed after retries: ${result.error}`);
-      refreshFailures.set(accountName, { error: result.error, retriable: !!result.retriable, ts: Date.now(), fp: oldFp });
+      const prevFail = refreshFailures.get(accountName);
+      refreshFailures.set(accountName, {
+        error: result.error, retriable: !!result.retriable, ts: Date.now(), fp: oldFp,
+        // first time the OAuth server rejected this token (invalid_grant), for the dead-login cleanup
+        rejectedSince: result.rejected ? (prevFail?.rejectedSince && prevFail.fp === oldFp ? prevFail.rejectedSince : Date.now()) : 0,
+      });
       logActivity('refresh-failed', { account: accountLabel, error: result.error, retriable: !!result.retriable });
       return { ok: false, error: result.error };
     }
@@ -7079,16 +7105,42 @@ function terminalLabel() {
 }
 
 // The user's interactive shell runs the command, so a shell alias (e.g. `csk`) works.
+// zsh, bash and sh quote one way, fish another; other shells get zsh.
 function userShell() {
-  try { return userInfo().shell || process.env.SHELL || '/bin/zsh'; } catch { return process.env.SHELL || '/bin/zsh'; }
+  let sh = '';
+  try { sh = userInfo().shell || ''; } catch { /* none */ }
+  sh = sh || process.env.SHELL || '/bin/zsh';
+  const name = basename(sh);
+  if (['zsh', 'bash', 'sh', 'ksh', 'dash'].includes(name)) return { path: sh, family: 'posix' };
+  if (name === 'fish') return { path: sh, family: 'fish' };
+  return { path: '/bin/zsh', family: 'posix' };
 }
 
-function runFile(file, args, opts = {}) {
+// Runs a program and waits for it to exit (not for its pipes to close: something it started
+// in the background, e.g. from a shell rc file, may keep them open). detached: its own process
+// group, so what it starts (a `claude --bg` session) is not stopped with vdm.
+function runFile(file, args, { timeout = 30000, detached = false, cwd } = {}) {
   return new Promise((resolve) => {
-    const child = execFile(file, args, { timeout: 30000, maxBuffer: 1 << 20, ...opts }, (err, stdout, stderr) => {
-      resolve({ ok: !err, code: err ? (err.code ?? 1) : 0, out: String(stdout || '').trim(), err: String(stderr || '').trim(), killed: !!err?.killed });
-    });
-    child.stdin?.end(); // empty input: Claude Code reads piped input as a prompt
+    let out = '', err = '', done = false, killed = false;
+    let child;
+    try {
+      child = spawn(file, args, { cwd, detached, stdio: ['ignore', 'pipe', 'pipe'] });  // no input: Claude Code reads piped input as a prompt
+    } catch (e) { resolve({ ok: false, code: 1, out: '', err: e.message, killed: false }); return; }
+    const add = (which) => (c) => { if (which === 'out') { if (out.length < 1 << 20) out += c; } else if (err.length < 1 << 20) err += c; };
+    child.stdout.on('data', add('out'));
+    child.stderr.on('data', add('err'));
+    const finish = (code) => {
+      if (done) return; done = true;
+      clearTimeout(timer);
+      setTimeout(() => {   // let the last output arrive, then let go of the pipes
+        child.stdout.destroy(); child.stderr.destroy();
+        if (detached) child.unref();
+        resolve({ ok: code === 0 && !killed, code, out: out.trim(), err: err.trim(), killed });
+      }, 150);
+    };
+    const timer = setTimeout(() => { killed = true; try { child.kill('SIGKILL'); } catch {} finish(1); }, timeout);
+    child.on('error', (e) => { err += e.message; finish(1); });
+    child.on('exit', (code) => finish(code ?? 1));
   });
 }
 
@@ -7100,13 +7152,14 @@ async function openSession(id, body = {}) {
   const name = cleanLine(body.name ?? d.title, 80);
   const prompt = cleanMessage(body.prompt, 4000);
   const background = body.background === true;
-  const command = sessionLaunchCommand({ claudeCommand: claudeCommand(), id, cwd: d.cwd, name, prompt, background });
-  logActivity('session-opened', { session: id.slice(0, 8), name, where: background ? 'background' : terminalLabel() });
+  const shell = userShell();
+  const command = sessionLaunchCommand({ claudeCommand: claudeCommand(), id: d.id, cwd: d.cwd, name, prompt, background, shell: shell.family });
+  const opened = (where) => logActivity('session-opened', { session: d.id.slice(0, 8), name, where });
 
   if (background) {
     // `claude --bg` returns at once and prints the id that `claude attach` takes
     // Set after the shell's own startup files, which may set another ANTHROPIC_BASE_URL
-    const r = await runFile(userShell(), ['-ic', `export ANTHROPIC_BASE_URL=http://localhost:${PROXY_PORT}; ${command}`], { cwd: d.cwd });
+    const r = await runFile(shell.path, ['-ic', `export ANTHROPIC_BASE_URL=http://localhost:${PROXY_PORT}; ${command}`], { cwd: d.cwd, detached: true });
     const text = (r.out + '\n' + r.err).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();
     // Prints "backgrounded · 784bf036 · name". A refusal (e.g. "Workspace not trusted") also exits 0.
     const bgId = (text.match(/backgrounded\s*·\s*([0-9a-f]{6,})/i) || [])[1];
@@ -7114,12 +7167,14 @@ async function openSession(id, body = {}) {
       const e = new Error(r.killed ? 'Claude Code did not answer within 30 s' : (text.split('\n').slice(-3).join(' ') || 'Could not start it'));
       e.code = 'CONFLICT'; throw e;
     }
+    opened('background');
     return { ok: true, background: true, id: bgId, attach: `claude attach ${bgId}` };
   }
 
   const app = pickTerminal(settings.terminalApp, installedTerminals());
   const lines = terminalScript(app);
-  const r = await runFile('/usr/bin/osascript', [...lines.flatMap(l => ['-e', l]), command, name]);
+  // The first time, macOS asks to allow this: leave time to answer
+  const r = await runFile('/usr/bin/osascript', [...lines.flatMap(l => ['-e', l]), command, name], { timeout: 120000 });
   if (!r.ok) {
     const denied = /-1743|not allowed|Not authorized/i.test(r.err);
     const e = new Error(denied
@@ -7127,6 +7182,7 @@ async function openSession(id, body = {}) {
       : `Could not open ${TERMINAL_APPS[app].label}: ${r.err || 'unknown error'}`);
     e.code = 'CONFLICT'; throw e;
   }
+  opened(TERMINAL_APPS[app].label);
   return { ok: true, terminal: TERMINAL_APPS[app].label };
 }
 
@@ -7181,9 +7237,13 @@ async function handleHistoryAPI(req, res, url) {
     }
     if (action === 'delete' && req.method === 'POST') { json(res, await historyCall('remove', { id })); return true; }
     if (action === 'open' && req.method === 'POST') {
-      // Starts a program: only JSON from this computer's page (a web form cannot send JSON)
+      // Starts a program: only from this computer (even with CSW_ALLOW_REMOTE=1), and only
+      // JSON (a web form cannot send JSON)
+      if (!isLoopbackAddr(req.socket.remoteAddress)) { json(res, { error: 'Only from this computer' }, 403); return true; }
       if (!/^application\/json\b/i.test(req.headers['content-type'] || '')) { json(res, { error: 'JSON only' }, 415); return true; }
-      const body = JSON.parse(await readBody(req) || '{}');
+      let body;
+      try { body = JSON.parse(await readBody(req) || '{}'); } catch { body = null; }
+      if (!body || typeof body !== 'object') { json(res, { error: 'Bad JSON' }, 400); return true; }
       json(res, await openSession(id, body));
       return true;
     }

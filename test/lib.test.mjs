@@ -37,6 +37,7 @@ import {
   scoreAccountConserve,
   pickConserve,
   shellQuote,
+  fishQuote,
   sessionLaunchCommand,
   terminalScript,
   pickTerminal,
@@ -1086,6 +1087,19 @@ describe('sessionLaunchCommand', () => {
     assert.equal(cleanMessage('one\r\ntwo\u0000'), 'one\ntwo');
   });
 
+  it('fish: other quoting, no cd --', () => {
+    assert.equal(fishQuote(`it's a \\ b`), `'it\\'s a \\\\ b'`);
+    assert.equal(sessionLaunchCommand({ id, cwd: '/a b', name: "it's", shell: 'fish' }),
+      `cd '/a b' && claude --resume ${id} --name 'it\\'s'`);
+  });
+
+  it('fish runs it as written', { skip: !['/opt/homebrew/bin/fish', '/usr/local/bin/fish'].some(p => existsSync(p)) }, () => {
+    const fish = ['/opt/homebrew/bin/fish', '/usr/local/bin/fish'].find(p => existsSync(p));
+    const evil = `x'; echo PWNED; '\\$(echo PWNED)`;
+    const out = execFileSync(fish, ['-c', `printf '%s|' ${fishQuote(evil)}`], { encoding: 'utf8' });
+    assert.equal(out, evil + '|');
+  });
+
   it('shellQuote survives quotes', () => {
     assert.equal(sh(`printf %s ${shellQuote(`it's "ok"`)}`), `it's "ok"`);
   });
@@ -1106,5 +1120,14 @@ describe('terminal choice', () => {
       const args = terminalScript(app).flatMap(l => ['-e', l]);
       execFileSync('/usr/bin/osacompile', [...args, '-o', `/tmp/vdm-test-${process.pid}-${app}.scpt`]);
     }
+  });
+});
+
+describe('parseRefreshResponse: rejected refresh token', () => {
+  it('marks only invalid_grant as rejected', () => {
+    assert.equal(parseRefreshResponse(400, '{"error":"invalid_grant","error_description":"Refresh token not found or invalid"}').rejected, true);
+    assert.equal(parseRefreshResponse(403, '<html>blocked</html>').rejected, false);
+    assert.equal(parseRefreshResponse(400, '{"error":"invalid_request"}').rejected, false);
+    assert.equal(parseRefreshResponse(503, '{"error":"invalid_grant"}').rejected, false);
   });
 });

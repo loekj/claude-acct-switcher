@@ -47,7 +47,7 @@ The installer:
 |---|---|
 | macOS | everything (vdm uses the Keychain and launchd) |
 | Node.js 18+ | vdm itself (`brew install node`) |
-| python3 | the `vdm` command (macOS has it) |
+| python3 | the `vdm` command (comes with the Command Line Tools or Homebrew) |
 | Claude Code CLI | the sessions vdm serves |
 | **Command Line Tools** (optional) | the menu bar icon. Install them with `xcode-select --install` (free, from Apple). Homebrew users already have them. Without them, vdm works, with no icon. |
 
@@ -96,9 +96,11 @@ vdm menubar off      Remove the icon
 - **Why a daemon.** Without it, your shell starts vdm when you open a terminal. After a crash or a reboot, vdm stays down until you open a new terminal, and Claude Code cannot connect meanwhile. The daemon is the same program (same ports, same memory: about 70 MB), but macOS keeps it running.
 - **Files.** `~/Library/LaunchAgents/io.github.loekj.vdm.plist` (daemon) and `io.github.loekj.vdm.menubar.plist` (icon). The log is `~/.claude/account-switcher/dashboard.log` (emptied when it passes 10 MB).
 - **Stop for a while.** `vdm dashboard stop` stops vdm until your next login (or `vdm dashboard start`). A crash restarts it; a stop does not.
-- **Your shell file** still sets `ANTHROPIC_BASE_URL`. It starts vdm only when the daemon is off.
-- **Node from nvm/fnm/volta?** The daemon remembers the path of `node`. After you change Node versions, run `vdm daemon on` again.
-- **The icon** shows whether vdm runs (a warning sign when it is down, an hourglass when every account is used up). Its menu lists each account: active one ticked, `week 42%`, `fresh`, `used up · back in 2d 3h`, or `login expired`. It has *Open dashboard* and *Restart vdm*. It only reads `http://localhost:3333/api/profiles`.
+- **Your shell file** still sets `ANTHROPIC_BASE_URL`. It starts vdm only when the daemon is not loaded. vdm updates the block in place, also through a symlink (dotfiles repo), and keeps a backup (`.zshrc.vdm-backup`).
+- **Node from nvm, fnm, asdf, mise or volta?** The daemon remembers the real path of `node` (not the shim). If that version is removed, it falls back to Homebrew's `node`, and `vdm daemon status` tells you to run `vdm daemon on` again.
+- **No GUI login (only SSH)?** launchd cannot start the daemon then; `vdm dashboard start` and new terminals start vdm the old way.
+- **Sessions you start with *Start in background*** keep running when vdm restarts or upgrades.
+- **The icon** shows whether vdm runs (a warning sign when it is down, an hourglass when every account is used up). Its menu lists each account: active one ticked, `week 42%`, `fresh`, `used up · back in 2d 3h`, or `login expired`. It has *Open dashboard* and *Restart vdm*. It only reads what vdm already knows (`/api/profiles?light=1`: no extra requests to Anthropic), every 20 seconds.
 
 ## Usage
 
@@ -140,7 +142,7 @@ Per account: 5h and weekly windows, plus a **Fable weekly** bar under the weekly
 
 A red banner above the bars means a limit is used up (`back in …`). A red line under them means the login expired. Under them, a line shows the account's **token throughput** (all models, incl. cache reads) per 5 minutes: the last 24 hours, and the last 7 days as hourly averages. All accounts share one scale, so a busy account stands out; above the **hot line** (Config → Advanced, default 25M tokens per 5 minutes) the line turns red.
 
-Accounts are named by their email. vdm saves a new login only once it knows that email: after a wake without network it waits instead of saving a nameless `auto-N` copy. Two saved copies of one login (same email or same refresh token) are merged, and a nameless login whose refresh token was rejected is removed (Activity says so). Run `/login` again to add that account back.
+Accounts are named by their email. vdm saves a new login only once it knows that email: after a wake without network it waits instead of saving a nameless `auto-N` copy. Two saved copies of one login (same email or same refresh token) are merged, and a nameless login whose refresh token the server has rejected for 30 minutes is removed (Activity says so). Run `/login` again to add that account back.
 
 Usage, charts and saved sessions are kept per account **email** (stored in `accounts/<name>.email`), so they carry on after a re-login, a token refresh, or removing and adding an account again. Each card shows how many Claude Code sessions ran through it in the last 24 hours (a link to them in the Sessions tab) and how many artifacts it owns.
 

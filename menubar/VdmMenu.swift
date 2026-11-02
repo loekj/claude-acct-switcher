@@ -1,7 +1,8 @@
 // vdm menu bar icon: shows whether vdm runs, and each account's limits.
 // Built on the user's Mac by `vdm menubar on` (swiftc from the Command Line Tools):
 //   swiftc -O -swift-version 5 -o VdmMenu VdmMenu.swift
-// It only reads http://localhost:<port>/api/profiles. `VdmMenu --dump` prints the menu and exits.
+// It only reads http://localhost:<port>/api/profiles?light=1 (what vdm knows already: no
+// rate-limit checks, no email lookups). `VdmMenu --dump` prints the menu and exits.
 
 import AppKit
 
@@ -29,7 +30,8 @@ struct Profile: Decodable {
 struct UsedUp: Decodable { let fable: Bool?; let until: String? }
 struct Status: Decodable { let profiles: [Profile]; let usedUp: UsedUp? }
 
-enum State { case unknown, down, up(Status) }
+// upUnreadable: vdm answers, but this app could not read the answer (newer vdm?)
+enum State { case unknown, down, upUnreadable, up(Status) }
 
 // MARK: - Text
 
@@ -74,6 +76,7 @@ func menuLines(_ state: State) -> [String] {
   switch state {
   case .unknown: return ["Checking vdm…"]
   case .down: return ["vdm is not running"]
+  case .upUnreadable: return ["vdm is running", "Accounts: see the dashboard"]
   case .up(let st):
     var lines = ["vdm is running"]
     if let u = st.usedUp { lines.append((u.fable == true ? "Fable is used up on every account until " : "Every account is used up until ") + (u.until ?? "?")) }
@@ -84,14 +87,66 @@ func menuLines(_ state: State) -> [String] {
 
 // MARK: - Fetch
 
-func fetchStatus(_ done: @escaping (State) -> Void) {
-  var req = URLRequest(url: dashboardURL.appendingPathComponent("api/profiles"))
-  req.timeoutInterval = 8
-  URLSession.shared.dataTask(with: req) { data, resp, _ in
-    let ok = (resp as? HTTPURLResponse)?.statusCode == 200
-    let st = ok ? data.flatMap { try? JSONDecoder().decode(Status.self, from: $0) } : nil
-    DispatchQueue.main.async { done(st.map { .up($0) } ?? .down) }
+let profilesURL = URL(string: "http://localhost:\(port)/api/profiles?light=1")!
+
+/// nil = no answer in time (vdm busy): keep showing what we had
+func readStatus(_ data: Data?, _ resp: URLResponse?, _ err: Error?) -> State? {
+  if let e = err as? URLError, e.code == .timedOut { return nil }
+  guard let http = resp as? HTTPURLResponse else { return .down }
+  guard http.statusCode == 200 else { return .upUnreadable }
+  guard let d = data, let st = try? JSONDecoder().decode(Status.self, from: d) else { return .upUnreadable }
+  return .up(st)
+}
+
+func fetchStatus(_ done: @escaping (State?) -> Void) {
+  var req = URLRequest(url: profilesURL)
+  req.timeoutInterval = 10
+  URLSession.shared.dataTask(with: req) { data, resp, err in
+    let st = readStatus(data, resp, err)
+    DispatchQueue.main.async { done(st) }
   }.resume()
+}
+
+// MARK: - Icon: a figure doing the splits (Van Damme-o-Matic), drawn in code
+
+enum IconBadge { case none, dot, off }
+
+/// 18×18 pt template image (macOS colors it for light/dark menu bars).
+/// .dot = every account used up; .off = vdm is not running (struck through).
+func vdmIcon(_ badge: IconBadge) -> NSImage {
+  let img = NSImage(size: NSSize(width: 18, height: 18), flipped: false) { _ in
+    NSColor.black.set()
+    let stroke = { (pts: [(CGFloat, CGFloat)], w: CGFloat) in
+      let p = NSBezierPath()
+      p.lineWidth = w; p.lineCapStyle = .round; p.lineJoinStyle = .round
+      p.move(to: NSPoint(x: pts[0].0, y: pts[0].1))
+      for q in pts.dropFirst() { p.line(to: NSPoint(x: q.0, y: q.1)) }
+      p.stroke()
+    }
+    // Legs in a full split, feet flexed up
+    stroke([(1.2, 5.4), (1.2, 3.2), (9, 3.2), (16.8, 3.2), (16.8, 5.4)], 1.7)
+    // Body, arms raised in a wide V: the split, and the win
+    stroke([(9, 3.2), (9, 10.0)], 1.9)
+    stroke([(3.0, 14.2), (9, 9.4), (15.0, 14.2)], 1.5)
+    // Head, between the arms
+    NSBezierPath(ovalIn: NSRect(x: 7.15, y: 11.3, width: 3.7, height: 3.7)).fill()
+    switch badge {
+    case .dot:
+      NSGraphicsContext.current?.compositingOperation = .clear
+      NSBezierPath(ovalIn: NSRect(x: 12.4, y: 11.8, width: 6.2, height: 6.2)).fill()
+      NSGraphicsContext.current?.compositingOperation = .sourceOver
+      NSBezierPath(ovalIn: NSRect(x: 13.5, y: 12.9, width: 4.2, height: 4.2)).fill()
+    case .off:
+      NSGraphicsContext.current?.compositingOperation = .clear
+      stroke([(2, 16.5), (16.5, 1.5)], 3.6)
+      NSGraphicsContext.current?.compositingOperation = .sourceOver
+      stroke([(2, 16.5), (16.5, 1.5)], 1.4)
+    case .none: break
+    }
+    return true
+  }
+  img.isTemplate = true
+  return img
 }
 
 // MARK: - App
@@ -113,26 +168,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
 
   func refresh() {
     fetchStatus { [weak self] st in
-      self?.state = st
-      self?.updateIcon()
+      guard let self = self else { return }
+      if let st = st { self.state = st } else if case .unknown = self.state { self.state = .upUnreadable }
+      self.updateIcon()
     }
   }
 
   func updateIcon() {
     guard let button = item.button else { return }
-    let name: String
-    var tip = "vdm"
+    var badge = IconBadge.none
+    var tip = "vdm is running"
     switch state {
-    case .down: name = "exclamationmark.triangle"; tip = "vdm is not running"
-    case .up(let st) where st.usedUp != nil: name = "hourglass"; tip = "vdm: accounts used up"
-    default: name = "figure.martial.arts"
+    case .down: badge = .off; tip = "vdm is not running"
+    case .up(let st) where st.usedUp != nil: badge = .dot; tip = "vdm: every account is used up for now"
+    default: break
     }
-    let img = NSImage(systemSymbolName: name, accessibilityDescription: tip)
-      ?? NSImage(systemSymbolName: "bolt.fill", accessibilityDescription: tip)
-    img?.isTemplate = true
-    button.image = img
+    button.image = vdmIcon(badge)
     button.toolTip = tip
-    button.appearsDisabled = { if case .down = state { return true }; return false }()
+    button.setAccessibilityLabel(tip)
+    button.appearsDisabled = badge == .off
   }
 
   // Rebuild the menu each time it opens, and ask for fresh numbers.
@@ -178,18 +232,35 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   @objc func quit() { NSApp.terminate(nil) }
 }
 
+if let i = CommandLine.arguments.firstIndex(of: "--render-icons"), i + 1 < CommandLine.arguments.count {
+  // Test mode: draw the three icons, 8x, black on white and white on dark, into one PNG
+  let out = CommandLine.arguments[i + 1]
+  let scale: CGFloat = 8, cell: CGFloat = 18 * scale + 24
+  let rep = NSBitmapImageRep(bitmapDataPlanes: nil, pixelsWide: Int(cell * 3), pixelsHigh: Int(cell * 2), bitsPerSample: 8,
+                             samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB, bytesPerRow: 0, bitsPerPixel: 0)!
+  NSGraphicsContext.saveGraphicsState()
+  NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+  for (row, (bg, fg)) in [(NSColor.white, NSColor.black), (NSColor(white: 0.15, alpha: 1), NSColor.white)].enumerated() {
+    for (col, b) in [IconBadge.none, .dot, .off].enumerated() {
+      let r = NSRect(x: CGFloat(col) * cell, y: CGFloat(1 - row) * cell, width: cell, height: cell)
+      bg.setFill(); r.fill()
+      let tinted = NSImage(size: NSSize(width: 18 * scale, height: 18 * scale), flipped: false) { rr in
+        vdmIcon(b).draw(in: rr); fg.set(); rr.fill(using: .sourceIn); return true
+      }
+      tinted.draw(in: r.insetBy(dx: 12, dy: 12))
+    }
+  }
+  NSGraphicsContext.restoreGraphicsState()
+  try? rep.representation(using: .png, properties: [:])?.write(to: URL(fileURLWithPath: out))
+  exit(0)
+}
+
 if CommandLine.arguments.contains("--dump") {
   // Test mode: print the menu text and exit
   let sem = DispatchSemaphore(value: 0)
   var result: State = .unknown
-  var req = URLRequest(url: dashboardURL.appendingPathComponent("api/profiles"))
-  req.timeoutInterval = 8
-  URLSession.shared.dataTask(with: req) { data, resp, _ in
-    let ok = (resp as? HTTPURLResponse)?.statusCode == 200
-    result = (ok ? data.flatMap { try? JSONDecoder().decode(Status.self, from: $0) } : nil).map { .up($0) } ?? .down
-    sem.signal()
-  }.resume()
-  sem.wait()
+  fetchStatus { st in result = st ?? .upUnreadable; sem.signal() }
+  while sem.wait(timeout: .now()) == .timedOut { RunLoop.main.run(until: Date().addingTimeInterval(0.05)) }
   menuLines(result).forEach { print($0) }
   exit(0)
 }

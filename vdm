@@ -903,9 +903,12 @@ cmd_dashboard() {
       if daemon_loaded; then
         # SIGTERM = a clean exit, so launchd does not restart it (until login or vdm dashboard start)
         launchctl kill SIGTERM "$GUI_DOMAIN/$LAUNCH_LABEL" 2>/dev/null || true
-        wait_port_free "$DASHBOARD_PORT" 10 || true
-        echo -e "${GREEN}✓${NC} Dashboard stopped. ${DIM}The daemon starts it at your next login, or now with: vdm dashboard start${NC}"
-        return 0
+        if wait_port_free "$DASHBOARD_PORT" 10; then
+          echo -e "${GREEN}✓${NC} Dashboard stopped. ${DIM}The daemon starts it at your next login, or now with: vdm dashboard start${NC}"
+          return 0
+        fi
+        echo -e "${YELLOW}Port $DASHBOARD_PORT is still in use (PID $(port_pid "$DASHBOARD_PORT")).${NC}"
+        return 1
       fi
       # Try PID file first, then fall back to port-based detection
       local stopped=false
@@ -926,6 +929,8 @@ cmd_dashboard() {
         fi
       fi
       if [[ "$stopped" == "true" ]]; then
+        wait_port_free "$DASHBOARD_PORT" 10 || true
+        wait_port_free "$PROXY_PORT" 5 || true
         echo -e "${GREEN}✓${NC} Dashboard stopped."
       else
         echo -e "${YELLOW}Dashboard was not running.${NC}"
@@ -956,8 +961,12 @@ cmd_dashboard() {
           [[ "${2:-}" == "--no-open" ]] || open "http://localhost:$DASHBOARD_PORT" 2>/dev/null || true
           return 0
         fi
-        echo -e "${RED}vdm did not start.${NC} See ${DIM}$DAEMON_LOG${NC}"
-        return 1
+        if port_listening "$DASHBOARD_PORT"; then
+          echo -e "${RED}vdm did not stay up.${NC} See ${DIM}$DAEMON_LOG${NC}"
+          return 1
+        fi
+        # No GUI login (e.g. only SSH) or launchd refused: run it the old way
+        echo -e "${YELLOW}The daemon could not start${NC} ${DIM}(see $DAEMON_LOG)${NC}. Starting vdm without it."
       fi
       echo -e "${BLUE}Starting dashboard on http://localhost:$DASHBOARD_PORT${NC}"
       node "$SCRIPT_DIR/dashboard.mjs" &
@@ -1012,18 +1021,30 @@ write_plist() {
 import os, plistlib, sys
 path, label, *args = sys.argv[1:]
 home = os.environ["HOME"]
-node_dir = os.path.dirname(args[0]) if args[0].endswith("/node") else ""
-dirs = [node_dir, home + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
-env = {"PATH": ":".join(d for i, d in enumerate(dirs) if d and d not in dirs[:i])}
-for k, v in os.environ.items():
-    if k.startswith("CSW_") or k in ("VDM_CLAUDE_CMD", "VDM_LAUNCH_LABEL", "OAUTH_TOKEN_URL"):
-        env[k] = v
-env["VDM_LAUNCH_LABEL"] = os.environ.get("VDM_LAUNCH_LABEL", label.removesuffix(".menubar"))
+keep = lambda k: k.startswith("CSW_") or k in ("VDM_CLAUDE_CMD", "OAUTH_TOKEN_URL")
+env = {}
+# Settings saved by an earlier `vdm daemon on` stay (e.g. a custom CSW_PORT); this shell's win
+try:
+    old = plistlib.load(open(path, "rb")).get("EnvironmentVariables", {})
+    env.update({k: v for k, v in old.items() if keep(k)})
+except Exception:
+    pass
+env.update({k: v for k, v in os.environ.items() if keep(k)})
+node = os.environ.get("PLIST_NODE", "")
+dirs = [os.path.dirname(node) if node else "", home + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+env["PATH"] = ":".join(d for i, d in enumerate(dirs) if d and d not in dirs[:i])
+env["VDM_LAUNCH_LABEL"] = os.environ.get("VDM_LAUNCH_LABEL") or (label[:-len(".menubar")] if label.endswith(".menubar") else label)
+if node:
+    # Node moved (nvm/fnm/volta switch, brew reinstall)? Fall back to the usual places.
+    env["VDM_NODE"] = node
+    args = ["/bin/sh", "-c", 'for n in "$VDM_NODE" /opt/homebrew/bin/node /usr/local/bin/node; do [ -x "$n" ] && exec "$n" "$0"; done; echo "vdm: Node.js not found (run: vdm daemon on)" >&2; exit 1'] + args
 p = {"Label": label, "ProgramArguments": args, "RunAtLoad": True, "EnvironmentVariables": env,
      "WorkingDirectory": os.path.dirname(os.path.abspath(args[-1])) if args[-1].endswith(".mjs") else home}
 if os.environ.get("PLIST_KEEPALIVE") == "1":
     p["KeepAlive"] = {"SuccessfulExit": False}   # restart after a crash, not after vdm dashboard stop
     p["ThrottleInterval"] = 10
+    p["ProcessType"] = "Interactive"             # every Claude request streams through it: no throttling
+    p["AbandonProcessGroup"] = True              # sessions started with `claude --bg` outlive a restart
 if os.environ.get("PLIST_LOG"):
     p["StandardOutPath"] = p["StandardErrorPath"] = os.environ["PLIST_LOG"]
     env["VDM_DAEMON_LOG"] = os.environ["PLIST_LOG"]
@@ -1036,18 +1057,48 @@ os.replace(path + ".tmp", path)
 PY
 }
 
+# The real Node binary, not a version-manager shim or a per-shell link (asdf, mise, fnm)
+real_node() {
+  local n; n="$(command -v node)" || return 1
+  "$n" -e 'process.stdout.write(process.execPath)' 2>/dev/null || echo "$n"
+}
+
 write_daemon_plist() {
   local node_bin
-  node_bin="$(command -v node)" || { echo -e "${RED}Node.js was not found.${NC}"; return 1; }
-  PLIST_KEEPALIVE=1 PLIST_LOG="$DAEMON_LOG" write_plist "$DAEMON_PLIST" "$LAUNCH_LABEL" "$node_bin" "$SCRIPT_DIR/dashboard.mjs"
+  node_bin="$(real_node)" || { echo -e "${RED}Node.js was not found.${NC}"; return 1; }
+  PLIST_KEEPALIVE=1 PLIST_LOG="$DAEMON_LOG" PLIST_NODE="$node_bin" write_plist "$DAEMON_PLIST" "$LAUNCH_LABEL" "$SCRIPT_DIR/dashboard.mjs"
 }
 
 # Load (or reload) the daemon so it reads its plist again, then wait for the dashboard.
+daemon_pid() { launchctl print "$GUI_DOMAIN/$LAUNCH_LABEL" 2>/dev/null | awk '/^\tpid = /{print $3}' || true; }
+port_pid() { lsof -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -1 || true; }
+
+# Load a LaunchAgent: a few tries (right after a bootout, launchd may still be busy with it).
+# Turned off under Login Items? `vdm … on` means on: enable it again. Prints launchctl's error.
+load_agent() { # label plist
+  local i err=""
+  launchctl enable "$GUI_DOMAIN/$1" 2>/dev/null || true
+  for i in 1 2 3 4 5; do
+    err=$(launchctl bootstrap "$GUI_DOMAIN" "$2" 2>&1) && return 0
+    launchctl print "$GUI_DOMAIN/$1" >/dev/null 2>&1 && { launchctl kickstart "$GUI_DOMAIN/$1" 2>/dev/null; return 0; }
+    sleep 1
+  done
+  echo -e "  ${DIM}launchctl: ${err}${NC}" >&2
+  return 1
+}
+
 daemon_start() {
   launchctl bootout "$GUI_DOMAIN/$LAUNCH_LABEL" 2>/dev/null || true
-  wait_port_free "$DASHBOARD_PORT" 5 || true
-  launchctl bootstrap "$GUI_DOMAIN" "$DAEMON_PLIST" 2>/dev/null || launchctl kickstart "$GUI_DOMAIN/$LAUNCH_LABEL" 2>/dev/null || true
-  wait_for_port "$DASHBOARD_PORT" 15
+  wait_port_free "$DASHBOARD_PORT" 10 || true
+  wait_port_free "$PROXY_PORT" 5 || true
+  load_agent "$LAUNCH_LABEL" "$DAEMON_PLIST" || return 1   # e.g. no GUI login (SSH only)
+  wait_for_port "$DASHBOARD_PORT" 15 && wait_for_port "$PROXY_PORT" 5 || return 1
+  sleep 1   # still up a moment later? (another vdm on the port makes it exit)
+  local pid; pid=$(daemon_pid)
+  if [[ -z "$pid" || "$(port_pid "$DASHBOARD_PORT")" != "$pid" ]]; then
+    echo -e "  ${YELLOW}Another vdm holds port $DASHBOARD_PORT (PID $(port_pid "$DASHBOARD_PORT")).${NC} Stop it, then: vdm daemon restart" >&2
+    return 1
+  fi
 }
 
 # vdm started the old way (from the shell, no launchd): stop it
@@ -1064,42 +1115,58 @@ stop_plain_dashboard() {
 shell_block() {
   cat <<SHELL_EOF
 # BEGIN claude-account-switcher
-if [ ! -f "\$HOME/Library/LaunchAgents/$LAUNCH_LABEL.plist" ] && ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then
-  nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &
-  disown
+if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then
+  # The daemon (vdm daemon on) runs vdm when it is loaded; else start it here
+  if ! { [ -f "\$HOME/Library/LaunchAgents/$LAUNCH_LABEL.plist" ] && launchctl print "gui/\$(id -u)/$LAUNCH_LABEL" >/dev/null 2>&1; }; then
+    nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &
+    disown
+  fi
 fi
 export ANTHROPIC_BASE_URL=http://localhost:3334
 # END claude-account-switcher
 SHELL_EOF
 }
 
-# Add the shell block, or replace an older one. Prints the file it changed.
+# Add the shell block, or replace older ones (in every shell file that has one).
+# Writes through symlinks (dotfile repos) and keeps the file mode. Prints the file(s).
 cmd_setup_shell() {
-  local rc="" f
-  for f in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do
-    if [[ -f "$f" ]] && grep -q "^# BEGIN claude-account-switcher" "$f"; then rc="$f"; break; fi
+  local f found=()
+  for f in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zprofile" "$HOME/.profile"; do
+    if [[ -f "$f" ]] && grep -q "^# BEGIN claude-account-switcher" "$f"; then found+=("$f"); fi
   done
-  if [[ -z "$rc" ]]; then
-    for f in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do [[ -f "$f" ]] && { rc="$f"; break; }; done
-  fi
-  if [[ -z "$rc" ]]; then echo ""; return 1; fi
   local block
   block="$(shell_block)"
-  if grep -q "^# BEGIN claude-account-switcher" "$rc"; then
-    BLOCK="$block" python3 - "$rc" <<'PY'
-import os, re, sys
-path = sys.argv[1]
+  if [[ ${#found[@]} -gt 0 ]]; then
+    for f in "${found[@]}"; do
+      BLOCK="$block" python3 - "$f" <<'PY'
+import os, re, shutil, sys, tempfile
+path = os.path.realpath(sys.argv[1])          # a symlink (dotfiles repo): change the real file
 text = open(path).read()
 new = re.sub(r"(?ms)^# BEGIN claude-account-switcher\n.*?^# END claude-account-switcher\n?", lambda m: os.environ["BLOCK"] + "\n", text, count=1)
 if new != text:
-    open(path + ".vdm-backup", "w").write(text)
-    tmp = path + ".vdm-tmp"
-    open(tmp, "w").write(new)
+    shutil.copy2(path, path + ".vdm-backup")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".vdm-")
+    with os.fdopen(fd, "w") as f:
+        f.write(new)
+    shutil.copymode(path, tmp)
     os.replace(tmp, path)
 PY
-  else
-    printf '\n%s\n' "$block" >> "$rc"
+    done
+    echo "${found[0]}"
+    return 0
   fi
+  local rc=""
+  for f in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do [[ -f "$f" ]] && { rc="$f"; break; }; done
+  if [[ -z "$rc" ]]; then
+    # A new Mac has no shell file yet: make the one your login shell reads
+    case "$(basename "${SHELL:-/bin/zsh}")" in
+      zsh) rc="$HOME/.zshrc" ;;
+      bash) rc="$HOME/.bash_profile" ;;
+      *) echo ""; return 1 ;;
+    esac
+    touch "$rc"
+  fi
+  printf '\n%s\n' "$block" >> "$rc"
   echo "$rc"
 }
 
@@ -1108,8 +1175,8 @@ cmd_daemon() {
   case "$action" in
     on|install)
       if [[ "$(uname)" != "Darwin" ]]; then echo -e "${RED}The daemon needs macOS (launchd).${NC}"; return 1; fi
-      local node_bin; node_bin="$(command -v node || true)"
-      if [[ "$node_bin" == *"/.nvm/"* || "$node_bin" == *"/.fnm/"* || "$node_bin" == *"/.volta/"* ]]; then
+      local node_bin; node_bin="$(real_node || true)"
+      if [[ "$node_bin" != /opt/homebrew/* && "$node_bin" != /usr/local/* ]]; then
         echo -e "${YELLOW}Note:${NC} Node is at ${DIM}$node_bin${NC}. If that path changes (new Node version), run ${CYAN}vdm daemon on${NC} again."
       fi
       write_daemon_plist || return 1
@@ -1129,11 +1196,13 @@ cmd_daemon() {
       if daemon_loaded; then launchctl bootout "$GUI_DOMAIN/$LAUNCH_LABEL" 2>/dev/null || true; had=true; fi
       [[ -f "$DAEMON_PLIST" ]] && { rm -f "$DAEMON_PLIST"; had=true; }
       wait_port_free "$DASHBOARD_PORT" 10 || true
-      if [[ "${2:-}" != "--no-start" ]]; then
+      wait_port_free "$PROXY_PORT" 5 || true
+      if [[ "${2:-}" != "--no-start" ]] && ! port_listening "$DASHBOARD_PORT"; then
         # Keep the proxy up: start it the old way (your shell also does this in new terminals)
         nohup node "$SCRIPT_DIR/dashboard.mjs" >/dev/null 2>&1 &
         echo $! > "$DASHBOARD_PID_FILE"
         disown 2>/dev/null || true
+        wait_for_port "$DASHBOARD_PORT" 10 || echo -e "${RED}vdm did not start.${NC} Run: vdm dashboard start"
       fi
       if [[ "$had" == "true" ]]; then echo -e "${GREEN}✓${NC} Daemon off. New terminals start vdm again, as before."
       else echo -e "${DIM}The daemon was not installed.${NC}"; fi
@@ -1144,7 +1213,11 @@ cmd_daemon() {
       ;;
     status)
       if daemon_installed; then
-        local pid; pid=$(launchctl print "$GUI_DOMAIN/$LAUNCH_LABEL" 2>/dev/null | awk '/^\tpid = /{print $3}')
+        local pid; pid=$(launchctl print "$GUI_DOMAIN/$LAUNCH_LABEL" 2>/dev/null | awk '/^\tpid = /{print $3}') || true
+        local node_bin; node_bin=$(plutil -extract EnvironmentVariables.VDM_NODE raw "$DAEMON_PLIST" 2>/dev/null) || true
+        if [[ -n "$node_bin" && ! -x "$node_bin" ]]; then
+          echo -e "${YELLOW}!${NC} The daemon's Node ($node_bin) is gone. Run ${CYAN}vdm daemon on${NC} to use the current one."
+        fi
         if [[ -n "$pid" ]]; then echo -e "${GREEN}●${NC} Daemon on, running (PID $pid)"
         elif daemon_loaded; then echo -e "${YELLOW}●${NC} Daemon on, stopped. Start it: ${CYAN}vdm dashboard start${NC}"
         else echo -e "${YELLOW}●${NC} Daemon installed, not loaded. Start it: ${CYAN}vdm daemon on${NC}"; fi
@@ -1206,7 +1279,10 @@ cmd_menubar() {
       build_menubar || return 1
       write_plist "$MENU_PLIST" "$MENU_LABEL" "$MENU_APP/Contents/MacOS/VdmMenu"
       launchctl bootout "$GUI_DOMAIN/$MENU_LABEL" 2>/dev/null || true
-      launchctl bootstrap "$GUI_DOMAIN" "$MENU_PLIST" 2>/dev/null || launchctl kickstart -k "$GUI_DOMAIN/$MENU_LABEL" 2>/dev/null || true
+      if ! load_agent "$MENU_LABEL" "$MENU_PLIST"; then
+        echo -e "${RED}The menu bar icon did not start.${NC}"
+        return 1
+      fi
       echo -e "${GREEN}✓${NC} Menu bar icon on (it starts when you log in)."
       ;;
     off|uninstall)
@@ -1222,7 +1298,7 @@ cmd_menubar() {
 }
 
 cmd_upgrade() {
-  local REPO_URL="https://github.com/loekj/claude-acct-switcher.git"
+  local REPO_URL="${VDM_REPO_URL:-https://github.com/loekj/claude-acct-switcher.git}"   # env: tests
   local tmpdir
   tmpdir=$(mktemp -d)
   # Ensure cleanup on any exit from this function
@@ -1280,7 +1356,7 @@ cmd_upgrade() {
   # Stop dashboard before overwriting files
   if [[ "$dashboard_was_running" == "true" ]]; then
     echo -e "  ${DIM}Stopping dashboard…${NC}"
-    cmd_dashboard stop
+    cmd_dashboard stop >/dev/null || true
     # Also kill any process on the port not tracked by PID file (e.g. shell auto-start)
     local port_pid
     port_pid=$(lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) || true
@@ -1324,20 +1400,20 @@ cmd_upgrade() {
     fi
   fi
 
-  # The shell block only starts vdm when the daemon is off (older blocks always did)
-  cmd_setup_shell >/dev/null 2>&1 || true
+  # The new script's shell block (this running script is the old version)
+  "$SCRIPT_DIR/vdm" _setup-shell >/dev/null 2>&1 || true
 
-  # Restart dashboard if it was running (the daemon reads its refreshed plist)
+  # Restart dashboard if it was running (the new script writes the plist and restarts it)
   if daemon_installed; then
     "$SCRIPT_DIR/vdm" _write-daemon-plist >/dev/null 2>&1 || true
     echo -e "  ${DIM}Restarting vdm (daemon)…${NC}"
-    daemon_start >/dev/null && echo -e "  ${GREEN}✓${NC} vdm running" || echo -e "  ${RED}vdm did not start.${NC} See ${DIM}$DAEMON_LOG${NC}"
+    "$SCRIPT_DIR/vdm" daemon restart >/dev/null && echo -e "  ${GREEN}✓${NC} vdm running" || echo -e "  ${RED}vdm did not start.${NC} See ${DIM}$DAEMON_LOG${NC}"
   elif [[ "$dashboard_was_running" == "true" ]]; then
     echo -e "  ${DIM}Restarting dashboard…${NC}"
     cmd_dashboard start
   fi
   # Rebuild the menu bar icon from the new source
-  if [[ -f "$MENU_PLIST" ]]; then "$SCRIPT_DIR/vdm" menubar on >/dev/null 2>&1 && echo -e "  ${GREEN}✓${NC} Menu bar icon rebuilt" || echo -e "  ${YELLOW}Menu bar icon not rebuilt.${NC} Run: vdm menubar on"; fi
+  if [[ -f "$MENU_PLIST" ]]; then echo -e "  ${DIM}Rebuilding the menu bar icon…${NC}"; "$SCRIPT_DIR/vdm" menubar on >/dev/null 2>&1 && echo -e "  ${GREEN}✓${NC} Menu bar icon rebuilt" || echo -e "  ${YELLOW}Menu bar icon not rebuilt.${NC} Run: vdm menubar on"; fi
   if ! daemon_installed; then
     echo -e "  ${DIM}New: run vdm as a daemon (starts at login, restarts after a crash):${NC} ${CYAN}vdm daemon on${NC}"
   fi

@@ -969,12 +969,14 @@ export function parseRefreshResponse(statusCode, bodyStr) {
   // Retriable: 429 (rate limit), 500+ (server errors)
   const retriable = statusCode === 429 || statusCode >= 500;
   let error = `HTTP ${statusCode}`;
+  let rejected = false;   // the OAuth server says this refresh token is dead (invalid_grant)
   try {
     const data = JSON.parse(bodyStr);
+    rejected = statusCode === 400 && data.error === 'invalid_grant';
     const raw = data.error_description || data.error || data.message || error;
     error = typeof raw === 'string' ? raw : (raw && raw.message) || JSON.stringify(raw);
   } catch {}
-  return { ok: false, error, retriable };
+  return { ok: false, error, retriable, rejected };
 }
 
 /**
@@ -2185,9 +2187,14 @@ export function setTopLevelJsonFields(text, fields) {
 // Open a saved session: in a terminal window, or in the background (claude --bg)
 // ─────────────────────────────────────────────────
 
-/** Quote one word for a POSIX shell. */
+/** Quote one word for a POSIX shell (sh, bash, zsh). */
 export function shellQuote(s) {
   return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+/** Quote one word for fish: inside '...' only \\ and \' are special. */
+export function fishQuote(s) {
+  return `'${String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
 }
 
 const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -2207,18 +2214,19 @@ export function cleanMessage(v, max = 4000) {
  * (it may be an alias, so it runs in an interactive shell). The prompt goes after `--`,
  * so text starting with "-" is never read as an option.
  */
-export function sessionLaunchCommand({ claudeCommand = 'claude', id, cwd, name = '', prompt = '', background = false }) {
+export function sessionLaunchCommand({ claudeCommand = 'claude', id, cwd, name = '', prompt = '', background = false, shell = 'posix' }) {
+  const q = shell === 'fish' ? fishQuote : shellQuote;
   if (!SESSION_ID_RE.test(String(id || ''))) throw new Error('Bad session id');
   const cmd = String(claudeCommand || 'claude').trim() || 'claude';
   const parts = [cmd];
   if (background) parts.push('--bg');
   parts.push('--resume', id);
   const n = cleanLine(name);
-  if (n) parts.push('--name', shellQuote(n));
+  if (n) parts.push('--name', q(n));
   const p = cleanMessage(prompt);
-  if (p) parts.push('--', shellQuote(p));
+  if (p) parts.push('--', q(p));
   const run = parts.join(' ');
-  return cwd ? `cd -- ${shellQuote(cwd)} && ${run}` : run;
+  return cwd ? `cd ${shell === 'fish' ? '' : '-- '}${q(cwd)} && ${run}` : run;
 }
 
 export const TERMINAL_APPS = {
@@ -2238,12 +2246,16 @@ export function terminalScript(app) {
       '  set title to item 2 of argv',
       '  tell application id "com.googlecode.iterm2"',
       '    activate',
-      '    if (count of windows) is 0 then',
-      '      set w to (create window with default profile)',
-      '    else',
-      '      set w to current window',
-      '      tell w to create tab with default profile',
-      '    end if',
+      '    set w to missing value',
+      '    try',
+      '      if (count of windows) > 0 then',
+      '        set w to current window',
+      '        tell w to create tab with default profile',
+      '      end if',
+      '    on error',
+      '      set w to missing value',
+      '    end try',
+      '    if w is missing value then set w to (create window with default profile)',
       '    tell current session of w',
       '      if title is not "" then set name to title',
       '      write text cmd',
