@@ -134,6 +134,15 @@ export function modelBucket(model) {
   return modelFamily(model) === 'fable' ? 'sevenDOI' : null;
 }
 
+/**
+ * Usage of a limit window as it is now (0-1). Once its reset time has passed, the window
+ * is over: the account is fresh until the next request starts a new one.
+ */
+export function liveUtil(utilization, resetSec, nowSec = Math.floor(Date.now() / 1000)) {
+  if (resetSec && resetSec <= nowSec) return 0;
+  return utilization || 0;
+}
+
 function isWindowExhausted(utilization, resetSec, nowSec) {
   // Unknown reset → don't lock the account out on a stale reading.
   return (utilization || 0) >= 1 && !!resetSec && resetSec > nowSec;
@@ -225,10 +234,11 @@ export function usedUpAnswer({ at, claim, label }, { total, model = null, otherM
 }
 
 /** Highest utilization among the windows a request for `model` draws from (0-1). */
-export function usageScore(acctState, model = null) {
+export function usageScore(acctState, model = null, now = Date.now()) {
   if (!acctState) return 0;
-  let s = Math.max(acctState.utilization5h || 0, acctState.utilization7d || 0);
-  if (modelBucket(model) === 'sevenDOI') s = Math.max(s, acctState.utilization7dOI || 0);
+  const nowSec = Math.floor(now / 1000);
+  let s = Math.max(liveUtil(acctState.utilization5h, acctState.resetAt, nowSec), liveUtil(acctState.utilization7d, acctState.resetAt7d, nowSec));
+  if (modelBucket(model) === 'sevenDOI') s = Math.max(s, liveUtil(acctState.utilization7dOI, acctState.resetAt7dOI, nowSec));
   return s;
 }
 
@@ -523,7 +533,7 @@ export function isAccountAvailable(token, expiresAt, stateManager, now = Date.no
 export function scoreAccount(token, stateManager) {
   const acctState = stateManager.get(token);
   if (!acctState) return 0; // unknown = fresh, try first
-  return acctState.utilization5h || 0;
+  return liveUtil(acctState.utilization5h, acctState.resetAt);
 }
 
 export function pickBestAccount(accounts, stateManager, excludeTokens = new Set(), model = null) {
@@ -552,8 +562,10 @@ export function pickDrainFirst(accounts, stateManager, excludeTokens = new Set()
 export function scoreAccountConserve(token, stateManager) {
   const acctState = stateManager.get(token);
   if (!acctState) return 0; // unknown = untouched, preserve it
-  const w7d = acctState.utilization7d || 0;
-  const w5h = acctState.utilization5h || 0;
+  // A window whose reset has passed is over: count it as untouched (0), so a fresh week
+  // is kept for later instead of looking like the busiest account.
+  const w7d = liveUtil(acctState.utilization7d, acctState.resetAt7d);
+  const w5h = liveUtil(acctState.utilization5h, acctState.resetAt);
   // Weekly dominates (×100), 5hr is tiebreaker (×1)
   return w7d * 100 + w5h;
 }
@@ -596,7 +608,7 @@ export function pickLeastLoaded(accounts, inflightTracker, stateManager, cap, ex
     .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager, now, model))
     .map(a => {
       const inflight = inflightTracker.get(a.name);
-      const score = usageScore(stateManager.get(a.token), model);
+      const score = usageScore(stateManager.get(a.token), model, now);
       return {
         account: a,
         inflight,

@@ -1431,6 +1431,7 @@ export async function openArchive({ P = historyPaths(), writer = false, log = ()
     }
     const page = pageEntries.map(e => {
       const r = row(e, registry.has(e.id));
+      r.resume = sessionCommands(e, cfg.claudeCommand).resume; // for the list's Copy button
       const h = hits?.get(e.id);
       if (h) { r.snippet = h.snip || ''; r.hitSeq = h.seq; r.hitCount = h.hits; }
       return r;
