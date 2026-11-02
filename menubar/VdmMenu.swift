@@ -203,7 +203,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
     add("Open dashboard", #selector(openDashboard), "d")
     if case .down = state { add("Start vdm", #selector(restartDaemon), "") } else { add("Restart vdm", #selector(restartDaemon), "") }
     menu.addItem(.separator())
-    add("Hide this icon", #selector(quit), "q")
+    if case .down = state {} else { add("Quit vdm…", #selector(quitVdm), "q") }
+    add("Hide icon", #selector(quit), "")
     refresh()
   }
 
@@ -230,6 +231,33 @@ final class AppDelegate: NSObject, NSApplicationDelegate, NSMenuDelegate {
   }
 
   @objc func quit() { NSApp.terminate(nil) }
+
+  // Stops vdm itself (a clean exit: launchd starts it again at the next login, or with
+  // `vdm dashboard start`), then this icon.
+  @objc func quitVdm() {
+    let a = NSAlert()
+    a.messageText = "Quit vdm?"
+    a.informativeText = "This stops vdm and this icon. Claude Code sessions that use vdm cannot reach Anthropic until vdm runs again.\n\nBoth start again at your next login. To start vdm now, run: vdm dashboard start"
+    a.addButton(withTitle: "Quit vdm")
+    a.addButton(withTitle: "Cancel")
+    NSApp.activate(ignoringOtherApps: true)
+    guard a.runModal() == .alertFirstButtonReturn else { return }
+    var req = URLRequest(url: dashboardURL.appendingPathComponent("api/shutdown"))
+    req.httpMethod = "POST"
+    req.setValue("application/json", forHTTPHeaderField: "Content-Type")
+    req.httpBody = "{}".data(using: .utf8)
+    req.timeoutInterval = 5
+    URLSession.shared.dataTask(with: req) { _, resp, _ in
+      let ok = (resp as? HTTPURLResponse)?.statusCode == 200
+      DispatchQueue.main.async {
+        if ok { NSApp.terminate(nil); return }
+        let e = NSAlert()
+        e.messageText = "Could not quit vdm"
+        e.informativeText = "In a terminal, run: vdm dashboard stop"
+        e.runModal()
+      }
+    }.resume()
+  }
 }
 
 if let i = CommandLine.arguments.firstIndex(of: "--render-icons"), i + 1 < CommandLine.arguments.count {

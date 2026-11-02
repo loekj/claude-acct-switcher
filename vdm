@@ -1243,7 +1243,7 @@ build_menubar() {
   if [[ ! -f "$src" ]]; then
     # Upgraded by an older vdm, which did not copy menubar/: fetch it now
     local t; t=$(mktemp -d)
-    if git clone --depth 1 --quiet "https://github.com/loekj/claude-acct-switcher.git" "$t" 2>/dev/null && [[ -f "$t/menubar/VdmMenu.swift" ]]; then
+    if git clone --depth 1 --quiet "${VDM_REPO_URL:-https://github.com/loekj/claude-acct-switcher.git}" "$t" 2>/dev/null && [[ -f "$t/menubar/VdmMenu.swift" ]]; then
       mkdir -p "$SCRIPT_DIR/menubar" && cp "$t"/menubar/*.swift "$SCRIPT_DIR/menubar/"
     fi
     rm -rf "$t"

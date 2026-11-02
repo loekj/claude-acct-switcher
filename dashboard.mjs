@@ -1003,6 +1003,17 @@ async function handleAPI(req, res) {
 
   if (url.pathname === '/api/history' || url.pathname.startsWith('/api/history/')) return handleHistoryAPI(req, res, url);
 
+  // Quit vdm (menu bar icon → Quit vdm). A clean exit, so launchd does not start it again
+  // until the next login or `vdm dashboard start`. Only from this computer, only JSON.
+  if (url.pathname === '/api/shutdown' && req.method === 'POST') {
+    if (!isLoopbackAddr(req.socket.remoteAddress)) { json(res, { error: 'Only from this computer' }, 403); return true; }
+    if (!/^application\/json\b/i.test(req.headers['content-type'] || '')) { json(res, { error: 'JSON only' }, 415); return true; }
+    logActivity('vdm-quit', {});
+    json(res, { ok: true });
+    setTimeout(() => shutdown('quit from the menu bar'), 200);
+    return true;
+  }
+
   if (url.pathname === '/api/cache-care' && req.method === 'GET') { json(res, cacheCareReport(parseInt(url.searchParams.get('days') || '7', 10))); return true; }
   if (url.pathname === '/api/cache-care/mode' && req.method === 'POST') {
     const { sid, mode } = JSON.parse(await readBody(req) || '{}');
@@ -3527,6 +3538,7 @@ function evtMsg(e) {
     case 'auth-expired': return '<b>' + (e.account||'?') + '</b> token expired';
     case 'all-exhausted': return 'All accounts exhausted';
     case 'account-discovered': return 'Discovered <b>' + (e.label||e.name||'?') + '</b>';
+    case 'vdm-quit': return 'vdm was quit from the menu bar';
     case 'session-opened': return 'Opened session <b>' + escHtml(e.name || e.session || '?') + '</b> in ' + escHtml(e.where || 'a terminal');
     case 'account-removed': return 'Removed <b>' + escHtml(e.name||'?') + '</b>' + (e.reason === 'dead-login' ? ': a nameless login that can no longer refresh' : '');
     case 'account-renamed': return 'Renamed <b>' + (e.name||'?') + '</b> to <b>' + (e.label||'?') + '</b>';
@@ -6085,8 +6097,11 @@ async function refreshSweep(label = 'refresh-bg') {
   }
 }
 
-// Run immediately on startup (handles expired tokens after sleep/restart)
-refreshSweep('refresh-startup').catch(() => {});
+// Run on startup (handles expired tokens after sleep/restart), once this vdm holds both
+// ports: a second vdm that cannot get them must not refresh tokens next to the first one
+// (each refresh revokes the token the other just got).
+const _onBothListening = [];   // run by onServerListening once both ports are ours
+_onBothListening.push(() => refreshSweep('refresh-startup').catch(() => {}));
 
 // Detect system wake: if the timer fires much later than expected, the system slept
 let lastRefreshTick = Date.now();
@@ -7080,9 +7095,9 @@ function applyHistorySettings() {
 
 let _serversListening = 0;
 function onServerListening() {
-  if (++_serversListening === 2 && historyConfig().enabled) {
-    startHistory().catch(err => log('error', `History: ${err.message}`));
-  }
+  if (++_serversListening !== 2) return;
+  for (const fn of _onBothListening.splice(0)) fn();
+  if (historyConfig().enabled) startHistory().catch(err => log('error', `History: ${err.message}`));
 }
 
 function historyStatusCode(err) {
@@ -8726,19 +8741,22 @@ process.on('unhandledRejection', (reason) => {
   try { log('fatal', `Unhandled rejection: ${reason}`); } catch { /* swallow */ }
 });
 
-// A port already in use means another vdm runs: exit (failed), so launchd tries again
-// later instead of keeping a process alive that serves nothing.
-function exitIfPortBusy(what, port) {
+// A port in use: the vdm before this one may still be saving its data and exiting (upgrade,
+// restart), so try again for 10 s. Still busy: another vdm runs, so exit (failed) and let
+// launchd try later, instead of keeping a process alive that serves nothing.
+function exitIfPortBusy(srv, what, port) {
+  let tries = 0;
   return (err) => {
     if (err && err.code === 'EADDRINUSE') {
+      if (++tries <= 20) { setTimeout(() => srv.listen(port), 500); return; }
       try { console.error(`[fatal] Port ${port} (${what}) is in use: another vdm is running. Exiting.`); } catch {}
       process.exit(1);
     }
     try { log('error', `${what} server: ${err && err.message}`); } catch {}
   };
 }
-server.on('error', exitIfPortBusy('dashboard', PORT));
-proxyServer.on('error', exitIfPortBusy('proxy', PROXY_PORT));
+server.on('error', exitIfPortBusy(server, 'dashboard', PORT));
+proxyServer.on('error', exitIfPortBusy(proxyServer, 'proxy', PROXY_PORT));
 
 // Under launchd (vdm daemon) output goes to a file: keep it under 10 MB.
 // launchd opens it for appending, so emptying it in place is safe.

@@ -95,12 +95,12 @@ vdm menubar off      Remove the icon
 
 - **Why a daemon.** Without it, your shell starts vdm when you open a terminal. After a crash or a reboot, vdm stays down until you open a new terminal, and Claude Code cannot connect meanwhile. The daemon is the same program (same ports, same memory: about 70 MB), but macOS keeps it running.
 - **Files.** `~/Library/LaunchAgents/io.github.loekj.vdm.plist` (daemon) and `io.github.loekj.vdm.menubar.plist` (icon). The log is `~/.claude/account-switcher/dashboard.log` (emptied when it passes 10 MB).
-- **Stop for a while.** `vdm dashboard stop` stops vdm until your next login (or `vdm dashboard start`). A crash restarts it; a stop does not.
+- **Stop for a while.** `vdm dashboard stop` (or the icon's *Quit vdm…*) stops vdm until your next login (or `vdm dashboard start`). A crash restarts it; a stop does not.
 - **Your shell file** still sets `ANTHROPIC_BASE_URL`. It starts vdm only when the daemon is not loaded. vdm updates the block in place, also through a symlink (dotfiles repo), and keeps a backup (`.zshrc.vdm-backup`).
 - **Node from nvm, fnm, asdf, mise or volta?** The daemon remembers the real path of `node` (not the shim). If that version is removed, it falls back to Homebrew's `node`, and `vdm daemon status` tells you to run `vdm daemon on` again.
 - **No GUI login (only SSH)?** launchd cannot start the daemon then; `vdm dashboard start` and new terminals start vdm the old way.
 - **Sessions you start with *Start in background*** keep running when vdm restarts or upgrades.
-- **The icon** shows whether vdm runs (a warning sign when it is down, an hourglass when every account is used up). Its menu lists each account: active one ticked, `week 42%`, `fresh`, `used up · back in 2d 3h`, or `login expired`. It has *Open dashboard* and *Restart vdm*. It only reads what vdm already knows (`/api/profiles?light=1`: no extra requests to Anthropic), every 20 seconds.
+- **The icon** shows whether vdm runs (a warning sign when it is down, an hourglass when every account is used up). Its menu lists each account: active one ticked, `week 42%`, `fresh`, `used up · back in 2d 3h`, or `login expired`. It has *Open dashboard*, *Restart vdm*, **Quit vdm…** (stops vdm and the icon until your next login, or until `vdm dashboard start`; new terminals do not start it again while the daemon is on) and *Hide icon* (only the icon). To turn vdm off for good: `vdm daemon off` and `vdm menubar off`, or `./uninstall.sh`. While vdm is off, Claude Code in terminals with `ANTHROPIC_BASE_URL` set cannot reach Anthropic. It only reads what vdm already knows (`/api/profiles?light=1`: no extra requests to Anthropic), every 20 seconds.
 
 ## Usage
 
