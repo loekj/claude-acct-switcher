@@ -1045,3 +1045,12 @@ describe('liveUtil and ended windows', () => {
     assert.equal(pickConserve(accounts, sm(states)).name, 'busy');
   });
 });
+
+describe('parseRefreshResponse: rejected refresh token', () => {
+  it('marks only invalid_grant as rejected', () => {
+    assert.equal(parseRefreshResponse(400, '{"error":"invalid_grant","error_description":"Refresh token not found or invalid"}').rejected, true);
+    assert.equal(parseRefreshResponse(403, '<html>blocked</html>').rejected, false);
+    assert.equal(parseRefreshResponse(400, '{"error":"invalid_request"}').rejected, false);
+    assert.equal(parseRefreshResponse(503, '{"error":"invalid_grant"}').rejected, false);
+  });
+});

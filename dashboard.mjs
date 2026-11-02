@@ -352,6 +352,9 @@ function fetchAccountEmail(token) {
       let data = '';
       res.on('data', c => data += c);
       res.on('end', () => {
+        // '' = the server answered without an email; null = no real answer (no network,
+        // server error, busy), so the caller waits and asks again
+        if (res.statusCode >= 500 || res.statusCode === 429) { resolve(null); return; }
         try {
           const d = JSON.parse(data);
           const name = d.organization_name || '';
@@ -360,8 +363,8 @@ function fetchAccountEmail(token) {
         } catch { resolve(''); }
       });
     });
-    req.on('error', () => resolve(''));
-    req.on('timeout', () => { req.destroy(); resolve(''); });
+    req.on('error', () => resolve(null));
+    req.on('timeout', () => { req.destroy(); resolve(null); });
     req.end();
   });
 }
@@ -377,9 +380,9 @@ async function getEmailForToken(token, fp) {
   if (cached && Date.now() - cached.fetchedAt < (cached.email ? EMAIL_CACHE_TTL : EMAIL_RETRY_MS)) {
     return cached.email;
   }
-  const email = await fetchAccountEmail(token);
-  emailCache.set(fp, { email, fetchedAt: Date.now() });
-  return email;
+  const got = await fetchAccountEmail(token);
+  emailCache.set(fp, { email: got || '', answered: got !== null, fetchedAt: Date.now() });
+  return got || '';
 }
 
 // ─────────────────────────────────────────────────
@@ -430,7 +433,8 @@ function writeActivityFile() {
 
 // Check if the current keychain creds match a saved profile.
 // If not, auto-save them as a new account.
-let _discoverWaitFp = null;
+let _discoverWait = { fp: null, answeredSince: 0 };
+const DISCOVER_NAMELESS_AFTER_MS = Number(process.env.CSW_DISCOVER_NAMELESS_MS) || 10 * 60 * 1000; // env: tests
 // One run at a time: two requests at once both saw an unknown login and saved it twice.
 let _discoverRun = null;
 function autoDiscoverAccount() {
@@ -502,11 +506,18 @@ async function discoverAccountOnce() {
   // Truly new account  - save it. Without its email it may be a known account whose
   // lookup failed (no network after waking up): wait, the next request asks again.
   // A nameless copy would only turn into a dead "auto-N" card later.
+  // If the server keeps answering without an email (not a network problem), save it
+  // without a name after 10 minutes, so the account is still used.
   const scopes = creds.claudeAiOauth.scopes;
   if (!email && (!Array.isArray(scopes) || scopes.includes('user:profile'))) {
-    if (_discoverWaitFp !== fp) console.log('[auto-discover] New login, but its email lookup failed: waiting before saving it');
-    _discoverWaitFp = fp;
-    return;
+    if (_discoverWait.fp !== fp) {
+      _discoverWait = { fp, answeredSince: 0 };
+      console.log('[auto-discover] New login, but its email lookup failed: waiting before saving it');
+    }
+    const answered = emailCache.get(fp)?.answered === true;
+    if (answered && !_discoverWait.answeredSince) _discoverWait.answeredSince = Date.now();
+    if (!answered || Date.now() - _discoverWait.answeredSince < DISCOVER_NAMELESS_AFTER_MS) return;
+    console.log('[auto-discover] The server gives no email for this login: saving it without a name');
   }
   let idx = 1;
   while (existsSync(join(ACCOUNTS_DIR, `auto-${idx}.json`))) idx++;
@@ -816,6 +827,10 @@ async function loadProfiles() {
       if (!email) {
         try { email = (await readFile(join(ACCOUNTS_DIR, `${name}.label`), 'utf8')).trim(); } catch {}
       }
+      if (!email) {
+        // Learned later (rememberAccountEmail writes only .email)
+        try { email = (await readFile(join(ACCOUNTS_DIR, `${name}.email`), 'utf8')).trim(); } catch {}
+      }
 
       const isLogin = fp === activeFp;               // Claude Code's own login (keychain)
       const isActive = routeName ? routeName === name : isLogin; // where new requests go
@@ -942,13 +957,15 @@ async function loadProfiles() {
     if (keepNew) keys.forEach(k => seen.set(k, i));
   }
 
-  // A nameless account ("auto-N") whose login is expired and whose refresh token was
-  // rejected can never work again, and nothing tells which account it was: remove it.
+  // A nameless account ("auto-N", no email in .label or .email) whose login is expired and
+  // whose refresh token the OAuth server rejected (invalid_grant, for 30 minutes: not one odd
+  // answer) can never work again, and nothing tells which account it was: remove it.
   // Logging in again with /login adds that account back, with its email.
   for (let i = 0; i < profiles.length; i++) {
     const p = profiles[i];
     if (toRemove.has(i) || p.label !== p.name || p.isLogin || p.isActive) continue;
-    const dead = p.expiresAt && p.expiresAt < Date.now() && p.refreshFailed && p.refreshFailed.retriable === false;
+    const since = p.refreshFailed?.rejectedSince || 0;
+    const dead = p.expiresAt && p.expiresAt < Date.now() && since && Date.now() - since >= DEAD_LOGIN_AFTER_MS;
     if (!dead || !removeFiles(p, 'nameless login that can no longer refresh')) continue;
     sessionStore.unpinAccount(p.name);
     markSessionsDirty();
@@ -964,6 +981,8 @@ async function loadProfiles() {
 
   return profiles;
 }
+
+const DEAD_LOGIN_AFTER_MS = Number(process.env.CSW_DEAD_LOGIN_MS) || 30 * 60 * 1000; // env: tests
 
 // ─────────────────────────────────────────────────
 // API handlers
@@ -5852,7 +5871,12 @@ async function refreshAccountToken(accountName, { force = false, staleToken = nu
 
     if (!result.ok) {
       log('refresh', `${accountName}: refresh failed after retries: ${result.error}`);
-      refreshFailures.set(accountName, { error: result.error, retriable: !!result.retriable, ts: Date.now(), fp: oldFp });
+      const prevFail = refreshFailures.get(accountName);
+      refreshFailures.set(accountName, {
+        error: result.error, retriable: !!result.retriable, ts: Date.now(), fp: oldFp,
+        // first time the OAuth server rejected this token (invalid_grant), for the dead-login cleanup
+        rejectedSince: result.rejected ? (prevFail?.rejectedSince && prevFail.fp === oldFp ? prevFail.rejectedSince : Date.now()) : 0,
+      });
       logActivity('refresh-failed', { account: accountLabel, error: result.error, retriable: !!result.retriable });
       return { ok: false, error: result.error };
     }

@@ -969,12 +969,14 @@ export function parseRefreshResponse(statusCode, bodyStr) {
   // Retriable: 429 (rate limit), 500+ (server errors)
   const retriable = statusCode === 429 || statusCode >= 500;
   let error = `HTTP ${statusCode}`;
+  let rejected = false;   // the OAuth server says this refresh token is dead (invalid_grant)
   try {
     const data = JSON.parse(bodyStr);
+    rejected = statusCode === 400 && data.error === 'invalid_grant';
     const raw = data.error_description || data.error || data.message || error;
     error = typeof raw === 'string' ? raw : (raw && raw.message) || JSON.stringify(raw);
   } catch {}
-  return { ok: false, error, retriable };
+  return { ok: false, error, retriable, rejected };
 }
 
 /**
