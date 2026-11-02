@@ -49,6 +49,15 @@ echo ""
 
 # ── 1. Stop running processes ──
 
+# Daemon and menu bar icon (LaunchAgents)
+for label in io.github.loekj.vdm io.github.loekj.vdm.menubar; do
+  launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+  if [[ -f "$HOME/Library/LaunchAgents/$label.plist" ]]; then
+    rm -f "$HOME/Library/LaunchAgents/$label.plist"
+    echo -e "  ${GREEN}✓${NC} Removed $label"
+  fi
+done
+
 stopped=false
 
 # Try vdm dashboard stop

@@ -14,6 +14,15 @@ PROXY_PORT="${CSW_PROXY_PORT:-3334}"
 DASHBOARD_PID_FILE="$SCRIPT_DIR/.dashboard.pid"
 CONFIG_FILE="$SCRIPT_DIR/config.json"
 ACTIVITY_LOG_FILE="$SCRIPT_DIR/activity-log.json"
+# Daemon (macOS LaunchAgent: runs as you, no admin password) and the menu bar icon
+LAUNCH_LABEL="${VDM_LAUNCH_LABEL:-io.github.loekj.vdm}"
+LAUNCH_DIR="${VDM_LAUNCH_AGENTS_DIR:-$HOME/Library/LaunchAgents}"
+DAEMON_PLIST="$LAUNCH_DIR/$LAUNCH_LABEL.plist"
+DAEMON_LOG="$SCRIPT_DIR/dashboard.log"
+MENU_LABEL="$LAUNCH_LABEL.menubar"
+MENU_PLIST="$LAUNCH_DIR/$MENU_LABEL.plist"
+MENU_APP="$SCRIPT_DIR/VdmMenu.app"
+GUI_DOMAIN="gui/$(id -u)"
 
 # Colors
 RED='\033[0;31m'
@@ -745,6 +754,7 @@ cmd_config() {
     echo -e "  ${DIM}  vdm config keep-warm on|off${NC}  ${DIM}keep idle sessions' prompt cache warm (learned limits)${NC}"
     echo -e "  ${DIM}  vdm config claude-cmd 'claude --flags'${NC}  ${DIM}how vdm starts Claude Code (full command, not an alias)${NC}"
     echo -e "  ${DIM}  vdm config history-keep 0|90|180|365|730${NC}  ${DIM}days to keep saved sessions (0 = forever)${NC}"
+    echo -e "  ${DIM}  vdm config terminal auto|iterm|terminal${NC}  ${DIM}where History → Open starts sessions${NC}"
     return 0
   fi
 
@@ -766,9 +776,10 @@ cmd_config() {
       # Allow it unquoted: vdm config claude-cmd claude --dangerously-skip-permissions
       if [[ $# -gt 2 ]]; then shift; value="$*"; fi ;;
     history-keep|historyRetentionDays|history-retention) key="historyRetentionDays"; is_bool=false ;;
+    terminal|terminalApp|terminal-app) key="terminalApp"; is_bool=false ;;
     *)
       echo -e "${RED}Unknown setting: $key${NC}"
-      echo "  Available: proxy, autoswitch, notifications, rotation, interval, max-concurrent, serialize, serialize-delay, affinity, history, keep-warm, claude-cmd, history-keep"
+      echo "  Available: proxy, autoswitch, notifications, rotation, interval, max-concurrent, serialize, serialize-delay, affinity, history, keep-warm, claude-cmd, history-keep, terminal"
       return 1
       ;;
   esac
@@ -843,6 +854,13 @@ cmd_config() {
     value=$((10#$value))
     set_config_number "$key" "$value"
     echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value}${NC}  ${DIM}concurrent in-flight per account${NC}"
+  elif [[ "$key" == "terminalApp" ]]; then
+    case "$value" in
+      auto|iterm|terminal) ;;
+      *) echo -e "${RED}Invalid terminal: $value${NC}  (use auto, iterm or terminal)"; return 1 ;;
+    esac
+    set_config_string "$key" "$value"
+    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}$value${NC}  ${DIM}(History → Open uses it)${NC}"
   elif [[ "$key" == "claudeCommand" ]]; then
     if [[ ${#value} -gt 300 || "$value" == *$'\n'* ]]; then
       echo -e "${RED}Invalid command${NC}  (one line, max 300 characters)"
@@ -851,7 +869,7 @@ cmd_config() {
     local first="${value%% *}"
     first="${first/#\~/$HOME}"
     if ! command -v "$first" >/dev/null 2>&1; then
-      echo -e "${YELLOW}Warning:${NC} '$first' is not a command vdm can run (shell aliases do not work here)."
+      echo -e "${YELLOW}Note:${NC} '$first' is not a program. Fine for an alias: History → Open runs it in your shell. Copied commands and vdm history resume need the full command."
     fi
     set_config_text "$key" "$value"
     echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value}${NC}"
@@ -882,6 +900,16 @@ cmd_dashboard() {
 
   case "$action" in
     stop)
+      if daemon_loaded; then
+        # SIGTERM = a clean exit, so launchd does not restart it (until login or vdm dashboard start)
+        launchctl kill SIGTERM "$GUI_DOMAIN/$LAUNCH_LABEL" 2>/dev/null || true
+        if wait_port_free "$DASHBOARD_PORT" 10; then
+          echo -e "${GREEN}✓${NC} Dashboard stopped. ${DIM}The daemon starts it at your next login, or now with: vdm dashboard start${NC}"
+          return 0
+        fi
+        echo -e "${YELLOW}Port $DASHBOARD_PORT is still in use (PID $(port_pid "$DASHBOARD_PORT")).${NC}"
+        return 1
+      fi
       # Try PID file first, then fall back to port-based detection
       local stopped=false
       if [[ -f "$DASHBOARD_PID_FILE" ]]; then
@@ -901,6 +929,8 @@ cmd_dashboard() {
         fi
       fi
       if [[ "$stopped" == "true" ]]; then
+        wait_port_free "$DASHBOARD_PORT" 10 || true
+        wait_port_free "$PROXY_PORT" 5 || true
         echo -e "${GREEN}✓${NC} Dashboard stopped."
       else
         echo -e "${YELLOW}Dashboard was not running.${NC}"
@@ -924,6 +954,20 @@ cmd_dashboard() {
         return 0
       fi
 
+      if daemon_installed; then
+        echo -e "${BLUE}Starting vdm (daemon)…${NC}"
+        if daemon_start; then
+          echo -e "${GREEN}✓${NC} Dashboard running: ${CYAN}http://localhost:$DASHBOARD_PORT${NC}"
+          [[ "${2:-}" == "--no-open" ]] || open "http://localhost:$DASHBOARD_PORT" 2>/dev/null || true
+          return 0
+        fi
+        if port_listening "$DASHBOARD_PORT"; then
+          echo -e "${RED}vdm did not stay up.${NC} See ${DIM}$DAEMON_LOG${NC}"
+          return 1
+        fi
+        # No GUI login (e.g. only SSH) or launchd refused: run it the old way
+        echo -e "${YELLOW}The daemon could not start${NC} ${DIM}(see $DAEMON_LOG)${NC}. Starting vdm without it."
+      fi
       echo -e "${BLUE}Starting dashboard on http://localhost:$DASHBOARD_PORT${NC}"
       node "$SCRIPT_DIR/dashboard.mjs" &
       local pid=$!
@@ -948,8 +992,313 @@ cmd_dashboard() {
   esac
 }
 
+# ─────────────────────────────────────────────────────────
+# Daemon: launchd starts vdm at login and again after a crash
+# ─────────────────────────────────────────────────────────
+
+daemon_installed() { [[ -f "$DAEMON_PLIST" ]]; }
+daemon_loaded() { launchctl print "$GUI_DOMAIN/$LAUNCH_LABEL" >/dev/null 2>&1; }
+port_listening() { lsof -iTCP:"$1" -sTCP:LISTEN -t >/dev/null 2>&1; }
+
+wait_for_port() { # port, seconds
+  local i
+  for ((i = 0; i < $2 * 4; i++)); do port_listening "$1" && return 0; sleep 0.25; done
+  return 1
+}
+wait_port_free() {
+  local i
+  for ((i = 0; i < $2 * 4; i++)); do port_listening "$1" || return 0; sleep 0.25; done
+  return 1
+}
+
+# Write a LaunchAgent plist. Args: path label program [args...]. Env: PLIST_KEEPALIVE=1, PLIST_LOG=file.
+# Settings vdm reads from the environment (CSW_*, VDM_CLAUDE_CMD) go along, so the daemon
+# behaves like the shell that turned it on.
+write_plist() {
+  local path="$1"; shift
+  mkdir -p "$(dirname "$path")"
+  python3 - "$path" "$@" <<'PY'
+import os, plistlib, sys
+path, label, *args = sys.argv[1:]
+home = os.environ["HOME"]
+keep = lambda k: k.startswith("CSW_") or k in ("VDM_CLAUDE_CMD", "OAUTH_TOKEN_URL")
+env = {}
+# Settings saved by an earlier `vdm daemon on` stay (e.g. a custom CSW_PORT); this shell's win
+try:
+    old = plistlib.load(open(path, "rb")).get("EnvironmentVariables", {})
+    env.update({k: v for k, v in old.items() if keep(k)})
+except Exception:
+    pass
+env.update({k: v for k, v in os.environ.items() if keep(k)})
+node = os.environ.get("PLIST_NODE", "")
+dirs = [os.path.dirname(node) if node else "", home + "/.local/bin", "/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin", "/usr/sbin", "/sbin"]
+env["PATH"] = ":".join(d for i, d in enumerate(dirs) if d and d not in dirs[:i])
+env["VDM_LAUNCH_LABEL"] = os.environ.get("VDM_LAUNCH_LABEL") or (label[:-len(".menubar")] if label.endswith(".menubar") else label)
+if node:
+    # Node moved (nvm/fnm/volta switch, brew reinstall)? Fall back to the usual places.
+    env["VDM_NODE"] = node
+    args = ["/bin/sh", "-c", 'for n in "$VDM_NODE" /opt/homebrew/bin/node /usr/local/bin/node; do [ -x "$n" ] && exec "$n" "$0"; done; echo "vdm: Node.js not found (run: vdm daemon on)" >&2; exit 1'] + args
+p = {"Label": label, "ProgramArguments": args, "RunAtLoad": True, "EnvironmentVariables": env,
+     "WorkingDirectory": os.path.dirname(os.path.abspath(args[-1])) if args[-1].endswith(".mjs") else home}
+if os.environ.get("PLIST_KEEPALIVE") == "1":
+    p["KeepAlive"] = {"SuccessfulExit": False}   # restart after a crash, not after vdm dashboard stop
+    p["ThrottleInterval"] = 10
+    p["ProcessType"] = "Interactive"             # every Claude request streams through it: no throttling
+    p["AbandonProcessGroup"] = True              # sessions started with `claude --bg` outlive a restart
+if os.environ.get("PLIST_LOG"):
+    p["StandardOutPath"] = p["StandardErrorPath"] = os.environ["PLIST_LOG"]
+    env["VDM_DAEMON_LOG"] = os.environ["PLIST_LOG"]
+if label.endswith(".menubar"):
+    p["LimitLoadToSessionType"] = "Aqua"
+    p["ProcessType"] = "Interactive"
+with open(path + ".tmp", "wb") as f:
+    plistlib.dump(p, f)
+os.replace(path + ".tmp", path)
+PY
+}
+
+# The real Node binary, not a version-manager shim or a per-shell link (asdf, mise, fnm)
+real_node() {
+  local n; n="$(command -v node)" || return 1
+  "$n" -e 'process.stdout.write(process.execPath)' 2>/dev/null || echo "$n"
+}
+
+write_daemon_plist() {
+  local node_bin
+  node_bin="$(real_node)" || { echo -e "${RED}Node.js was not found.${NC}"; return 1; }
+  PLIST_KEEPALIVE=1 PLIST_LOG="$DAEMON_LOG" PLIST_NODE="$node_bin" write_plist "$DAEMON_PLIST" "$LAUNCH_LABEL" "$SCRIPT_DIR/dashboard.mjs"
+}
+
+# Load (or reload) the daemon so it reads its plist again, then wait for the dashboard.
+daemon_pid() { launchctl print "$GUI_DOMAIN/$LAUNCH_LABEL" 2>/dev/null | awk '/^\tpid = /{print $3}' || true; }
+port_pid() { lsof -iTCP:"$1" -sTCP:LISTEN -t 2>/dev/null | head -1 || true; }
+
+# Load a LaunchAgent: a few tries (right after a bootout, launchd may still be busy with it).
+# Turned off under Login Items? `vdm … on` means on: enable it again. Prints launchctl's error.
+load_agent() { # label plist
+  local i err=""
+  launchctl enable "$GUI_DOMAIN/$1" 2>/dev/null || true
+  for i in 1 2 3 4 5; do
+    err=$(launchctl bootstrap "$GUI_DOMAIN" "$2" 2>&1) && return 0
+    launchctl print "$GUI_DOMAIN/$1" >/dev/null 2>&1 && { launchctl kickstart "$GUI_DOMAIN/$1" 2>/dev/null; return 0; }
+    sleep 1
+  done
+  echo -e "  ${DIM}launchctl: ${err}${NC}" >&2
+  return 1
+}
+
+daemon_start() {
+  launchctl bootout "$GUI_DOMAIN/$LAUNCH_LABEL" 2>/dev/null || true
+  wait_port_free "$DASHBOARD_PORT" 10 || true
+  wait_port_free "$PROXY_PORT" 5 || true
+  load_agent "$LAUNCH_LABEL" "$DAEMON_PLIST" || return 1   # e.g. no GUI login (SSH only)
+  wait_for_port "$DASHBOARD_PORT" 15 && wait_for_port "$PROXY_PORT" 5 || return 1
+  sleep 1   # still up a moment later? (another vdm on the port makes it exit)
+  local pid; pid=$(daemon_pid)
+  if [[ -z "$pid" || "$(port_pid "$DASHBOARD_PORT")" != "$pid" ]]; then
+    echo -e "  ${YELLOW}Another vdm holds port $DASHBOARD_PORT (PID $(port_pid "$DASHBOARD_PORT")).${NC} Stop it, then: vdm daemon restart" >&2
+    return 1
+  fi
+}
+
+# vdm started the old way (from the shell, no launchd): stop it
+stop_plain_dashboard() {
+  local pid
+  if [[ -f "$DASHBOARD_PID_FILE" ]]; then kill "$(cat "$DASHBOARD_PID_FILE")" 2>/dev/null || true; rm -f "$DASHBOARD_PID_FILE"; fi
+  pid=$(lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) || true
+  [[ -n "$pid" ]] && kill "$pid" 2>/dev/null || true
+  wait_port_free "$DASHBOARD_PORT" 10 || true
+  wait_port_free "$PROXY_PORT" 5 || true
+}
+
+# The shell block: sets ANTHROPIC_BASE_URL; starts vdm only when the daemon is not installed.
+shell_block() {
+  cat <<SHELL_EOF
+# BEGIN claude-account-switcher
+if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then
+  # The daemon (vdm daemon on) runs vdm when it is loaded; else start it here
+  if ! { [ -f "\$HOME/Library/LaunchAgents/$LAUNCH_LABEL.plist" ] && launchctl print "gui/\$(id -u)/$LAUNCH_LABEL" >/dev/null 2>&1; }; then
+    nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &
+    disown
+  fi
+fi
+export ANTHROPIC_BASE_URL=http://localhost:3334
+# END claude-account-switcher
+SHELL_EOF
+}
+
+# Add the shell block, or replace older ones (in every shell file that has one).
+# Writes through symlinks (dotfile repos) and keeps the file mode. Prints the file(s).
+cmd_setup_shell() {
+  local f found=()
+  for f in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile" "$HOME/.zprofile" "$HOME/.profile"; do
+    if [[ -f "$f" ]] && grep -q "^# BEGIN claude-account-switcher" "$f"; then found+=("$f"); fi
+  done
+  local block
+  block="$(shell_block)"
+  if [[ ${#found[@]} -gt 0 ]]; then
+    for f in "${found[@]}"; do
+      BLOCK="$block" python3 - "$f" <<'PY'
+import os, re, shutil, sys, tempfile
+path = os.path.realpath(sys.argv[1])          # a symlink (dotfiles repo): change the real file
+text = open(path).read()
+new = re.sub(r"(?ms)^# BEGIN claude-account-switcher\n.*?^# END claude-account-switcher\n?", lambda m: os.environ["BLOCK"] + "\n", text, count=1)
+if new != text:
+    shutil.copy2(path, path + ".vdm-backup")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".vdm-")
+    with os.fdopen(fd, "w") as f:
+        f.write(new)
+    shutil.copymode(path, tmp)
+    os.replace(tmp, path)
+PY
+    done
+    echo "${found[0]}"
+    return 0
+  fi
+  local rc=""
+  for f in "$HOME/.zshrc" "$HOME/.bashrc" "$HOME/.bash_profile"; do [[ -f "$f" ]] && { rc="$f"; break; }; done
+  if [[ -z "$rc" ]]; then
+    # A new Mac has no shell file yet: make the one your login shell reads
+    case "$(basename "${SHELL:-/bin/zsh}")" in
+      zsh) rc="$HOME/.zshrc" ;;
+      bash) rc="$HOME/.bash_profile" ;;
+      *) echo ""; return 1 ;;
+    esac
+    touch "$rc"
+  fi
+  printf '\n%s\n' "$block" >> "$rc"
+  echo "$rc"
+}
+
+cmd_daemon() {
+  local action="${1:-status}"
+  case "$action" in
+    on|install)
+      if [[ "$(uname)" != "Darwin" ]]; then echo -e "${RED}The daemon needs macOS (launchd).${NC}"; return 1; fi
+      local node_bin; node_bin="$(real_node || true)"
+      if [[ "$node_bin" != /opt/homebrew/* && "$node_bin" != /usr/local/* ]]; then
+        echo -e "${YELLOW}Note:${NC} Node is at ${DIM}$node_bin${NC}. If that path changes (new Node version), run ${CYAN}vdm daemon on${NC} again."
+      fi
+      write_daemon_plist || return 1
+      if ! daemon_loaded; then stop_plain_dashboard; fi
+      cmd_setup_shell >/dev/null || true
+      if daemon_start; then
+        echo -e "${GREEN}✓${NC} Daemon on: vdm starts when you log in, and again after a crash."
+        echo -e "  ${DIM}macOS may show \"Background item added\". No admin password is needed.${NC}"
+        echo -e "  ${DIM}Log: $DAEMON_LOG${NC}"
+      else
+        echo -e "${RED}The daemon did not start within 15 s.${NC} See ${DIM}$DAEMON_LOG${NC}"
+        return 1
+      fi
+      ;;
+    off|uninstall)
+      local had=false
+      if daemon_loaded; then launchctl bootout "$GUI_DOMAIN/$LAUNCH_LABEL" 2>/dev/null || true; had=true; fi
+      [[ -f "$DAEMON_PLIST" ]] && { rm -f "$DAEMON_PLIST"; had=true; }
+      wait_port_free "$DASHBOARD_PORT" 10 || true
+      wait_port_free "$PROXY_PORT" 5 || true
+      if [[ "${2:-}" != "--no-start" ]] && ! port_listening "$DASHBOARD_PORT"; then
+        # Keep the proxy up: start it the old way (your shell also does this in new terminals)
+        nohup node "$SCRIPT_DIR/dashboard.mjs" >/dev/null 2>&1 &
+        echo $! > "$DASHBOARD_PID_FILE"
+        disown 2>/dev/null || true
+        wait_for_port "$DASHBOARD_PORT" 10 || echo -e "${RED}vdm did not start.${NC} Run: vdm dashboard start"
+      fi
+      if [[ "$had" == "true" ]]; then echo -e "${GREEN}✓${NC} Daemon off. New terminals start vdm again, as before."
+      else echo -e "${DIM}The daemon was not installed.${NC}"; fi
+      ;;
+    restart)
+      if ! daemon_installed; then echo -e "${YELLOW}The daemon is off.${NC} Turn it on: ${CYAN}vdm daemon on${NC}"; return 1; fi
+      daemon_start && echo -e "${GREEN}✓${NC} vdm restarted" || { echo -e "${RED}vdm did not start.${NC} See ${DIM}$DAEMON_LOG${NC}"; return 1; }
+      ;;
+    status)
+      if daemon_installed; then
+        local pid; pid=$(launchctl print "$GUI_DOMAIN/$LAUNCH_LABEL" 2>/dev/null | awk '/^\tpid = /{print $3}') || true
+        local node_bin; node_bin=$(plutil -extract EnvironmentVariables.VDM_NODE raw "$DAEMON_PLIST" 2>/dev/null) || true
+        if [[ -n "$node_bin" && ! -x "$node_bin" ]]; then
+          echo -e "${YELLOW}!${NC} The daemon's Node ($node_bin) is gone. Run ${CYAN}vdm daemon on${NC} to use the current one."
+        fi
+        if [[ -n "$pid" ]]; then echo -e "${GREEN}●${NC} Daemon on, running (PID $pid)"
+        elif daemon_loaded; then echo -e "${YELLOW}●${NC} Daemon on, stopped. Start it: ${CYAN}vdm dashboard start${NC}"
+        else echo -e "${YELLOW}●${NC} Daemon installed, not loaded. Start it: ${CYAN}vdm daemon on${NC}"; fi
+        echo -e "  ${DIM}Log: $DAEMON_LOG${NC}"
+      else
+        echo -e "${DIM}●${NC} Daemon off (your shell starts vdm). Turn it on: ${CYAN}vdm daemon on${NC}"
+      fi
+      if port_listening "$DASHBOARD_PORT"; then echo -e "  Dashboard: ${CYAN}http://localhost:$DASHBOARD_PORT${NC}"; else echo -e "  ${RED}Dashboard is not running${NC}"; fi
+      ;;
+    *) echo -e "${RED}Usage: vdm daemon [on|off|restart|status]${NC}"; return 1 ;;
+  esac
+}
+
+# ─────────────────────────────────────────────────────────
+# Menu bar icon: a small native app, built here from source
+# (swiftc from the Command Line Tools: no download, no signing)
+# ─────────────────────────────────────────────────────────
+
+has_swiftc() { xcode-select -p >/dev/null 2>&1 && xcrun --find swiftc >/dev/null 2>&1; }
+
+build_menubar() {
+  local src="$SCRIPT_DIR/menubar/VdmMenu.swift" tmp="$SCRIPT_DIR/.VdmMenu.app.new"
+  if [[ ! -f "$src" ]]; then
+    # Upgraded by an older vdm, which did not copy menubar/: fetch it now
+    local t; t=$(mktemp -d)
+    if git clone --depth 1 --quiet "${VDM_REPO_URL:-https://github.com/loekj/claude-acct-switcher.git}" "$t" 2>/dev/null && [[ -f "$t/menubar/VdmMenu.swift" ]]; then
+      mkdir -p "$SCRIPT_DIR/menubar" && cp "$t"/menubar/*.swift "$SCRIPT_DIR/menubar/"
+    fi
+    rm -rf "$t"
+    [[ -f "$src" ]] || { echo -e "${RED}menubar/VdmMenu.swift is missing.${NC} Run: vdm upgrade"; return 1; }
+  fi
+  rm -rf "$tmp"; mkdir -p "$tmp/Contents/MacOS"
+  python3 - "$tmp/Contents/Info.plist" <<'PY'
+import plistlib, sys
+plistlib.dump({"CFBundleName": "VdmMenu", "CFBundleDisplayName": "vdm", "CFBundleIdentifier": "io.github.loekj.vdm.menubar",
+  "CFBundleExecutable": "VdmMenu", "CFBundlePackageType": "APPL", "CFBundleShortVersionString": "1.0", "LSUIElement": True,
+  "NSAppTransportSecurity": {"NSAllowsLocalNetworking": True}}, open(sys.argv[1], "wb"))
+PY
+  echo -e "  ${DIM}Building the menu bar app (about a minute the first time)…${NC}"
+  if ! xcrun swiftc -O -swift-version 5 -o "$tmp/Contents/MacOS/VdmMenu" "$src" >"$SCRIPT_DIR/menubar-build.log" 2>&1; then
+    rm -rf "$tmp"
+    echo -e "${RED}The build failed.${NC} See ${DIM}$SCRIPT_DIR/menubar-build.log${NC}"
+    return 1
+  fi
+  codesign --force -s - "$tmp" >/dev/null 2>&1 || true   # ad-hoc signature, made on this Mac
+  rm -rf "$MENU_APP"; mv "$tmp" "$MENU_APP"
+}
+
+cmd_menubar() {
+  local action="${1:-status}"
+  case "$action" in
+    on|install|rebuild)
+      if ! has_swiftc; then
+        echo -e "${YELLOW}The menu bar icon needs Apple's Command Line Tools (free, includes swiftc).${NC}"
+        echo -e "  Install them: ${CYAN}xcode-select --install${NC}   then run: ${CYAN}vdm menubar on${NC}"
+        echo -e "  ${DIM}vdm itself works without them.${NC}"
+        return 1
+      fi
+      build_menubar || return 1
+      write_plist "$MENU_PLIST" "$MENU_LABEL" "$MENU_APP/Contents/MacOS/VdmMenu"
+      launchctl bootout "$GUI_DOMAIN/$MENU_LABEL" 2>/dev/null || true
+      if ! load_agent "$MENU_LABEL" "$MENU_PLIST"; then
+        echo -e "${RED}The menu bar icon did not start.${NC}"
+        return 1
+      fi
+      echo -e "${GREEN}✓${NC} Menu bar icon on (it starts when you log in)."
+      ;;
+    off|uninstall)
+      launchctl bootout "$GUI_DOMAIN/$MENU_LABEL" 2>/dev/null || true
+      rm -f "$MENU_PLIST"; rm -rf "$MENU_APP"
+      echo -e "${GREEN}✓${NC} Menu bar icon off."
+      ;;
+    status)
+      if [[ -f "$MENU_PLIST" ]]; then echo -e "${GREEN}●${NC} Menu bar icon on"; else echo -e "${DIM}●${NC} Menu bar icon off. Turn it on: ${CYAN}vdm menubar on${NC}"; fi
+      ;;
+    *) echo -e "${RED}Usage: vdm menubar [on|off|status]${NC}"; return 1 ;;
+  esac
+}
+
 cmd_upgrade() {
-  local REPO_URL="https://github.com/loekj/claude-acct-switcher.git"
+  local REPO_URL="${VDM_REPO_URL:-https://github.com/loekj/claude-acct-switcher.git}"   # env: tests
   local tmpdir
   tmpdir=$(mktemp -d)
   # Ensure cleanup on any exit from this function
@@ -979,8 +1328,8 @@ cmd_upgrade() {
 
   # Same version, but a module is missing (an older upgrade did not know about it): repair
   local missing=""
-  for f in "$tmpdir"/*.mjs; do
-    [[ -f "$f" && ! -f "$SCRIPT_DIR/$(basename "$f")" ]] && missing="$missing $(basename "$f")"
+  for f in "$tmpdir"/*.mjs "$tmpdir"/menubar/*.swift; do
+    [[ -f "$f" && ! -f "$SCRIPT_DIR/${f#"$tmpdir"/}" ]] && missing="$missing ${f#"$tmpdir"/}"
   done
   if [[ -n "$current_hash" && "$current_hash" == "$latest_hash" && -z "$missing" ]]; then
     echo -e "  ${GREEN}✓${NC} Already on the latest version (${DIM}$current_hash${NC})"
@@ -1007,7 +1356,7 @@ cmd_upgrade() {
   # Stop dashboard before overwriting files
   if [[ "$dashboard_was_running" == "true" ]]; then
     echo -e "  ${DIM}Stopping dashboard…${NC}"
-    cmd_dashboard stop
+    cmd_dashboard stop >/dev/null || true
     # Also kill any process on the port not tracked by PID file (e.g. shell auto-start)
     local port_pid
     port_pid=$(lsof -iTCP:"$DASHBOARD_PORT" -sTCP:LISTEN -t 2>/dev/null | head -1) || true
@@ -1032,6 +1381,10 @@ cmd_upgrade() {
     fi
   done
   chmod +x "$SCRIPT_DIR/vdm"
+  if [[ -d "$tmpdir/menubar" ]]; then
+    mkdir -p "$SCRIPT_DIR/menubar"
+    cp "$tmpdir"/menubar/*.swift "$SCRIPT_DIR/menubar/" 2>/dev/null || true
+  fi
 
   # Write version marker
   echo "$latest_hash" > "$SCRIPT_DIR/.version"
@@ -1047,10 +1400,22 @@ cmd_upgrade() {
     fi
   fi
 
-  # Restart dashboard if it was running
-  if [[ "$dashboard_was_running" == "true" ]]; then
+  # The new script's shell block (this running script is the old version)
+  "$SCRIPT_DIR/vdm" _setup-shell >/dev/null 2>&1 || true
+
+  # Restart dashboard if it was running (the new script writes the plist and restarts it)
+  if daemon_installed; then
+    "$SCRIPT_DIR/vdm" _write-daemon-plist >/dev/null 2>&1 || true
+    echo -e "  ${DIM}Restarting vdm (daemon)…${NC}"
+    "$SCRIPT_DIR/vdm" daemon restart >/dev/null && echo -e "  ${GREEN}✓${NC} vdm running" || echo -e "  ${RED}vdm did not start.${NC} See ${DIM}$DAEMON_LOG${NC}"
+  elif [[ "$dashboard_was_running" == "true" ]]; then
     echo -e "  ${DIM}Restarting dashboard…${NC}"
     cmd_dashboard start
+  fi
+  # Rebuild the menu bar icon from the new source
+  if [[ -f "$MENU_PLIST" ]]; then echo -e "  ${DIM}Rebuilding the menu bar icon…${NC}"; "$SCRIPT_DIR/vdm" menubar on >/dev/null 2>&1 && echo -e "  ${GREEN}✓${NC} Menu bar icon rebuilt" || echo -e "  ${YELLOW}Menu bar icon not rebuilt.${NC} Run: vdm menubar on"; fi
+  if ! daemon_installed; then
+    echo -e "  ${DIM}New: run vdm as a daemon (starts at login, restarts after a crash):${NC} ${CYAN}vdm daemon on${NC}"
   fi
 
   echo ""
@@ -1268,6 +1633,8 @@ cmd_help() {
   echo -e "    ${CYAN}logs${NC} [filter]            Stream live proxy logs"
   echo -e "    ${CYAN}tokens${NC} [--days N]       Show token usage and API-price value"
   echo -e "    ${CYAN}history${NC} [cmd]            Search and continue saved sessions (vdm history help)"
+  echo -e "    ${CYAN}daemon${NC} [on|off|status]  Run vdm in the background: starts at login, restarts after a crash"
+  echo -e "    ${CYAN}menubar${NC} [on|off]        Menu bar icon (needs Command Line Tools: xcode-select --install)"
   echo -e "    ${CYAN}upgrade${NC}                 Update to the latest version"
   echo -e "    ${CYAN}help${NC}                    Show this help"
   echo ""
@@ -1313,6 +1680,10 @@ main() {
     tokens|tok) cmd_tokens "$@" ;;
     history|hist) cmd_history "$@" ;;
     upgrade|update) cmd_upgrade ;;
+    daemon) cmd_daemon "$@" ;;
+    menubar|menu) cmd_menubar "$@" ;;
+    _setup-shell) cmd_setup_shell ;;
+    _write-daemon-plist) write_daemon_plist ;;
     help|--help|-h) cmd_help ;;
     *)
       echo -e "${RED}Unknown command: $command${NC}"

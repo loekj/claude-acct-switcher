@@ -2182,3 +2182,101 @@ export function setTopLevelJsonFields(text, fields) {
     return out;
   } catch { return null; }
 }
+
+// ─────────────────────────────────────────────────
+// Open a saved session: in a terminal window, or in the background (claude --bg)
+// ─────────────────────────────────────────────────
+
+/** Quote one word for a POSIX shell (sh, bash, zsh). */
+export function shellQuote(s) {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
+/** Quote one word for fish: inside '...' only \\ and \' are special. */
+export function fishQuote(s) {
+  return `'${String(s).replace(/\\/g, '\\\\').replace(/'/g, "\\'")}'`;
+}
+
+const SESSION_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+/** One line of plain text (a session name): no control characters, at most `max` characters. */
+export function cleanLine(v, max = 80) {
+  return String(v ?? '').replace(/[\x00-\x1f\x7f]+/g, ' ').trim().slice(0, max);
+}
+
+/** A first message: keeps line breaks, drops other control characters. */
+export function cleanMessage(v, max = 4000) {
+  return String(v ?? '').replace(/\r\n?/g, '\n').replace(/[\x00-\x09\x0b-\x1f\x7f]/g, '').trim().slice(0, max);
+}
+
+/**
+ * The shell command that resumes a session. `claudeCommand` is the user's own command
+ * (it may be an alias, so it runs in an interactive shell). The prompt goes after `--`,
+ * so text starting with "-" is never read as an option.
+ */
+export function sessionLaunchCommand({ claudeCommand = 'claude', id, cwd, name = '', prompt = '', background = false, shell = 'posix' }) {
+  const q = shell === 'fish' ? fishQuote : shellQuote;
+  if (!SESSION_ID_RE.test(String(id || ''))) throw new Error('Bad session id');
+  const cmd = String(claudeCommand || 'claude').trim() || 'claude';
+  const parts = [cmd];
+  if (background) parts.push('--bg');
+  parts.push('--resume', id);
+  const n = cleanLine(name);
+  if (n) parts.push('--name', q(n));
+  const p = cleanMessage(prompt);
+  if (p) parts.push('--', q(p));
+  const run = parts.join(' ');
+  return cwd ? `cd ${shell === 'fish' ? '' : '-- '}${q(cwd)} && ${run}` : run;
+}
+
+export const TERMINAL_APPS = {
+  iterm: { label: 'iTerm', bundleId: 'com.googlecode.iterm2', app: 'iTerm.app' },
+  terminal: { label: 'Terminal', bundleId: 'com.apple.Terminal', app: 'Terminal.app' },
+};
+
+/**
+ * AppleScript lines that run argv[1] in a new terminal tab (iTerm) or window (Terminal),
+ * titled argv[2]. Command and title are passed as arguments, never pasted into the script.
+ */
+export function terminalScript(app) {
+  if (app === 'iterm') {
+    return [
+      'on run argv',
+      '  set cmd to item 1 of argv',
+      '  set title to item 2 of argv',
+      '  tell application id "com.googlecode.iterm2"',
+      '    activate',
+      '    set w to missing value',
+      '    try',
+      '      if (count of windows) > 0 then',
+      '        set w to current window',
+      '        tell w to create tab with default profile',
+      '      end if',
+      '    on error',
+      '      set w to missing value',
+      '    end try',
+      '    if w is missing value then set w to (create window with default profile)',
+      '    tell current session of w',
+      '      if title is not "" then set name to title',
+      '      write text cmd',
+      '    end tell',
+      '  end tell',
+      'end run',
+    ];
+  }
+  return [
+    'on run argv',
+    '  tell application id "com.apple.Terminal"',
+    '    activate',
+    '    do script (item 1 of argv)',
+    '  end tell',
+    'end run',
+  ];
+}
+
+/** Which terminal to use: the setting, or (auto) iTerm when it is installed. */
+export function pickTerminal(setting, installed) {
+  if (setting === 'iterm' && installed.iterm) return 'iterm';
+  if (setting === 'terminal') return 'terminal';
+  return installed.iterm ? 'iterm' : 'terminal';
+}
