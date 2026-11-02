@@ -36,7 +36,15 @@ import {
   usageScore,
   scoreAccountConserve,
   pickConserve,
+  shellQuote,
+  sessionLaunchCommand,
+  terminalScript,
+  pickTerminal,
+  cleanLine,
+  cleanMessage,
 } from '../lib.mjs';
+import { execFileSync } from 'node:child_process';
+import { existsSync } from 'node:fs';
 
 // ─────────────────────────────────────────────────
 // Existing function tests (sanity checks)
@@ -1043,5 +1051,60 @@ describe('liveUtil and ended windows', () => {
     assert.equal(scoreAccountConserve('ended', sm(states)), 0);
     const accounts = [{ name: 'ended', token: 'ended' }, { name: 'busy', token: 'busy' }];
     assert.equal(pickConserve(accounts, sm(states)).name, 'busy');
+  });
+});
+
+// ─────────────────────────────────────────────────
+// Opening a saved session
+// ─────────────────────────────────────────────────
+
+describe('sessionLaunchCommand', () => {
+  const id = '0123abcd-4567-89ab-cdef-0123456789ab';
+  const sh = (cmd) => execFileSync('/bin/sh', ['-c', cmd], { encoding: 'utf8' });
+
+  it('resumes in the folder, with name and first message', () => {
+    assert.equal(sessionLaunchCommand({ claudeCommand: 'csk', id, cwd: '/tmp/a b', name: 'Fix tests', prompt: 'go' }),
+      `cd -- '/tmp/a b' && csk --resume ${id} --name 'Fix tests' -- 'go'`);
+    assert.equal(sessionLaunchCommand({ id, background: true }), `claude --bg --resume ${id}`);
+  });
+
+  it('never lets name or message run as shell code', () => {
+    const evil = `x'; echo PWNED; '$(echo PWNED)\`echo PWNED\``;
+    const cmd = sessionLaunchCommand({ claudeCommand: 'printf "%s|"', id, name: evil, prompt: evil + '\nline 2' });
+    const out = sh(cmd);
+    assert.ok(!/^PWNED|\|PWNED\|/.test(out));
+    assert.ok(out.includes(`--name|${evil}|--|${evil}\nline 2|`), out);
+  });
+
+  it('refuses a bad session id', () => {
+    assert.throws(() => sessionLaunchCommand({ id: '1; rm -rf /' }), /Bad session id/);
+  });
+
+  it('cleans names and messages', () => {
+    assert.equal(cleanLine('a\nb\tc' + 'x'.repeat(100)).length, 80);
+    assert.equal(cleanLine(' a\u0007b '), 'a b');
+    assert.equal(cleanMessage('one\r\ntwo\u0000'), 'one\ntwo');
+  });
+
+  it('shellQuote survives quotes', () => {
+    assert.equal(sh(`printf %s ${shellQuote(`it's "ok"`)}`), `it's "ok"`);
+  });
+});
+
+describe('terminal choice', () => {
+  it('auto picks iTerm only when installed', () => {
+    assert.equal(pickTerminal('auto', { iterm: true }), 'iterm');
+    assert.equal(pickTerminal('auto', { iterm: false }), 'terminal');
+    assert.equal(pickTerminal('iterm', { iterm: false }), 'terminal');
+    assert.equal(pickTerminal('terminal', { iterm: true }), 'terminal');
+  });
+
+  it('the AppleScripts compile', { skip: process.platform !== 'darwin' }, () => {
+    // iTerm's words compile only where iTerm is installed
+    const hasIterm = ['/Applications/iTerm.app', `${process.env.HOME}/Applications/iTerm.app`].some(p => existsSync(p));
+    for (const app of hasIterm ? ['iterm', 'terminal'] : ['terminal']) {
+      const args = terminalScript(app).flatMap(l => ['-e', l]);
+      execFileSync('/usr/bin/osacompile', [...args, '-o', `/tmp/vdm-test-${process.pid}-${app}.scpt`]);
+    }
   });
 });

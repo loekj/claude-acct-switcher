@@ -33,9 +33,29 @@ cd claude-acct-switcher
 ./install.sh
 ```
 
-Restart your terminal. Done. The proxy auto-starts on new shells.
+Restart your terminal. Done.
 
-**Requirements:** macOS, Node.js 18+, python3, Claude Code CLI.
+The installer:
+- copies vdm to `~/.claude/account-switcher/` and links the `vdm` command,
+- sets `ANTHROPIC_BASE_URL=http://localhost:3334` in your shell file (`.zshrc` or `.bashrc`),
+- turns on the **daemon**: vdm runs in the background, starts when you log in, and starts again after a crash,
+- builds the **menu bar icon**, if the Command Line Tools are installed.
+
+**Requirements**
+
+| | Needed for |
+|---|---|
+| macOS | everything (vdm uses the Keychain and launchd) |
+| Node.js 18+ | vdm itself (`brew install node`) |
+| python3 | the `vdm` command (macOS has it) |
+| Claude Code CLI | the sessions vdm serves |
+| **Command Line Tools** (optional) | the menu bar icon. Install them with `xcode-select --install` (free, from Apple). Homebrew users already have them. Without them, vdm works, with no icon. |
+
+**No admin password.** The daemon and the icon are LaunchAgents in your own `~/Library/LaunchAgents/`: they run as you, so they can read your Keychain. macOS shows one notice, "Background item added". You can see and turn them off in System Settings → General → Login Items.
+
+**No App Store, no download to trust.** The menu bar icon is built on your Mac from its Swift source (`menubar/VdmMenu.swift`) by the installer. macOS checks only apps downloaded through a browser, so there is no "cannot be verified" warning, and no Apple developer account is needed.
+
+Skip parts: `VDM_NO_DAEMON=1 ./install.sh` (no daemon: new terminals start vdm, as in older versions), `VDM_NO_MENUBAR=1 ./install.sh` (no icon).
 
 ### Upgrade
 
@@ -52,6 +72,33 @@ git clone https://github.com/loekj/claude-acct-switcher.git && cd claude-acct-sw
 ```
 
 From v3.0.1 on, `vdm upgrade` handles this by itself.
+
+**Coming from v4.3 or older?** After `vdm upgrade`, turn on the new parts once:
+
+```bash
+vdm daemon on      # run vdm in the background (starts at login, restarts after a crash)
+vdm menubar on     # menu bar icon (needs the Command Line Tools: xcode-select --install)
+```
+
+From then on, `vdm upgrade` restarts the daemon and rebuilds the icon.
+
+### Daemon and menu bar icon
+
+```
+vdm daemon on        Run vdm under launchd: starts at login, starts again after a crash
+vdm daemon off       Stop that; new terminals start vdm again (the old way)
+vdm daemon status    Is it on, is it running, where is the log
+vdm daemon restart   Restart vdm
+vdm menubar on       Build and show the menu bar icon (also: rebuild it)
+vdm menubar off      Remove the icon
+```
+
+- **Why a daemon.** Without it, your shell starts vdm when you open a terminal. After a crash or a reboot, vdm stays down until you open a new terminal, and Claude Code cannot connect meanwhile. The daemon is the same program (same ports, same memory: about 70 MB), but macOS keeps it running.
+- **Files.** `~/Library/LaunchAgents/io.github.loekj.vdm.plist` (daemon) and `io.github.loekj.vdm.menubar.plist` (icon). The log is `~/.claude/account-switcher/dashboard.log` (emptied when it passes 10 MB).
+- **Stop for a while.** `vdm dashboard stop` stops vdm until your next login (or `vdm dashboard start`). A crash restarts it; a stop does not.
+- **Your shell file** still sets `ANTHROPIC_BASE_URL`. It starts vdm only when the daemon is off.
+- **Node from nvm/fnm/volta?** The daemon remembers the path of `node`. After you change Node versions, run `vdm daemon on` again.
+- **The icon** shows whether vdm runs (a warning sign when it is down, an hourglass when every account is used up). Its menu lists each account: active one ticked, `week 42%`, `fresh`, `used up · back in 2d 3h`, or `login expired`. It has *Open dashboard* and *Restart vdm*. It only reads `http://localhost:3333/api/profiles`.
 
 ## Usage
 
@@ -74,6 +121,8 @@ vdm dashboard [start|stop]  Dashboard control
 vdm logs [filter]           Stream live proxy logs
 vdm tokens [--days N]       Show token usage and API-price value
 vdm history [cmd]           Search and continue saved sessions (see below)
+vdm daemon [on|off|status]  Run vdm in the background (see above)
+vdm menubar [on|off]        Menu bar icon
 vdm upgrade                 Update to latest version
 ```
 
@@ -83,7 +132,15 @@ vdm upgrade                 Update to latest version
 
 #### Accounts
 
-Per account: 5h and weekly windows, plus a small **Fable weekly** bar next to the weekly countdown when the account has that bucket (Fable has its own weekly limit). Under them, a line shows the account's **token throughput** (all models, incl. cache reads) per 5 minutes: the last 24 hours, and the last 7 days as hourly averages. All accounts share one scale, so a busy account stands out; above the **hot line** (Config → Advanced, default 25M tokens per 5 minutes) the line turns red.
+Per account: 5h and weekly windows, plus a **Fable weekly** bar under the weekly one when the account has that bucket (Fable has its own weekly limit). Under each bar:
+
+- `2d 5h left`: time until the window resets.
+- **Fresh: starts when used**: the window's reset time has passed, so it is empty again. Its next request starts a new window. (Use outside vdm, e.g. on claude.ai, shows after vdm sends a request on that account.) The strategies count such a window as 0%, so Conserve keeps a fresh week for later.
+- **Not started**: no window is running.
+
+A red banner above the bars means a limit is used up (`back in …`). A red line under them means the login expired. Under them, a line shows the account's **token throughput** (all models, incl. cache reads) per 5 minutes: the last 24 hours, and the last 7 days as hourly averages. All accounts share one scale, so a busy account stands out; above the **hot line** (Config → Advanced, default 25M tokens per 5 minutes) the line turns red.
+
+Accounts are named by their email. vdm saves a new login only once it knows that email: after a wake without network it waits instead of saving a nameless `auto-N` copy. Two saved copies of one login (same email or same refresh token) are merged, and a nameless login whose refresh token was rejected is removed (Activity says so). Run `/login` again to add that account back.
 
 Usage, charts and saved sessions are kept per account **email** (stored in `accounts/<name>.email`), so they carry on after a re-login, a token refresh, or removing and adding an account again. Each card shows how many Claude Code sessions ran through it in the last 24 hours (a link to them in the Sessions tab) and how many artifacts it owns.
 
@@ -125,7 +182,13 @@ vdm config history on
 - **Search everything.** Your prompts, Claude's replies, file names and commands are indexed (full-text, on this computer; no AI, no extra cost). Filters: `file:app.js`, `branch:fix`, `project:x`, `account:a@b`, `after:2026-09-01`, `"exact words"`. Each result shows your first and last prompt and the files it changed; the detail view adds its cost at API prices.
 - **Continue in a new session.** *Copy prompt* writes a handoff file (Claude Code's latest compaction summary, the newest messages, files changed, last commands) and copies a one-line prompt. Paste it into any new Claude session. Or run `vdm history continue <id>` to open a new session in the right folder with the handoff loaded.
 - **Resume exactly.** `vdm history resume <id>` runs `claude --resume` in the session's folder. If Claude Code already deleted the session, vdm puts its copy back first (it never overwrites a file).
-- **Your launch command.** If you start Claude Code with flags (or an alias), set the full command once: `vdm config claude-cmd 'claude --dangerously-skip-permissions'`. Shell aliases do not work inside vdm. `VDM_CLAUDE_CMD` overrides it.
+- **Open from the dashboard.** Each History row has **Open** and **Copy resume**:
+  - **Open** asks for a session **name** (filled in with the title; shown in the terminal title and in `/resume`) and an optional **first message** (Claude starts on it at once). Then:
+    - **Open in iTerm / Terminal** opens a new tab (iTerm) or window (Terminal) that runs `cd <folder> && <launch command> --resume <id> --name <name> -- <message>`. Pick the app in Config → *Open sessions in* (Auto = iTerm when installed) or `vdm config terminal auto|iterm|terminal`. The first time, macOS asks to let vdm control that app (System Settings → Privacy & Security → Automation).
+    - **Start in background** runs the same with `claude --bg`: no window. Open it later with `claude attach <id>` (the dialog shows and copies it); `claude agents` lists them. The folder must be one you trusted in Claude Code before.
+  - **Copy resume** copies the resume command in one click.
+  - A session Claude Code deleted is put back first.
+- **Your launch command.** If you start Claude Code with flags or an alias, set it once: `vdm config claude-cmd csk` or `vdm config claude-cmd 'claude --dangerously-skip-permissions'`. **Open** runs it in your interactive shell, so an alias works there. Copied commands and `vdm history resume|continue` need the full command. `VDM_CLAUDE_CMD` overrides it.
 
 ```
 vdm history [--days N] [--all]   Recent sessions (--all: include automated `claude -p` runs)
@@ -163,7 +226,8 @@ vdm config serialize-delay <ms>   # Serialization delay
 vdm config affinity on|off        # Keep each session on one account
 vdm config history on|off         # Save sessions (search, continue, resume)
 vdm config keep-warm on|off       # Keep idle sessions' prompt cache warm (learned limits)
-vdm config claude-cmd '<command>' # How vdm starts Claude Code (full command, not an alias)
+vdm config claude-cmd '<command>' # How vdm starts Claude Code (an alias works for History → Open)
+vdm config terminal auto|iterm|terminal  # Where History → Open starts sessions
 vdm config history-keep <days>    # Delete saved sessions older than this (0 = forever)
 ```
 
@@ -228,6 +292,8 @@ Sessions running in git worktrees are grouped with the parent repo in the Usage 
 | 3333 | Web Dashboard | `CSW_PORT` |
 | 3334 | API Proxy | `CSW_PROXY_PORT` |
 
+With the daemon, settings from the environment (`CSW_*`, `VDM_CLAUDE_CMD`) are copied into its LaunchAgent when you run `vdm daemon on`: set them in that shell first.
+
 Both ports answer only this computer. Other devices get `403`, and the dashboard refuses requests from other web pages (foreign `Origin`, wrong `Host`). To let another device or a devcontainer (`host.docker.internal`) use the proxy, start the dashboard with `CSW_ALLOW_REMOTE=1`. Web pages stay blocked.
 
 ## Testing
@@ -236,7 +302,7 @@ Both ports answer only this computer. Other devices get `403`, and the dashboard
 node --test 'test/*.test.mjs'
 ```
 
-To run a throwaway copy of the proxy without touching your real login, point it at a test Keychain item and a stand-in API: `CSW_KEYCHAIN_SERVICE=vdm-test CSW_UPSTREAM=http://127.0.0.1:9999 CSW_PORT=4333 CSW_PROXY_PORT=4334 node dashboard.mjs` (run it from a copy with its own `accounts/`).
+To run a throwaway copy of the proxy without touching your real login, point it at a test Keychain item and a stand-in API: `CSW_KEYCHAIN_SERVICE=vdm-test CSW_UPSTREAM=http://127.0.0.1:9999 CSW_PORT=4333 CSW_PROXY_PORT=4334 node dashboard.mjs` (run it from a copy with its own `accounts/`). To try the daemon the same way, also set `VDM_LAUNCH_LABEL=io.github.loekj.vdm.test` and `VDM_LAUNCH_AGENTS_DIR=<a temp folder>` before `vdm daemon on`.
 
 ## Uninstall
 
@@ -244,7 +310,7 @@ To run a throwaway copy of the proxy without touching your real login, point it 
 ./uninstall.sh
 ```
 
-Keychain credentials are not touched — Claude Code keeps working normally.
+It stops vdm, removes the daemon and the menu bar icon (their LaunchAgents), the shell block and the `vdm` link. Keychain credentials are not touched — Claude Code keeps working normally. Remove `ANTHROPIC_BASE_URL` from open terminals (or open new ones).
 
 ## License
 

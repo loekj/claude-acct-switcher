@@ -44,6 +44,14 @@ if ! command -v python3 &>/dev/null; then
 fi
 
 echo -e "  ${GREEN}✓${NC} Prerequisites OK (Node $(node -v), macOS, python3)"
+if xcode-select -p &>/dev/null && xcrun --find swiftc &>/dev/null; then
+  HAS_CLT=true
+  echo -e "  ${GREEN}✓${NC} Command Line Tools found (for the menu bar icon)"
+else
+  HAS_CLT=false
+  echo -e "  ${YELLOW}!${NC} Command Line Tools not found: no menu bar icon. vdm works without it."
+  echo -e "    ${DIM}Add it later: xcode-select --install, then vdm menubar on${NC}"
+fi
 echo ""
 
 # ── Install files ──
@@ -56,6 +64,8 @@ for f in "$SCRIPT_DIR"/*.mjs; do
 done
 cp "$SCRIPT_DIR/vdm" "$INSTALL_DIR/vdm"
 cp "$SCRIPT_DIR/install-hooks.sh" "$INSTALL_DIR/install-hooks.sh"
+mkdir -p "$INSTALL_DIR/menubar"
+cp "$SCRIPT_DIR"/menubar/*.swift "$INSTALL_DIR/menubar/"
 chmod +x "$INSTALL_DIR/vdm"
 
 # Create default config if it doesn't exist
@@ -91,45 +101,36 @@ rm -f "$LINK_DIR/csw"
 echo -e "  ${GREEN}✓${NC} Linked ${CYAN}vdm${NC} to ${DIM}$LINK_DIR${NC}"
 
 # ── Configure shell ──
+# Sets ANTHROPIC_BASE_URL; starts vdm in new terminals only while the daemon is off
 
-SHELL_RC=""
-if [[ -f "$HOME/.zshrc" ]]; then
-  SHELL_RC="$HOME/.zshrc"
-elif [[ -f "$HOME/.bashrc" ]]; then
-  SHELL_RC="$HOME/.bashrc"
-elif [[ -f "$HOME/.bash_profile" ]]; then
-  SHELL_RC="$HOME/.bash_profile"
-fi
-
-SNIPPET_MARKER="# BEGIN claude-account-switcher"
-
+SHELL_RC="$("$INSTALL_DIR/vdm" _setup-shell || true)"
 if [[ -n "$SHELL_RC" ]]; then
-  if grep -q "$SNIPPET_MARKER" "$SHELL_RC" 2>/dev/null; then
-    echo -e "  ${DIM}Shell config already present in $SHELL_RC${NC}"
-  else
-    echo "" >> "$SHELL_RC"
-    cat >> "$SHELL_RC" << 'SHELL_EOF'
-# BEGIN claude-account-switcher
-if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then
-  nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &
-  disown
-fi
-export ANTHROPIC_BASE_URL=http://localhost:3334
-# END claude-account-switcher
-SHELL_EOF
-    echo -e "  ${GREEN}✓${NC} Added auto-start to ${CYAN}$SHELL_RC${NC}"
-  fi
+  echo -e "  ${GREEN}✓${NC} Shell set up in ${CYAN}$SHELL_RC${NC}"
 else
-  echo -e "  ${YELLOW}Could not detect shell config file.${NC}"
-  echo "  Add this to your shell profile manually:"
+  echo -e "  ${YELLOW}Could not find a shell config file (.zshrc, .bashrc).${NC} Add this to yours:"
   echo ""
-  echo '    # BEGIN claude-account-switcher'
-  echo '    if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then'
-  echo '      nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &'
-  echo '      disown'
-  echo '    fi'
   echo '    export ANTHROPIC_BASE_URL=http://localhost:3334'
-  echo '    # END claude-account-switcher'
+  echo ""
+fi
+
+# ── Daemon: vdm starts at login and again after a crash (VDM_NO_DAEMON=1 skips it) ──
+
+if [[ "${VDM_NO_DAEMON:-}" != "1" ]]; then
+  if "$INSTALL_DIR/vdm" daemon on >/dev/null; then
+    echo -e "  ${GREEN}✓${NC} Daemon on: vdm runs in the background ${DIM}(no admin password; macOS may say \"Background item added\")${NC}"
+  else
+    echo -e "  ${YELLOW}!${NC} The daemon did not start. New terminals start vdm instead. Try: ${DIM}vdm daemon on${NC}"
+  fi
+fi
+
+# ── Menu bar icon (VDM_NO_MENUBAR=1 skips it) ──
+
+if [[ "$HAS_CLT" == "true" && "${VDM_NO_MENUBAR:-}" != "1" ]]; then
+  if "$INSTALL_DIR/vdm" menubar on >/dev/null; then
+    echo -e "  ${GREEN}✓${NC} Menu bar icon on"
+  else
+    echo -e "  ${YELLOW}!${NC} Menu bar icon not built. See ${DIM}$INSTALL_DIR/menubar-build.log${NC}"
+  fi
 fi
 
 # ── Remove hooks older versions installed (no longer needed) ──
@@ -147,10 +148,9 @@ echo ""
 echo -e "  ${BOLD}${GREEN}Installation complete!${NC}"
 echo ""
 echo -e "  ${BOLD}Next steps:${NC}"
-echo -e "    1. Restart your terminal (or run: ${DIM}source $SHELL_RC${NC})"
-echo -e "    2. Log in to your first account:  ${DIM}claude login${NC}"
-echo -e "    3. Save it:                       ${DIM}vdm add account-1${NC}"
-echo -e "    4. Switch accounts or open the dashboard: ${DIM}vdm dashboard${NC}"
+echo -e "    1. Restart your terminal (or run: ${DIM}source ${SHELL_RC:-~/.zshrc}${NC})"
+echo -e "    2. Log in to each account:  ${DIM}claude login${NC}  (vdm finds them by itself)"
+echo -e "    3. Open the dashboard:      ${DIM}vdm dashboard${NC}"
 echo ""
 echo -e "  Dashboard:  ${CYAN}http://localhost:3333${NC}"
 echo -e "  API Proxy:  ${CYAN}http://localhost:3334${NC}"

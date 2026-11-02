@@ -8,7 +8,7 @@ import { join, basename } from 'node:path';
 import { execSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { dirname } from 'node:path';
-import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, renameSync } from 'node:fs';
+import { existsSync, writeFileSync, mkdirSync, readdirSync, readFileSync, unlinkSync, renameSync, statSync, truncateSync } from 'node:fs';
 import { Transform, pipeline } from 'node:stream';
 import { StringDecoder } from 'node:string_decoder';
 
@@ -109,6 +109,7 @@ const DEFAULT_SETTINGS = {
   historyRetentionDays: 0,    // delete saved sessions this old (0 = keep forever)
   historyExclude: [],         // folders whose sessions are never saved
   claudeCommand: 'claude',    // how `vdm history continue|resume` and copied commands start Claude Code
+  terminalApp: 'auto',        // History "Open": auto (iTerm when installed) | iterm | terminal
   hotTokensPer5m: 25_000_000, // account charts: above this many tokens per 5 minutes the line turns red
   keepWarm: true,             // ping idle sessions so their prompt cache stays warm (smart, learned); on unless turned off
 };
@@ -145,6 +146,7 @@ function clampSettings(s) {
     console.error(`[config] historyExclude: ignored ${excludeAsked.length - s.historyExclude.length} folder(s) that are not full paths (use / or ~/)`);
   }
   s.claudeCommand = cleanClaudeCommand(s.claudeCommand) || 'claude';
+  if (!['auto', 'iterm', 'terminal'].includes(s.terminalApp)) s.terminalApp = 'auto';
   return s;
 }
 
@@ -243,7 +245,7 @@ function writeKeychain(creds) {
 
 import https from 'node:https';
 import { execFile, fork } from 'node:child_process';
-import { setPriority } from 'node:os';
+import { setPriority, userInfo } from 'node:os';
 import { createReadStream } from 'node:fs';
 import zlib from 'node:zlib';
 import http from 'node:http';
@@ -257,6 +259,12 @@ import {
   parseRateLimitHeaders,
   modelFamily,
   liveUtil,
+  sessionLaunchCommand,
+  terminalScript,
+  pickTerminal,
+  TERMINAL_APPS,
+  cleanLine,
+  cleanMessage,
   createSessionStore,
   sessionAffinity,
   sessionLabel,
@@ -1221,6 +1229,7 @@ async function handleAPI(req, res) {
     }
     if (Array.isArray(patch.historyExclude)) settings.historyExclude = cleanExcludeList(patch.historyExclude);
     if (patch.claudeCommand !== undefined) settings.claudeCommand = cleanClaudeCommand(patch.claudeCommand);
+    if (['auto', 'iterm', 'terminal'].includes(patch.terminalApp)) settings.terminalApp = patch.terminalApp;
     saveSettings(settings);
     if (JSON.stringify(historyConfig()) !== historyBefore) applyHistorySettings();
     logActivity('settings-changed', {
@@ -1932,6 +1941,16 @@ function renderHTML() {
   .hist-row:hover, .hist-row:focus-visible { border-color: var(--primary); outline: none; }
   .hist-row.sel { border-color: var(--primary); box-shadow: 0 0 0 3px var(--primary-soft); }
   .hist-top { display: flex; align-items: center; gap: 0.5rem; }
+  .open-dlg { margin: auto; border: 1px solid var(--border); border-radius: var(--radius); padding: 1.25rem 1.5rem; width: min(520px, 92vw); background: var(--card); color: var(--foreground); box-shadow: 0 12px 40px rgba(0,0,0,0.18); }
+  .open-dlg::backdrop { background: rgba(0,0,0,0.25); }
+  .open-dlg h3 { margin: 0 0 0.875rem; font-size: 1rem; }
+  .open-field { display: block; font-size: 0.8125rem; font-weight: 500; margin-bottom: 0.75rem; }
+  .open-field .muted { color: var(--muted); font-weight: 400; }
+  .open-field input, .open-field textarea { display: block; width: 100%; margin-top: 0.3125rem; box-sizing: border-box; font-family: inherit; resize: vertical; }
+  .open-btns { display: flex; justify-content: flex-end; gap: 0.5rem; margin-top: 0.25rem; }
+  .open-result { font-size: 0.8125rem; margin-bottom: 0.75rem; padding: 0.625rem 0.75rem; border-radius: var(--radius-sm); background: var(--bg); border: 1px solid var(--border); }
+  .open-result code { font-size: 0.75rem; }
+  .open-result.err { color: var(--red); background: var(--red-soft); border-color: var(--red-border); }
   .hbtn.hist-copy { padding: 0.1875rem 0.5rem; font-size: 0.75rem; flex-shrink: 0; white-space: nowrap; }
   .hist-title { flex: 1; min-width: 0; font-weight: 600; font-size: 0.875rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .hist-sub { font-size: 0.75rem; color: var(--muted); margin-top: 0.125rem; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2813,9 +2832,18 @@ function renderHTML() {
         <div class="config-row">
           <div class="config-info">
             <div class="config-label">Launch command</div>
-            <div class="config-desc" id="claude-cmd-desc">How copied commands and <code>vdm history continue</code> start Claude Code. Use the full command, not a shell alias, e.g. <code>claude --dangerously-skip-permissions</code>.</div>
+            <div class="config-desc" id="claude-cmd-desc">How vdm starts Claude Code. <b>Open</b> runs it in your shell, so an alias works. Copied commands need the full command.</div>
           </div>
           <input class="config-select hd-input" id="inp-claude-cmd" style="max-width:280px" aria-label="Launch command" spellcheck="false" onchange="saveClaudeCommand(this.value)">
+        </div>
+        <div class="config-row">
+          <div class="config-info">
+            <div class="config-label">Open sessions in</div>
+            <div class="config-desc">The terminal that History's <b>Open</b> uses. Auto picks iTerm when it is installed.</div>
+          </div>
+          <select class="config-select" id="sel-terminal" aria-label="Open sessions in" onchange="saveHistorySetting({ terminalApp: this.value }, 'Sessions open in ' + this.options[this.selectedIndex].text)">
+            <option value="auto">Auto</option><option value="iterm">iTerm</option><option value="terminal">Terminal</option>
+          </select>
         </div>
         <div class="config-row">
           <div class="config-info">
@@ -2892,6 +2920,21 @@ function renderHTML() {
 
 </div>
 
+<dialog id="open-dlg" class="open-dlg" aria-labelledby="open-dlg-title">
+  <form method="dialog" onsubmit="return false">
+    <h3 id="open-dlg-title">Open session</h3>
+    <label class="open-field">Name <span class="muted">(shown in the terminal title and in /resume)</span>
+      <input id="open-name" class="config-select" maxlength="80" spellcheck="false"></label>
+    <label class="open-field">First message <span class="muted">(optional: Claude starts on it at once)</span>
+      <textarea id="open-prompt" class="config-select" rows="3" maxlength="4000" placeholder="e.g. Run the tests and fix what fails"></textarea></label>
+    <div id="open-result" class="open-result" hidden></div>
+    <div class="open-btns">
+      <button type="button" class="hbtn" onclick="document.getElementById('open-dlg').close()">Cancel</button>
+      <button type="button" class="hbtn" id="open-bg" onclick="openSessionGo(true)" title="Runs without a window (claude --bg). Open it later with claude attach.">Start in background</button>
+      <button type="button" class="hbtn hbtn-primary" id="open-term" onclick="openSessionGo(false)">Open in Terminal</button>
+    </div>
+  </form>
+</dialog>
 <div id="toast" class="toast"></div>
 
 <script>
@@ -3463,6 +3506,7 @@ function evtMsg(e) {
     case 'auth-expired': return '<b>' + (e.account||'?') + '</b> token expired';
     case 'all-exhausted': return 'All accounts exhausted';
     case 'account-discovered': return 'Discovered <b>' + (e.label||e.name||'?') + '</b>';
+    case 'session-opened': return 'Opened session <b>' + escHtml(e.name || e.session || '?') + '</b> in ' + escHtml(e.where || 'a terminal');
     case 'account-removed': return 'Removed <b>' + escHtml(e.name||'?') + '</b>' + (e.reason === 'dead-login' ? ': a nameless login that can no longer refresh' : '');
     case 'account-renamed': return 'Renamed <b>' + (e.name||'?') + '</b> to <b>' + (e.label||'?') + '</b>';
     case 'settings-changed': return 'Settings updated';
@@ -3574,6 +3618,7 @@ async function loadSettingsUI() {
       hot.appendChild(hotOpt);
     }
     hot.value = hotVal;
+    document.getElementById('sel-terminal').value = s.terminalApp || 'auto';
     var cmdInput = document.getElementById('inp-claude-cmd');
     if (document.activeElement !== cmdInput) cmdInput.value = s.claudeCommandEnv || s.claudeCommand || 'claude';
     cmdInput.disabled = !!s.claudeCommandEnv;
@@ -4282,7 +4327,8 @@ function histRow(s) {
   var chips = s.topFiles.map(function(f) { return '<span class="hist-chip" title="' + escHtml(f) + '">' + escHtml(baseName(f)) + '</span>'; }).join('');
   // Copy the resume command straight from the list (no full copy saved: nothing to resume)
   var copy = s.resume && (s.original || s.rawMode !== 'none')
-    ? '<button class="hbtn hist-copy" data-id="' + s.id + '" title="' + escHtml(s.resume) + '" onclick="event.stopPropagation(); histCopyResume(this.dataset.id)" onkeydown="event.stopPropagation()">Copy resume</button>' : '';
+    ? '<button class="hbtn hist-copy" data-id="' + s.id + '" title="Open it in ' + escHtml((HIST.data && HIST.data.terminal) || 'a terminal') + ', with a name and a first message" onclick="event.stopPropagation(); openSessionDialog(this.dataset.id)" onkeydown="event.stopPropagation()">Open</button>' +
+      '<button class="hbtn hist-copy" data-id="' + s.id + '" title="' + escHtml(s.resume) + '" onclick="event.stopPropagation(); histCopyResume(this.dataset.id)" onkeydown="event.stopPropagation()">Copy resume</button>' : '';
   return '<div class="hist-row' + (HIST.open === s.id ? ' sel' : '') + '" tabindex="0" data-id="' + s.id + '" data-seq="' + (s.hitSeq == null ? '' : s.hitSeq) + '" onclick="histOpen(this.dataset.id, this.dataset.seq)" onkeydown="if (event.key === &quot;Enter&quot;) histOpen(this.dataset.id, this.dataset.seq)">' +
     '<div class="hist-top"><span class="hist-title" title="' + escHtml(s.title) + '">' + escHtml(s.title) + '</span>' + badges +
       '<span class="sess-meta">' + agoSpan(s.lastAt) + '</span>' + copy + '</div>' +
@@ -4437,7 +4483,7 @@ function renderHistDetail(d) {
     resume = '<div class="hd-warn">' + escHtml(d.rawNote || 'No full copy of this session was saved, only the text.') + '</div>';
   } else {
     resume = (d.needsRestore ? '<div class="hd-act-desc">Claude Code deleted its copy. This first puts the saved copy back.</div>' : '') +
-      '<div class="hd-btns"><button class="hbtn" onclick="histResume()">' + (d.needsRestore ? 'Restore session file' : 'Copy resume command') + '</button></div>' +
+      '<div class="hd-btns"><button class="hbtn hbtn-primary" onclick="openSessionDialog(HIST.detail.id)">Open…</button><button class="hbtn" onclick="histResume()">' + (d.needsRestore ? 'Restore session file' : 'Copy resume command') + '</button></div>' +
       '<code class="hd-cmd" title="' + escHtml(d.commands.resume) + '">' + escHtml(d.commands.resume) + '</code>';
   }
   var files = d.files.slice(0, 12).map(function(f) { return '<div title="' + escHtml(f[0]) + '">' + escHtml(f[0].replace(d.cwd + '/', '')) + (f[1] > 1 ? ' <span style="color:var(--muted)">×' + f[1] + '</span>' : '') + '</div>'; }).join('') +
@@ -4589,6 +4635,60 @@ async function histCopyResume(id) {
     s.original = true;
     showToast('Ready: run the copied command in a terminal');
   } catch (e) { showToast('Restore failed: the command will not work yet'); }
+}
+
+// ── Open a session in a terminal (or in the background) ──
+
+var OPEN = { id: null, busy: false };
+
+function openSessionDialog(id) {
+  var s = HIST.rows.find(function(r) { return r.id === id; }) || (HIST.detail && HIST.detail.id === id ? HIST.detail : null);
+  OPEN.id = id;
+  document.getElementById('open-name').value = s ? (s.title || '').slice(0, 80) : '';
+  document.getElementById('open-prompt').value = '';
+  var res = document.getElementById('open-result');
+  res.hidden = true; res.className = 'open-result'; res.innerHTML = '';
+  document.getElementById('open-term').textContent = 'Open in ' + ((HIST.data && HIST.data.terminal) || 'Terminal');
+  openBusy(false);
+  var dlg = document.getElementById('open-dlg');
+  dlg.showModal();
+  document.getElementById('open-name').select();
+}
+
+function openBusy(b) {
+  OPEN.busy = b;
+  document.getElementById('open-term').disabled = b;
+  document.getElementById('open-bg').disabled = b;
+}
+
+async function openSessionGo(background) {
+  if (OPEN.busy || !OPEN.id) return;
+  openBusy(true);
+  var res = document.getElementById('open-result');
+  res.hidden = false; res.className = 'open-result';
+  res.textContent = background ? 'Starting in the background…' : 'Opening…';
+  try {
+    var r = await fetch('/api/history/' + OPEN.id + '/open', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name: document.getElementById('open-name').value, prompt: document.getElementById('open-prompt').value, background: background }),
+    });
+    var x = await r.json();
+    if (!r.ok) throw new Error(x.error || 'Could not open it');
+    if (background) {
+      res.innerHTML = 'Running in the background. Open it in a terminal with <code>' + escHtml(x.attach) + '</code> ' +
+        '<button type="button" class="link-btn" onclick="histCopy(' + escHtml(JSON.stringify(x.attach)) + ', &quot;Command copied&quot;)">Copy</button>';
+      openBusy(false);
+      document.getElementById('open-term').disabled = true;
+      document.getElementById('open-bg').disabled = true;
+    } else {
+      document.getElementById('open-dlg').close();
+      showToast('Opened in ' + x.terminal);
+    }
+  } catch (e) {
+    res.className = 'open-result err';
+    res.textContent = e.message;
+    openBusy(false);
+  }
 }
 
 async function histResume() {
@@ -6962,7 +7062,72 @@ function onServerListening() {
 function historyStatusCode(err) {
   if (err.code === 'NOT_FOUND') return 404;
   if (err.code === 'AMBIGUOUS') return 400;
+  if (err.code === 'CONFLICT') return 409;
   return 503;
+}
+
+// ── Open a saved session: in a terminal tab, or in the background (claude --bg) ──
+
+function installedTerminals() {
+  const home = process.env.HOME || '';
+  const has = (app) => [join('/Applications', app), join(home, 'Applications', app)].some(p => existsSync(p));
+  return { iterm: has(TERMINAL_APPS.iterm.app), terminal: true };
+}
+
+function terminalLabel() {
+  return TERMINAL_APPS[pickTerminal(settings.terminalApp, installedTerminals())].label;
+}
+
+// The user's interactive shell runs the command, so a shell alias (e.g. `csk`) works.
+function userShell() {
+  try { return userInfo().shell || process.env.SHELL || '/bin/zsh'; } catch { return process.env.SHELL || '/bin/zsh'; }
+}
+
+function runFile(file, args, opts = {}) {
+  return new Promise((resolve) => {
+    const child = execFile(file, args, { timeout: 30000, maxBuffer: 1 << 20, ...opts }, (err, stdout, stderr) => {
+      resolve({ ok: !err, code: err ? (err.code ?? 1) : 0, out: String(stdout || '').trim(), err: String(stderr || '').trim(), killed: !!err?.killed });
+    });
+    child.stdin?.end(); // empty input: Claude Code reads piped input as a prompt
+  });
+}
+
+async function openSession(id, body = {}) {
+  const d = await historyCall('get', { id });
+  if (!d.cwdExists) { const e = new Error(`The folder of this session is gone: ${d.cwd || '?'}`); e.code = 'CONFLICT'; throw e; }
+  if (!d.canResume) { const e = new Error('No full copy of this session was saved, only the text.'); e.code = 'CONFLICT'; throw e; }
+  if (d.needsRestore) await historyCall('restore', { id }, 120000);
+  const name = cleanLine(body.name ?? d.title, 80);
+  const prompt = cleanMessage(body.prompt, 4000);
+  const background = body.background === true;
+  const command = sessionLaunchCommand({ claudeCommand: claudeCommand(), id, cwd: d.cwd, name, prompt, background });
+  logActivity('session-opened', { session: id.slice(0, 8), name, where: background ? 'background' : terminalLabel() });
+
+  if (background) {
+    // `claude --bg` returns at once and prints the id that `claude attach` takes
+    // Set after the shell's own startup files, which may set another ANTHROPIC_BASE_URL
+    const r = await runFile(userShell(), ['-ic', `export ANTHROPIC_BASE_URL=http://localhost:${PROXY_PORT}; ${command}`], { cwd: d.cwd });
+    const text = (r.out + '\n' + r.err).replace(/\x1b\[[0-9;]*[A-Za-z]/g, '').trim();
+    // Prints "backgrounded · 784bf036 · name". A refusal (e.g. "Workspace not trusted") also exits 0.
+    const bgId = (text.match(/backgrounded\s*·\s*([0-9a-f]{6,})/i) || [])[1];
+    if (!r.ok || !bgId) {
+      const e = new Error(r.killed ? 'Claude Code did not answer within 30 s' : (text.split('\n').slice(-3).join(' ') || 'Could not start it'));
+      e.code = 'CONFLICT'; throw e;
+    }
+    return { ok: true, background: true, id: bgId, attach: `claude attach ${bgId}` };
+  }
+
+  const app = pickTerminal(settings.terminalApp, installedTerminals());
+  const lines = terminalScript(app);
+  const r = await runFile('/usr/bin/osascript', [...lines.flatMap(l => ['-e', l]), command, name]);
+  if (!r.ok) {
+    const denied = /-1743|not allowed|Not authorized/i.test(r.err);
+    const e = new Error(denied
+      ? `macOS blocked vdm from controlling ${TERMINAL_APPS[app].label}. Allow it in System Settings → Privacy & Security → Automation.`
+      : `Could not open ${TERMINAL_APPS[app].label}: ${r.err || 'unknown error'}`);
+    e.code = 'CONFLICT'; throw e;
+  }
+  return { ok: true, terminal: TERMINAL_APPS[app].label };
 }
 
 async function handleHistoryAPI(req, res, url) {
@@ -6970,7 +7135,7 @@ async function handleHistoryAPI(req, res, url) {
   const q = url.searchParams;
   const base = () => ({
     enabled: historyConfig().enabled, state: _hist.state, error: _hist.lastError || null,
-    module: existsSync(HISTORY_MODULE), claudeCommand: claudeCommand(),
+    module: existsSync(HISTORY_MODULE), claudeCommand: claudeCommand(), terminal: terminalLabel(),
   });
   try {
     if (parts.length === 3 && parts[2] === 'status' && req.method === 'GET') {
@@ -7015,6 +7180,13 @@ async function handleHistoryAPI(req, res, url) {
       return true;
     }
     if (action === 'delete' && req.method === 'POST') { json(res, await historyCall('remove', { id })); return true; }
+    if (action === 'open' && req.method === 'POST') {
+      // Starts a program: only JSON from this computer's page (a web form cannot send JSON)
+      if (!/^application\/json\b/i.test(req.headers['content-type'] || '')) { json(res, { error: 'JSON only' }, 415); return true; }
+      const body = JSON.parse(await readBody(req) || '{}');
+      json(res, await openSession(id, body));
+      return true;
+    }
     if (action === 'download' && req.method === 'GET') {
       const t = await historyCall('transcript', { id });
       const okPath = [ARCHIVE_DIR, join(CLAUDE_DIR, 'projects')].some(root => t.file.startsWith(root + '/'));
@@ -8493,6 +8665,30 @@ process.on('uncaughtException', (err) => {
 process.on('unhandledRejection', (reason) => {
   try { log('fatal', `Unhandled rejection: ${reason}`); } catch { /* swallow */ }
 });
+
+// A port already in use means another vdm runs: exit (failed), so launchd tries again
+// later instead of keeping a process alive that serves nothing.
+function exitIfPortBusy(what, port) {
+  return (err) => {
+    if (err && err.code === 'EADDRINUSE') {
+      try { console.error(`[fatal] Port ${port} (${what}) is in use: another vdm is running. Exiting.`); } catch {}
+      process.exit(1);
+    }
+    try { log('error', `${what} server: ${err && err.message}`); } catch {}
+  };
+}
+server.on('error', exitIfPortBusy('dashboard', PORT));
+proxyServer.on('error', exitIfPortBusy('proxy', PROXY_PORT));
+
+// Under launchd (vdm daemon) output goes to a file: keep it under 10 MB.
+// launchd opens it for appending, so emptying it in place is safe.
+if (process.env.VDM_DAEMON_LOG) {
+  const trimLog = () => {
+    try { if (statSync(process.env.VDM_DAEMON_LOG).size > 10 * 1024 * 1024) truncateSync(process.env.VDM_DAEMON_LOG, 0); } catch {}
+  };
+  trimLog();
+  setInterval(trimLog, 60 * 60 * 1000).unref?.();
+}
 
 proxyServer.listen(PROXY_PORT, () => {
   onServerListening();
