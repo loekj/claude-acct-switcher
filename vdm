@@ -149,7 +149,12 @@ except:
   echo "$org_name"
 }
 
+# $1 = subscription type, $2 = rate-limit tier. Anthropic renamed the plans (Nov 2026):
+# Max 20x is now Ultra, Max 5x is now Max. Logins still report the old tier, so 20x reads as Ultra.
 format_sub_type() {
+  if [[ "$1" == ultra || "${2:-}" == *ultra* || ( "$1" == max && "${2:-}" == *20x* ) ]]; then
+    echo -e "${BOLD}${CYAN}ULTRA${NC}"; return
+  fi
   case "$1" in
     max) echo -e "${BOLD}${CYAN}MAX${NC}" ;;
     pro) echo -e "${BOLD}${BLUE}PRO${NC}" ;;
@@ -348,7 +353,7 @@ cmd_add() {
   if [[ -n "$email" ]]; then
     echo -e "  Email: ${CYAN}$email${NC}"
   fi
-  echo -e "  Plan: $(format_sub_type "$sub_type")  Tier: ${tier}"
+  echo -e "  Plan: $(format_sub_type "$sub_type" "$tier")  Tier: ${tier}"
   echo -e "  Token expires: ${DIM}$expires${NC}"
 
   log_activity "account-discovered" "name=$name" "label=${email:-$name}"
@@ -403,9 +408,9 @@ cmd_list() {
     [[ -f "$label_file" ]] && label=$(cat "$label_file")
 
     if [[ "$fp" == "$active_fp" ]]; then
-      echo -e "  ${GREEN}▸ ${BOLD}$name${NC}  $(format_sub_type "$sub_type")  ${GREEN}← active${NC}"
+      echo -e "  ${GREEN}▸ ${BOLD}$name${NC}  $(format_sub_type "$sub_type" "$tier")  ${GREEN}← active${NC}"
     else
-      echo -e "    ${BOLD}$name${NC}  $(format_sub_type "$sub_type")"
+      echo -e "    ${BOLD}$name${NC}  $(format_sub_type "$sub_type" "$tier")"
     fi
     if [[ -n "$label" ]]; then
       echo -e "      ${DIM}$label${NC}"
@@ -441,14 +446,15 @@ cmd_switch() {
       local fp=$(get_profile_fingerprint "$file" 2>/dev/null)
       local info=$(get_profile_info "$file" 2>/dev/null)
       local sub_type=$(echo "$info" | cut -d'|' -f1)
+      local tier=$(echo "$info" | cut -d'|' -f2)
       local label_file="$ACCOUNTS_DIR/${pname}.label"
       local label=""
       [[ -f "$label_file" ]] && label=" ${DIM}($( cat "$label_file"))${NC}"
 
       if [[ "$fp" == "$active_fp" ]]; then
-        echo -e "  ${GREEN}$i)${NC} ${BOLD}$pname${NC}  $(format_sub_type "$sub_type")${label}  ${GREEN}← active${NC}"
+        echo -e "  ${GREEN}$i)${NC} ${BOLD}$pname${NC}  $(format_sub_type "$sub_type" "$tier")${label}  ${GREEN}← active${NC}"
       else
-        echo -e "  $i) ${BOLD}$pname${NC}  $(format_sub_type "$sub_type")${label}"
+        echo -e "  $i) ${BOLD}$pname${NC}  $(format_sub_type "$sub_type" "$tier")${label}"
       fi
       ((i++))
     done
@@ -502,11 +508,12 @@ cmd_switch() {
 
   local info=$(get_profile_info "$file" 2>/dev/null)
   local sub_type=$(echo "$info" | cut -d'|' -f1)
+  local tier=$(echo "$info" | cut -d'|' -f2)
   local label_file="$ACCOUNTS_DIR/${name}.label"
   local label=""
   [[ -f "$label_file" ]] && label=$(cat "$label_file")
 
-  echo -e "${GREEN}✓${NC} Switched to ${BOLD}$name${NC}  $(format_sub_type "$sub_type")"
+  echo -e "${GREEN}✓${NC} Switched to ${BOLD}$name${NC}  $(format_sub_type "$sub_type" "$tier")"
   echo -e "${DIM}  All Claude Code sessions will use this account on their next API call.${NC}"
 
   log_activity "manual-switch" "to=${label:-$name}"
@@ -587,7 +594,7 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
   if [[ ! "$active_name" =~ ^auto-[0-9]+$ && "$active_name" != "(not saved)" ]]; then
     echo -e "  Profile:  ${BOLD}$active_name${NC}"
   fi
-  echo -e "  Plan:     $(format_sub_type "$sub_type")"
+  echo -e "  Plan:     $(format_sub_type "$sub_type" "$tier")"
   echo -e "  Tier:     $tier"
   echo -e "  Expires:  $expires"
   echo -e "  Scopes:   ${DIM}$scopes${NC}"

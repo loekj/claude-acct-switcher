@@ -15,6 +15,7 @@ import {
   isAccountAvailable,
   scoreAccount,
   pickBestAccount,
+  pickDrainFirst,
   pickAnyUntried,
   pickLeastLoaded,
   pickByStrategy,
@@ -1052,6 +1053,18 @@ describe('liveUtil and ended windows', () => {
     assert.equal(scoreAccountConserve('ended', sm(states)), 0);
     const accounts = [{ name: 'ended', token: 'ended' }, { name: 'busy', token: 'busy' }];
     assert.equal(pickConserve(accounts, sm(states)).name, 'busy');
+  });
+
+  it('spread and drain-first rank by the fullest window, so Ultra (no 5h window) ranks by its week', () => {
+    const t = Math.floor(Date.now() / 1000);
+    const states = {
+      ultraFull: { utilization7d: 0.8, resetAt7d: t + 86400, utilization5h: 0, resetAt: 0 },
+      ultraLight: { utilization7d: 0.2, resetAt7d: t + 86400, utilization5h: 0, resetAt: 0 },
+    };
+    assert.equal(scoreAccount('ultraFull', sm(states)), 0.8);
+    const accounts = [{ name: 'ultraFull', token: 'ultraFull' }, { name: 'ultraLight', token: 'ultraLight' }];
+    assert.equal(pickBestAccount(accounts, sm(states)).name, 'ultraLight');
+    assert.equal(pickDrainFirst(accounts, sm(states)).name, 'ultraFull');
   });
 });
 

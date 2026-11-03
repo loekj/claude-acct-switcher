@@ -530,10 +530,11 @@ export function isAccountAvailable(token, expiresAt, stateManager, now = Date.no
   return true;
 }
 
+/** How full an account is: its fullest shared window, 5h or weekly (Ultra has no 5h window). */
 export function scoreAccount(token, stateManager) {
   const acctState = stateManager.get(token);
   if (!acctState) return 0; // unknown = fresh, try first
-  return liveUtil(acctState.utilization5h, acctState.resetAt);
+  return usageScore(acctState);
 }
 
 export function pickBestAccount(accounts, stateManager, excludeTokens = new Set(), model = null) {
@@ -637,7 +638,7 @@ export const ROTATION_STRATEGIES = {
   conserve:      { label: 'Conserve',      desc: 'Max out active accounts first  - untouched windows stay dormant' },
   'round-robin': { label: 'Round-robin',   desc: 'Rotate to lowest-utilization account on a timer' },
   spread:        { label: 'Spread',        desc: 'Always pick lowest utilization (switches often)' },
-  'drain-first': { label: 'Drain first',   desc: 'Use highest 5hr-utilization account first' },
+  'drain-first': { label: 'Drain first',   desc: 'Use highest-utilization account first' },
   balance:       { label: 'Balance',       desc: 'Spread sessions across accounts by load, capped per account' },
 };
 
@@ -1478,15 +1479,28 @@ export function usageCost(usage, model) {
   ) / 1e6;
 }
 
-/** Monthly subscription price (USD) for a plan; null for plans the proxy doesn't target. */
-export function planMonthlyUsd(subscriptionType, rateLimitTier) {
+/**
+ * A plan as people know it: { name: 'Ultra' | 'Max' | 'Pro' | 'Free', fiveHourWindow }.
+ * Anthropic renamed the plans (Nov 2026): Max 20x is now Ultra, Max 5x is now Max. The
+ * login still reports the old tier ("default_claude_max_20x"), so 20x reads as Ultra.
+ * Ultra has no 5-hour window, only the weekly ones.
+ */
+export function planInfo(subscriptionType, rateLimitTier) {
   const sub = String(subscriptionType || '').toLowerCase();
   const tier = String(rateLimitTier || '').toLowerCase();
-  if (sub === 'max' || tier.includes('max')) {
-    const m = tier.match(/(\d+)x/);
-    return m && parseInt(m[1], 10) >= 20 ? 200 : 100;
+  const m = tier.match(/(\d+)x/);
+  if (sub === 'ultra' || tier.includes('ultra') || ((sub === 'max' || tier.includes('max')) && m && parseInt(m[1], 10) >= 20)) {
+    return { name: 'Ultra', fiveHourWindow: false };
   }
-  return null;
+  if (sub === 'max' || tier.includes('max')) return { name: 'Max', fiveHourWindow: true };
+  if (sub === 'pro' || tier.includes('pro')) return { name: 'Pro', fiveHourWindow: true };
+  return { name: 'Free', fiveHourWindow: true };
+}
+
+/** Monthly subscription price (USD) for a plan; null for plans the proxy doesn't target. */
+export function planMonthlyUsd(subscriptionType, rateLimitTier) {
+  const { name } = planInfo(subscriptionType, rateLimitTier);
+  return name === 'Ultra' ? 200 : name === 'Max' ? 100 : null;
 }
 
 // ─────────────────────────────────────────────────

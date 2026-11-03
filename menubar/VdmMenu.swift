@@ -107,7 +107,7 @@ func fetchStatus(_ done: @escaping (State?) -> Void) {
   }.resume()
 }
 
-// MARK: - Icon: a figure doing the splits (Van Damme-o-Matic), drawn in code
+// MARK: - Icon: a figure doing a near-vertical high kick (Van Damme-o-Matic), drawn in code
 
 enum IconBadge { case none, dot, off }
 
@@ -123,19 +123,24 @@ func vdmIcon(_ badge: IconBadge) -> NSImage {
       for q in pts.dropFirst() { p.line(to: NSPoint(x: q.0, y: q.1)) }
       p.stroke()
     }
-    // Legs in a full split, feet flexed up
-    stroke([(1.2, 5.4), (1.2, 3.2), (9, 3.2), (16.8, 3.2), (16.8, 5.4)], 1.7)
-    // Body, arms raised in a wide V: the split, and the win
-    stroke([(9, 3.2), (9, 10.0)], 1.9)
-    stroke([(3.0, 14.2), (9, 9.4), (15.0, 14.2)], 1.5)
-    // Head, between the arms
-    NSBezierPath(ovalIn: NSRect(x: 7.15, y: 11.3, width: 3.7, height: 3.7)).fill()
+    // Standing leg, then the kicking leg almost straight up, foot flexed.
+    // Both legs about the same length, like a real body.
+    stroke([(9.6, 0.9), (11.0, 7.6)], 1.7)
+    stroke([(11.0, 7.6), (12.6, 14.8), (14.3, 15.6)], 1.7)
+    // Body leaning back, away from the kick
+    stroke([(11.0, 7.6), (6.6, 10.6)], 1.9)
+    // Arms: a guard up front, the other arm back for balance
+    stroke([(7.0, 10.3), (9.0, 11.0), (9.1, 13.2)], 1.4)
+    stroke([(7.0, 10.3), (3.8, 7.8)], 1.4)
+    // Head, a small gap above the shoulders
+    NSBezierPath(ovalIn: NSRect(x: 2.65, y: 10.45, width: 3.5, height: 3.5)).fill()
     switch badge {
     case .dot:
+      // Bottom right: the only corner the kick leaves free
       NSGraphicsContext.current?.compositingOperation = .clear
-      NSBezierPath(ovalIn: NSRect(x: 12.4, y: 11.8, width: 6.2, height: 6.2)).fill()
+      NSBezierPath(ovalIn: NSRect(x: 11.8, y: -0.2, width: 6.4, height: 6.4)).fill()
       NSGraphicsContext.current?.compositingOperation = .sourceOver
-      NSBezierPath(ovalIn: NSRect(x: 13.5, y: 12.9, width: 4.2, height: 4.2)).fill()
+      NSBezierPath(ovalIn: NSRect(x: 12.9, y: 0.9, width: 4.2, height: 4.2)).fill()
     case .off:
       NSGraphicsContext.current?.compositingOperation = .clear
       stroke([(2, 16.5), (16.5, 1.5)], 3.6)

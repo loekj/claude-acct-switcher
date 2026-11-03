@@ -275,6 +275,7 @@ import {
   parseJsonUsage,
   usageCost,
   planMonthlyUsd,
+  planInfo,
   createUsageDay,
   summarizeUsage,
   utcDay,
@@ -915,6 +916,7 @@ async function loadProfiles({ light = false } = {}) {
         id: (loadAllAccountTokens().find(a => a.name === name) || {}).id || email || name,
         subscriptionType: subType,
         rateLimitTier: rlTier,
+        plan: planInfo(subType, rlTier),
         expiresAt,
         isActive,
         isLogin,
@@ -1031,6 +1033,12 @@ async function handleAPI(req, res) {
       p.throughput = accountThroughput(p);
       p.velocity5h = utilizationHistory.getVelocity(p.id);
       p.minutesToLimit = utilizationHistory.predictMinutesToLimit(p.id);
+      // Ultra has no 5-hour window: no 5h bar, no "time to 5h limit"
+      if (p.plan && !p.plan.fiveHourWindow) {
+        p.velocity5h = null;
+        p.minutesToLimit = null;
+        if (p.rateLimits) p.rateLimits = { ...p.rateLimits, fiveH: null };
+      }
       p.inflight = balanceLimiter.get(p.name); // balance-mode concurrent in-flight (0 in other modes)
       p.sessions = accountSessions(p.name);
       p.artifactCount = (artifactIndex.accounts[p.name]?.frames || []).length;
@@ -3051,22 +3059,11 @@ function tokenStatus(expiresAt) {
   return { text: 'Expires soon', cls: 'tok-bad' };
 }
 
-function planBadge(subscriptionType, rateLimitTier) {
-  const sub = (subscriptionType || 'free').toLowerCase();
-  const tier = (rateLimitTier || '').toLowerCase();
-  let label, cls;
-  if (sub === 'max' || tier.indexOf('max') !== -1) {
-    cls = 'badge-max';
-    const m = tier.match(/(\\d+)x/);
-    label = m ? 'MAX ' + m[1] + 'x' : 'MAX';
-  } else if (sub === 'pro' || tier.indexOf('pro') !== -1) {
-    cls = 'badge-pro';
-    label = 'PRO';
-  } else {
-    cls = 'badge-free';
-    label = 'FREE';
-  }
-  return '<span class="badge ' + cls + '">' + label + '</span>';
+// The server names the plan (planInfo in lib.mjs): Ultra, Max, Pro or Free.
+function planBadge(plan) {
+  const name = (plan && plan.name) || 'Free';
+  const cls = (name === 'Ultra' || name === 'Max') ? 'badge-max' : name === 'Pro' ? 'badge-pro' : 'badge-free';
+  return '<span class="badge ' + cls + '">' + name.toUpperCase() + '</span>';
 }
 
 // Balance mode only: a live count of concurrent in-flight requests routed to this
@@ -3436,16 +3433,19 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
     var spark7d = renderUsageChart(tp.week, 7*24*60*60*1000, 'days', CHART_SCALE.week, 'hot-' + i + '-w');
     // A grid: the bars, then (on accounts with its own weekly bucket) Fable under Weekly,
     // then the charts, so both charts start at the same height.
-    var cells = [
-      rateGroup('5h window', rl.fiveH.utilization, rl.fiveH.reset),
-      rateGroup('Weekly', rl.sevenD.utilization, rl.sevenD.reset),
-    ];
+    // Ultra has no 5h window (fiveH is null): Weekly takes its place, Fable sits beside it.
+    var cells = rl.fiveH
+      ? [rateGroup('5h window', rl.fiveH.utilization, rl.fiveH.reset), rateGroup('Weekly', rl.sevenD.utilization, rl.sevenD.reset)]
+      : [rateGroup('Weekly', rl.sevenD.utilization, rl.sevenD.reset)];
     if (rl.sevenDOI) {
       var fableUntil = rl.fableBlockedUntil && rl.fableBlockedUntil > Date.now() / 1000 ? rl.fableBlockedUntil : 0;
-      cells.push('<div></div>', rateGroup('Fable weekly', rl.sevenDOI.utilization, fableUntil || rl.sevenDOI.reset, {
-        usedUp: !!fableUntil, cls: 'rate-row2',
+      if (rl.fiveH) cells.push('<div></div>');
+      cells.push(rateGroup('Fable weekly', rl.sevenDOI.utilization, fableUntil || rl.sevenDOI.reset, {
+        usedUp: !!fableUntil, cls: rl.fiveH ? 'rate-row2' : '',
         title: 'Fable has its own weekly limit on this account. When it is used up, only Fable requests move to another account.',
       }));
+    } else if (!rl.fiveH) {
+      cells.push('<div></div>');
     }
     cells.push('<div>' + spark5h + '</div>', '<div>' + spark7d + '</div>');
     barsHtml = '<div class="rate-bars">' + cells.join('') + '</div>';
@@ -3497,7 +3497,7 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
       '<div class="card-badges">' +
         arts +
         inflightBadge(p, balanceMode, balanceCap) +
-        planBadge(p.subscriptionType, p.rateLimitTier) +
+        planBadge(p.plan) +
         (active ? '<span class="badge badge-active" title="' + (p.isLogin ? 'Claude Code is logged in with this account; new sessions start here' : 'New sessions start here. Claude Code stays logged in with another account, so its artifacts keep working') + '">Active</span>' : '') +
         (p.isLogin && !active ? '<span class="badge" title="Claude Code is logged in with this account. Artifacts and claude.ai connectors use it, so vdm keeps the login here while other accounts take the requests.">Login</span>' : '') +
       '</div>' +
@@ -3621,8 +3621,8 @@ const STRATEGY_HINTS = {
   conserve: 'Drains active accounts first (weekly limit primary). Untouched accounts stay dormant  - their windows never start.',
   'round-robin': 'Rotates to the least-used account on a timer. Good balance of safety and efficiency.',
   spread: 'Picks the least-used account on every request. Switches often  - may trigger Anthropic notices.',
-  'drain-first': 'Uses the account with highest 5hr utilization first. Good for short sessions.',
-  balance: 'Spreads sessions across accounts by load, capped per account. Skips accounts whose 5h, weekly or Fable window is used up. Best for running many sessions at once.',
+  'drain-first': 'Uses the most-used account first. Good for short sessions.',
+  balance: 'Spreads sessions across accounts by load, capped per account. Skips accounts whose 5h (not on Ultra), weekly or Fable window is used up. Best for running many sessions at once.',
 };
 
 async function loadSettingsUI() {
@@ -3671,11 +3671,11 @@ async function loadSettingsUI() {
 
 const STRATEGY_DETAILS = {
   sticky:        { name: 'Sticky',      desc: 'Stay on the current account until it hits a rate limit (429) or auth error (401). Never switches proactively  - minimal disruption.' },
-  conserve:      { name: 'Conserve',    desc: 'Concentrate usage on accounts whose rate-limit windows are already active. Untouched accounts stay dormant so their 5hr and weekly windows never start  - maximizes total available capacity over time.' },
+  conserve:      { name: 'Conserve',    desc: 'Concentrate usage on accounts whose rate-limit windows are already active. Untouched accounts stay dormant so their limit windows never start  - maximizes total available capacity over time.' },
   'round-robin': { name: 'Round-robin', desc: 'Rotate to the least-used account on a fixed timer. Balances load evenly while limiting switch frequency.' },
-  spread:        { name: 'Spread',      desc: 'Always pick the account with the lowest 5hr utilization on every request. Switches often  - best for short, bursty sessions.' },
-  'drain-first': { name: 'Drain first', desc: 'Use the account with the highest 5hr utilization first, draining it before moving on. Good for finishing off nearly-exhausted windows.' },
-  balance:       { name: 'Balance',     desc: 'Place new sessions on the least-loaded account (in-flight requests plus warm sessions), capped per account. Accounts whose 5h, weekly or Fable window is used up are skipped, and nearly full ones go last. With session affinity a running session stays on its account (it waits for a slot there instead of moving). Best when running many sessions/subagents at once.' },
+  spread:        { name: 'Spread',      desc: 'Always pick the least-used account on every request. Switches often  - best for short, bursty sessions.' },
+  'drain-first': { name: 'Drain first', desc: 'Use the most-used account first, draining it before moving on. Good for finishing off nearly-exhausted windows.' },
+  balance:       { name: 'Balance',     desc: 'Place new sessions on the least-loaded account (in-flight requests plus warm sessions), capped per account. Accounts whose 5h (not on Ultra), weekly or Fable window is used up are skipped, and nearly full ones go last. With session affinity a running session stays on its account (it waits for a slot there instead of moving). Best when running many sessions/subagents at once.' },
 };
 
 function updateStrategyUI(strategy) {
@@ -6767,7 +6767,7 @@ function usageReport(params) {
     const used = cur.byAccount[a.id];
     return {
       name: a.name, key: a.id, label: a.label || a.id, monthly,
-      tier: (String(o.rateLimitTier || '').match(/(\d+)x/) || [])[1] ? `Max ${String(o.rateLimitTier).match(/(\d+)x/)[1]}x` : (o.subscriptionType || 'unknown'),
+      tier: planInfo(o.subscriptionType, o.rateLimitTier).name,
       planCost: monthly ? monthly * days / MONTH_DAYS : null,
       apiCost: used?.cost || 0,
       requests: used?.requests || 0,
