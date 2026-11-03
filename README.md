@@ -134,7 +134,7 @@ vdm upgrade                 Update to latest version
 
 #### Accounts
 
-Per account: 5h and weekly windows, plus a **Fable weekly** bar under the weekly one when the account has that bucket (Fable has its own weekly limit). Under each bar:
+Per account: 5h and weekly windows (Ultra accounts have no 5h window, so only weekly), plus a **Fable weekly** bar under the weekly one when the account has that bucket (Fable has its own weekly limit). Under each bar:
 
 - `2d 5h left`: time until the window resets.
 - **Fresh: starts when used**: the window's reset time has passed, so it is empty again. Its next request starts a new window. (Use outside vdm, e.g. on claude.ai, shows after vdm sends a request on that account.) The strategies count such a window as 0%, so Conserve keeps a fresh week for later.
@@ -213,7 +213,7 @@ Claude Code publishes and edits artifacts with its own login (the account in the
 
 Every request through the proxy is counted (input, output, cache reads, cache writes), per account, model, repo and branch. Data is kept as hourly rollups in `usage/` (one file per day), so it survives restarts and re-logins and has no row cap.
 
-- **Plan value**  - each Max account's subscription price (20x $200, 5x $100, prorated) vs the same usage at API prices, over the chosen period. Accounts not used in that period are left out.
+- **Plan value**  - each paid account's subscription price (Ultra $200, Max $100, prorated) vs the same usage at API prices, over the chosen period. Accounts not used in that period are left out.
 - Model, account and repo/branch breakdowns; CSV export of the hourly rows
 
 ### Settings
@@ -241,10 +241,10 @@ vdm config history-keep <days>    # Delete saved sessions older than this (0 = f
 | **Conserve** | Drain active accounts first, keep unused ones dormant |
 | **Round-robin** | Rotate every N minutes |
 | **Spread** | Always pick lowest utilization |
-| **Drain first** | Use highest 5hr utilization first |
+| **Drain first** | Use the most-used account first |
 | **Balance** | Put new sessions on the least-loaded account, capped per account |
 
-All strategies skip accounts whose 5h or weekly window is used up. Per-model weekly limits (Fable, and weekly Opus or Sonnet limits) only steer that model's requests away; other models keep using the account. When every account is used up for a request's model, vdm does not try them again: it answers at once with the first reset time, so Claude Code shows it and stops instead of retrying for minutes. If only Fable is used up everywhere, other models keep working. The dashboard then shows a banner with **Try again**, for a limit that came back early (for example after buying extra usage): your next prompt tries each account once. With session affinity on, the strategy only places new and idle sessions.
+All strategies skip accounts whose 5h (not on Ultra) or weekly window is used up. Per-model weekly limits (Fable, and weekly Opus or Sonnet limits) only steer that model's requests away; other models keep using the account. When every account is used up for a request's model, vdm does not try them again: it answers at once with the first reset time, so Claude Code shows it and stops instead of retrying for minutes. If only Fable is used up everywhere, other models keep working. The dashboard then shows a banner with **Try again**, for a limit that came back early (for example after buying extra usage): your next prompt tries each account once. With session affinity on, the strategy only places new and idle sessions.
 
 ## How It Works
 

@@ -10,6 +10,7 @@ import {
   priceFor,
   usageCost,
   planMonthlyUsd,
+  planInfo,
   createUsageDay,
   summarizeUsage,
   promptTokens,
@@ -96,10 +97,20 @@ describe('pricing', () => {
     close(usageCost({ ...u, speed: 'fast' }, 'claude-opus-5-5'), 2 * (4 + 20 + 0.2 + 5 + 8));
   });
 
-  it('planMonthlyUsd: Max 20x $200, Max 5x $100, others not priced', () => {
+  it('planMonthlyUsd: Ultra (old Max 20x) $200, Max (old Max 5x) $100, others not priced', () => {
     assert.equal(planMonthlyUsd('max', 'default_claude_max_20x'), 200);
+    assert.equal(planMonthlyUsd('ultra', 'default_claude_ultra'), 200);
     assert.equal(planMonthlyUsd('max', 'default_claude_max_5x'), 100);
     assert.equal(planMonthlyUsd('pro', 'default_claude_pro'), null);
+  });
+
+  it('planInfo: old Max 20x is Ultra with no 5-hour window; old Max 5x is Max', () => {
+    assert.deepEqual(planInfo('max', 'default_claude_max_20x'), { name: 'Ultra', fiveHourWindow: false });
+    assert.deepEqual(planInfo('ultra', 'unknown'), { name: 'Ultra', fiveHourWindow: false });
+    assert.deepEqual(planInfo('max', 'default_claude_max_5x'), { name: 'Max', fiveHourWindow: true });
+    assert.deepEqual(planInfo('max', 'unknown'), { name: 'Max', fiveHourWindow: true });
+    assert.deepEqual(planInfo('pro', 'default_claude_pro'), { name: 'Pro', fiveHourWindow: true });
+    assert.deepEqual(planInfo(undefined, undefined), { name: 'Free', fiveHourWindow: true });
   });
 });
 
