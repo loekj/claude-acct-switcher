@@ -3433,6 +3433,14 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
   var displayName = p.label || p.name;
   var eName = p.name.replace(/'/g, "\\\\'");
 
+  // A used-up 5h or weekly window shows on its own bar ("used up", time left), not in a banner
+  var shownOnBar = false;
+  var windowBar = function(label, w, blockWhat) {
+    var usedUp = !!(p.blocked && p.blocked.what === blockWhat);
+    if (usedUp) shownOnBar = true;
+    return rateGroup(label, w.utilization, usedUp ? p.blocked.until : w.reset,
+      usedUp ? { usedUp: true, title: 'New and moved sessions skip this account until then.' } : undefined);
+  };
   var barsHtml = '';
   if (p.rateLimits) {
     var rl = p.rateLimits;
@@ -3443,8 +3451,8 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
     // then the charts, so both charts start at the same height.
     // Ultra has no 5h window (fiveH is null): Weekly takes its place, Fable sits beside it.
     var cells = rl.fiveH
-      ? [rateGroup('5h window', rl.fiveH.utilization, rl.fiveH.reset), rateGroup('Weekly', rl.sevenD.utilization, rl.sevenD.reset)]
-      : [rateGroup('Weekly', rl.sevenD.utilization, rl.sevenD.reset)];
+      ? [windowBar('5h window', rl.fiveH, '5-hour limit'), windowBar('Weekly', rl.sevenD, 'weekly limit')]
+      : [windowBar('Weekly', rl.sevenD, 'weekly limit')];
     if (rl.sevenDOI) {
       var fableUntil = rl.fableBlockedUntil && rl.fableBlockedUntil > Date.now() / 1000 ? rl.fableBlockedUntil : 0;
       if (rl.fiveH) cells.push('<div></div>');
@@ -3465,7 +3473,7 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
 
   var backIn = function(until) { return ' <span class="muted">&middot; back in <span data-reset="' + until + '" data-short="1"></span></span>'; };
   var what = p.blocked ? p.blocked.what : '';
-  var blockedHtml = p.blocked
+  var blockedHtml = p.blocked && !shownOnBar
     ? '<div class="blocked-banner" title="New and moved sessions skip this account until then.">' +
       escHtml(what === 'cooling down' ? 'Cooling down' : what.charAt(0).toUpperCase() + what.slice(1) + ' used up') + backIn(p.blocked.until) + '</div>'
     : '';
