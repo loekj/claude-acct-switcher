@@ -1643,8 +1643,8 @@ function renderHTML() {
   .card.login { position: relative; background: var(--purple-soft); }
   .card.login:not(.active) { border-color: var(--purple-border); }
   .login-arrow {
-    position: absolute; left: -1.5rem; top: 50%; transform: translateY(-50%);
-    display: flex; width: 1.25rem; height: 1.25rem; color: var(--purple); cursor: help;
+    position: absolute; left: -1.6rem; top: 1.25rem;
+    display: flex; width: 1.4rem; height: 1.4rem; color: var(--purple); cursor: help;
   }
   .login-arrow svg { width: 100%; height: 100%; }
   .card.stale { opacity: 0.5; }
@@ -3487,7 +3487,7 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
   var loginTip = 'Claude Code is logged in to this one right now!&#10;Artifacts and claude.ai connectors use this login. Your prompts can still run on another account.';
   var loginArrow = p.isLogin
     ? '<span class="login-arrow" title="' + loginTip + '" aria-label="Claude Code is logged in to this account">' +
-        '<svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M3 8.5h8.5V4.8L18 10l-6.5 5.2v-3.7H3z"/></svg></span>'
+        '<svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M2 7.6h8.6V3.4L18.6 10l-8 6.6v-4.2H2z"/></svg></span>'
     : '';
   var sessLink = accountSessionsLink(p);
   var buttonsHtml = '';
