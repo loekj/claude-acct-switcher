@@ -1639,6 +1639,14 @@ function renderHTML() {
   }
   .card:hover { box-shadow: var(--shadow-lg); }
   .card.active { border-color: var(--green); border-width: 2px; }
+  /* Claude Code's own login (the Keychain account): a purple tint and an arrow beside the card */
+  .card.login { position: relative; background: var(--purple-soft); }
+  .card.login:not(.active) { border-color: var(--purple-border); }
+  .login-arrow {
+    position: absolute; left: -1.6rem; top: 1.25rem;
+    display: flex; width: 1.4rem; height: 1.4rem; color: var(--purple); cursor: help;
+  }
+  .login-arrow svg { width: 100%; height: 100%; }
   .card.stale { opacity: 0.5; }
   .card.stale:hover { opacity: 0.7; }
   .stale-msg {
@@ -3425,6 +3433,14 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
   var displayName = p.label || p.name;
   var eName = p.name.replace(/'/g, "\\\\'");
 
+  // A used-up 5h or weekly window shows on its own bar ("used up", time left), not in a banner
+  var shownOnBar = false;
+  var windowBar = function(label, w, blockWhat) {
+    var usedUp = !!(p.blocked && p.blocked.what === blockWhat);
+    if (usedUp) shownOnBar = true;
+    return rateGroup(label, w.utilization, usedUp ? p.blocked.until : w.reset,
+      usedUp ? { usedUp: true, title: 'New and moved sessions skip this account until then.' } : undefined);
+  };
   var barsHtml = '';
   if (p.rateLimits) {
     var rl = p.rateLimits;
@@ -3435,8 +3451,8 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
     // then the charts, so both charts start at the same height.
     // Ultra has no 5h window (fiveH is null): Weekly takes its place, Fable sits beside it.
     var cells = rl.fiveH
-      ? [rateGroup('5h window', rl.fiveH.utilization, rl.fiveH.reset), rateGroup('Weekly', rl.sevenD.utilization, rl.sevenD.reset)]
-      : [rateGroup('Weekly', rl.sevenD.utilization, rl.sevenD.reset)];
+      ? [windowBar('5h window', rl.fiveH, '5-hour limit'), windowBar('Weekly', rl.sevenD, 'weekly limit')]
+      : [windowBar('Weekly', rl.sevenD, 'weekly limit')];
     if (rl.sevenDOI) {
       var fableUntil = rl.fableBlockedUntil && rl.fableBlockedUntil > Date.now() / 1000 ? rl.fableBlockedUntil : 0;
       if (rl.fiveH) cells.push('<div></div>');
@@ -3457,7 +3473,7 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
 
   var backIn = function(until) { return ' <span class="muted">&middot; back in <span data-reset="' + until + '" data-short="1"></span></span>'; };
   var what = p.blocked ? p.blocked.what : '';
-  var blockedHtml = p.blocked
+  var blockedHtml = p.blocked && !shownOnBar
     ? '<div class="blocked-banner" title="New and moved sessions skip this account until then.">' +
       escHtml(what === 'cooling down' ? 'Cooling down' : what.charAt(0).toUpperCase() + what.slice(1) + ' used up') + backIn(p.blocked.until) + '</div>'
     : '';
@@ -3475,7 +3491,12 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
       ? '<div class="stale-msg">Login expired. Click Refresh or run <code>claude login</code> for this account.</div>'
       : '<div class="stale-msg">Login expired. Auto-refresh will retry shortly.</div>';
   }
-  var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '');
+  var cardClass = 'card' + (active ? ' active' : '') + (p.isLogin ? ' login' : '') + (isStale ? ' stale' : '');
+  var loginTip = 'Claude Code is logged in to this one right now!&#10;Artifacts and claude.ai connectors use this login. Your prompts can still run on another account.';
+  var loginArrow = p.isLogin
+    ? '<span class="login-arrow" title="' + loginTip + '" aria-label="Claude Code is logged in to this account">' +
+        '<svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M2 7.6h8.6V3.4L18.6 10l-8 6.6v-4.2H2z"/></svg></span>'
+    : '';
   var sessLink = accountSessionsLink(p);
   var buttonsHtml = '';
   if (!active) {
@@ -3488,6 +3509,7 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
   var arts = p.artifactCount
     ? '<button class="chip" onclick="openArtifactsFor(\\'' + eName + '\\')" title="Artifacts this account owns on claude.ai">' + p.artifactCount + ' artifact' + (p.artifactCount === 1 ? '' : 's') + '</button>' : '';
   return '<div class="' + cardClass + '"' + animStyle + ' data-name="' + escHtml(p.name) + '">' +
+    loginArrow +
     '<div class="card-top">' +
       '<div class="card-identity">' +
         '<div class="status-dot ' + (active ? 'active' : 'inactive') + '"></div>' +
@@ -3499,7 +3521,6 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
         inflightBadge(p, balanceMode, balanceCap) +
         planBadge(p.plan) +
         (active ? '<span class="badge badge-active" title="' + (p.isLogin ? 'Claude Code is logged in with this account; new sessions start here' : 'New sessions start here. Claude Code stays logged in with another account, so its artifacts keep working') + '">Active</span>' : '') +
-        (p.isLogin && !active ? '<span class="badge" title="Claude Code is logged in with this account. Artifacts and claude.ai connectors use it, so vdm keeps the login here while other accounts take the requests.">Login</span>' : '') +
       '</div>' +
     '</div>' +
     blockedHtml +
