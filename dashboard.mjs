@@ -1639,6 +1639,14 @@ function renderHTML() {
   }
   .card:hover { box-shadow: var(--shadow-lg); }
   .card.active { border-color: var(--green); border-width: 2px; }
+  /* Claude Code's own login (the Keychain account): a purple tint and an arrow beside the card */
+  .card.login { position: relative; background: var(--purple-soft); }
+  .card.login:not(.active) { border-color: var(--purple-border); }
+  .login-arrow {
+    position: absolute; left: -1.5rem; top: 50%; transform: translateY(-50%);
+    display: flex; width: 1.25rem; height: 1.25rem; color: var(--purple); cursor: help;
+  }
+  .login-arrow svg { width: 100%; height: 100%; }
   .card.stale { opacity: 0.5; }
   .card.stale:hover { opacity: 0.7; }
   .stale-msg {
@@ -3475,7 +3483,12 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
       ? '<div class="stale-msg">Login expired. Click Refresh or run <code>claude login</code> for this account.</div>'
       : '<div class="stale-msg">Login expired. Auto-refresh will retry shortly.</div>';
   }
-  var cardClass = 'card' + (active ? ' active' : '') + (isStale ? ' stale' : '');
+  var cardClass = 'card' + (active ? ' active' : '') + (p.isLogin ? ' login' : '') + (isStale ? ' stale' : '');
+  var loginTip = 'Claude Code is logged in to this one right now!&#10;Artifacts and claude.ai connectors use this login. Your prompts can still run on another account.';
+  var loginArrow = p.isLogin
+    ? '<span class="login-arrow" title="' + loginTip + '" aria-label="Claude Code is logged in to this account">' +
+        '<svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M3 8.5h8.5V4.8L18 10l-6.5 5.2v-3.7H3z"/></svg></span>'
+    : '';
   var sessLink = accountSessionsLink(p);
   var buttonsHtml = '';
   if (!active) {
@@ -3488,6 +3501,7 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
   var arts = p.artifactCount
     ? '<button class="chip" onclick="openArtifactsFor(\\'' + eName + '\\')" title="Artifacts this account owns on claude.ai">' + p.artifactCount + ' artifact' + (p.artifactCount === 1 ? '' : 's') + '</button>' : '';
   return '<div class="' + cardClass + '"' + animStyle + ' data-name="' + escHtml(p.name) + '">' +
+    loginArrow +
     '<div class="card-top">' +
       '<div class="card-identity">' +
         '<div class="status-dot ' + (active ? 'active' : 'inactive') + '"></div>' +
@@ -3499,7 +3513,6 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
         inflightBadge(p, balanceMode, balanceCap) +
         planBadge(p.plan) +
         (active ? '<span class="badge badge-active" title="' + (p.isLogin ? 'Claude Code is logged in with this account; new sessions start here' : 'New sessions start here. Claude Code stays logged in with another account, so its artifacts keep working') + '">Active</span>' : '') +
-        (p.isLogin && !active ? '<span class="badge" title="Claude Code is logged in with this account. Artifacts and claude.ai connectors use it, so vdm keeps the login here while other accounts take the requests.">Login</span>' : '') +
       '</div>' +
     '</div>' +
     blockedHtml +

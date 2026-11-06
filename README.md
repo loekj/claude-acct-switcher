@@ -207,7 +207,7 @@ Saved sessions live in `~/.claude/account-switcher/history/` (only you can read 
 
 #### Artifacts
 
-Claude Code publishes and edits artifacts with its own login (the account in the Keychain), not through the proxy. So vdm keeps that login in place: when an account hits a limit, only the requests move to another account, and your artifacts stay reachable. The login moves only when its token dies or you switch by hand. The card of that account shows a **Login** badge while requests run on another account. The Artifacts tab asks every account which artifacts it owns (every 15 minutes, or on demand). Paste an artifact link to find its owner. Artifact links seen in a session's messages are linked to that session.
+Claude Code publishes and edits artifacts with its own login (the account in the Keychain), not through the proxy. So vdm keeps that login in place: when an account hits a limit, only the requests move to another account, and your artifacts stay reachable. The login moves only when its token dies or you switch by hand. The card of that account is tinted purple, with an arrow beside it (hover it: "Claude Code is logged in to this one right now!"). The Artifacts tab asks every account which artifacts it owns (every 15 minutes, or on demand). Paste an artifact link to find its owner. Artifact links seen in a session's messages are linked to that session.
 
 #### Usage
 
