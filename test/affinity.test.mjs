@@ -12,6 +12,8 @@ import {
   createInflightTracker,
   pickLeastLoaded,
   pickByStrategy,
+  pickSoonestReset,
+  normalizeRotation,
   createSessionStore,
   sessionAffinity,
   sessionLabel,
@@ -180,6 +182,158 @@ describe('pickLeastLoaded (balance)', () => {
     assert.equal(pick.account.name, 'c');
     const preferred = pickLeastLoaded(accounts, inflight, sm, 8, new Set(), Date.now(), { extraLoad: { a: 2 }, prefer: 'a' });
     assert.equal(preferred.account.name, 'a');
+  });
+});
+
+// Weekly usage `u` resetting in `hours` (0 = window not started)
+const weekly = (sm, tok, u, hours) => sm.update(tok, tok, H(hours
+  ? { status: 'allowed', '7d-utilization': u, '7d-reset': Math.floor(Date.now() / 1000) + hours * 3600 }
+  : { status: 'allowed', '5h-utilization': 0 }));
+
+describe('soonest reset', () => {
+  const accounts = ['a', 'b', 'c', 'd', 'e'].map(n => ({ name: n, token: 'tok' + n, expiresAt: 0 }));
+  const setup = () => {
+    const sm = createAccountStateManager();
+    weekly(sm, 'toka', 0.5, 100);  // resets last
+    weekly(sm, 'tokb', 0.95, 30);  // resets first
+    weekly(sm, 'tokc', 0.2, 40);
+    weekly(sm, 'tokd', 0.9, 60);
+    weekly(sm, 'toke', 0, 0);      // week not started
+    return sm;
+  };
+
+  it('picks the account whose weekly limit resets first; unstarted weeks go last', () => {
+    const sm = setup();
+    assert.equal(pickSoonestReset(accounts, sm).name, 'b');
+    // a (resets in 100h) still goes before e (week not started)
+    assert.equal(pickSoonestReset(accounts, sm, new Set(['tokb', 'tokc', 'tokd'])).name, 'a');
+    assert.equal(pickSoonestReset(accounts, sm, new Set(['tokb', 'tokc', 'tokd', 'toka'])).name, 'e');
+    // used up → skipped
+    weekly(sm, 'tokb', 1, 30);
+    assert.equal(pickSoonestReset(accounts, sm).name, 'c');
+  });
+
+  it('pickByStrategy moves to the soonest reset, also when the current account is used up', () => {
+    const sm = setup();
+    const r = pickByStrategy({ strategy: 'soonest-reset', currentToken: 'toka', accounts, stateManager: sm });
+    assert.equal(r.account.name, 'b');
+    assert.equal(pickByStrategy({ strategy: 'soonest-reset', currentToken: 'tokb', accounts, stateManager: sm }).account, null);
+    weekly(sm, 'tokb', 1, 30);
+    // current used up: keep the order (c resets next), not the least-used account (e)
+    assert.equal(pickByStrategy({ strategy: 'soonest-reset', currentToken: 'tokb', accounts, stateManager: sm }).account.name, 'c');
+  });
+
+  it('balance: spreads over accounts that reset within the window, then spills in reset order', () => {
+    const sm = setup();
+    const inflight = createInflightTracker();
+    const opts = (extra) => ({ strategy: 'soonest-reset', withinSec: 48 * 3600, ...extra });
+    // b (30h) and c (40h) share the load
+    assert.equal(pickLeastLoaded(accounts, inflight, sm, 2, new Set(), Date.now(), opts()).account.name, 'b');
+    inflight.acquire('b');
+    assert.equal(pickLeastLoaded(accounts, inflight, sm, 2, new Set(), Date.now(), opts()).account.name, 'c');
+    // warm lanes count as load
+    assert.equal(pickLeastLoaded(accounts, inflight, sm, 2, new Set(), Date.now(), opts({ extraLoad: { c: 2 } })).account.name, 'b');
+    // group full (b, c at cap 2) → d, which resets next; not a (100h) or e (not started)
+    inflight.acquire('b'); inflight.acquire('c'); inflight.acquire('c');
+    const spill = pickLeastLoaded(accounts, inflight, sm, 2, new Set(), Date.now(), opts());
+    assert.equal(spill.account.name, 'd');
+    assert.equal(spill.overCap, false);
+    // everything full → the least-loaded group account, over the cap (caller waits)
+    for (const n of ['a', 'd', 'e']) { inflight.acquire(n); inflight.acquire(n); }
+    const full = pickLeastLoaded(accounts, inflight, sm, 2, new Set(), Date.now(), opts());
+    assert.equal(full.account.name, 'b');
+    assert.equal(full.overCap, true);
+  });
+
+  it('balance: a burst fills one unstarted account before it starts the next week', () => {
+    const sm = createAccountStateManager();
+    const inflight = createInflightTracker();
+    const opts = { strategy: 'soonest-reset', withinSec: 48 * 3600 };
+    const picks = [];
+    for (let i = 0; i < 3; i++) {
+      const p = pickLeastLoaded(accounts, inflight, sm, 2, new Set(), Date.now(), opts);
+      picks.push(p.account.name);
+      inflight.acquire(p.account.name);
+    }
+    assert.deepEqual(picks, ['a', 'a', 'b']);
+  });
+
+  it('balance: an empty window acts as plain soonest-reset with spill', () => {
+    const sm = setup();
+    const inflight = createInflightTracker();
+    const opts = { strategy: 'soonest-reset', withinSec: 24 * 3600 };
+    assert.equal(pickLeastLoaded(accounts, inflight, sm, 1, new Set(), Date.now(), opts).account.name, 'b');
+    inflight.acquire('b');
+    assert.equal(pickLeastLoaded(accounts, inflight, sm, 1, new Set(), Date.now(), opts).account.name, 'c');
+  });
+
+  it('balance: prefer is kept inside the window, not on an account that resets later', () => {
+    const sm = setup();
+    const inflight = createInflightTracker();
+    const opts = (prefer) => ({ strategy: 'soonest-reset', withinSec: 48 * 3600, prefer });
+    inflight.acquire('c');
+    assert.equal(pickLeastLoaded(accounts, inflight, sm, 4, new Set(), Date.now(), opts('c')).account.name, 'c');
+    assert.equal(pickLeastLoaded(accounts, inflight, sm, 4, new Set(), Date.now(), opts('a')).account.name, 'b');
+  });
+});
+
+describe('conserve + balance', () => {
+  const accounts = ['a', 'b', 'c'].map(n => ({ name: n, token: 'tok' + n, expiresAt: 0 }));
+
+  it('spreads over started accounts only; untouched ones stay dormant', () => {
+    const sm = createAccountStateManager();
+    weekly(sm, 'toka', 0.5, 100);
+    weekly(sm, 'tokb', 0.2, 50);
+    const inflight = createInflightTracker();
+    inflight.acquire('a');
+    const opts = { strategy: 'conserve' };
+    assert.equal(pickLeastLoaded(accounts, inflight, sm, 2, new Set(), Date.now(), opts).account.name, 'b');
+    inflight.acquire('b'); inflight.acquire('a'); inflight.acquire('b');
+    const full = pickLeastLoaded(accounts, inflight, sm, 2, new Set(), Date.now(), opts);
+    assert.notEqual(full.account.name, 'c', 'a dormant account is not started for load');
+    assert.equal(full.overCap, true);
+  });
+
+  it('one started account is solo: it takes every request', () => {
+    const sm = createAccountStateManager();
+    weekly(sm, 'toka', 0.5, 100);
+    const inflight = createInflightTracker();
+    inflight.acquire('a'); inflight.acquire('a');
+    const r = pickLeastLoaded(accounts, inflight, sm, 2, new Set(), Date.now(), { strategy: 'conserve' });
+    assert.equal(r.account.name, 'a');
+    assert.equal(r.solo, true);
+    assert.equal(r.overCap, false);
+  });
+
+  it('does not wake a dormant account while the started ones only cool down', () => {
+    const sm = createAccountStateManager();
+    weekly(sm, 'toka', 0.5, 100);
+    const r = pickLeastLoaded(accounts, createInflightTracker(), sm, 2, new Set(['toka']), Date.now(), { strategy: 'conserve' });
+    assert.equal(r, null);
+    // only cooling down (not tried): wait for it
+    const w = pickLeastLoaded(accounts, createInflightTracker(), sm, 2, new Set(['toka']), Date.now(), { strategy: 'conserve', cooled: new Set(['toka']) });
+    assert.equal(w.account.name, 'a');
+    assert.equal(w.wait, true);
+    // used up for real → a dormant account takes over
+    weekly(sm, 'toka', 1, 100);
+    assert.equal(pickLeastLoaded(accounts, createInflightTracker(), sm, 2, new Set(), Date.now(), { strategy: 'conserve' }).account.name, 'b');
+  });
+
+  it('starts one dormant account when none has started', () => {
+    const sm = createAccountStateManager();
+    const r = pickLeastLoaded(accounts, createInflightTracker(), sm, 2, new Set(), Date.now(), { strategy: 'conserve' });
+    assert.equal(r.account.name, 'a');
+    assert.equal(r.solo, true);
+  });
+});
+
+describe('normalizeRotation', () => {
+  it('turns the old balance strategy into spread + Balance', () => {
+    assert.deepEqual(normalizeRotation('balance', false), { rotationStrategy: 'spread', balanceLoad: true });
+    assert.deepEqual(normalizeRotation('soonest-reset', true), { rotationStrategy: 'soonest-reset', balanceLoad: true });
+    assert.deepEqual(normalizeRotation('conserve', undefined), { rotationStrategy: 'conserve', balanceLoad: false });
+    assert.deepEqual(normalizeRotation('nonsense', true), { rotationStrategy: 'conserve', balanceLoad: true });
+    assert.deepEqual(normalizeRotation('toString', false), { rotationStrategy: 'conserve', balanceLoad: false });
   });
 });
 

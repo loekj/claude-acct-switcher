@@ -102,6 +102,8 @@ const DEFAULT_SETTINGS = {
   notifications: true,
   serializeRequests: false,
   serializeDelayMs: 200,
+  balanceLoad: false,         // Balance: spread sessions over several accounts (spread, conserve, soonest-reset)
+  balanceWithinHours: 48,     // soonest-reset + Balance: accounts whose weekly limit resets this soon share the load
   maxConcurrentPerAccount: 8, // balance mode: max concurrent in-flight requests per account
   balanceWaitMs: 10000,       // balance mode: wait for a freed slot before overflowing
   sessionAffinity: true,      // keep each Claude Code session on one account while its prompt cache is warm
@@ -133,6 +135,8 @@ function loadSettings() {
 // per-request slot wait safely under REQUEST_DEADLINE_MS (45s).
 function clampSettings(s) {
   const n = (v, def, lo, hi) => (typeof v === 'number' && isFinite(v) ? Math.min(Math.max(v, lo), hi) : def);
+  Object.assign(s, normalizeRotation(s.rotationStrategy, s.balanceLoad));
+  if (!BALANCE_WITHIN_HOURS.includes(s.balanceWithinHours)) s.balanceWithinHours = 48;
   s.maxConcurrentPerAccount = Math.floor(n(s.maxConcurrentPerAccount, 8, 1, 50));
   s.balanceWaitMs = n(s.balanceWaitMs, 10000, 0, 30000);
   s.hotTokensPer5m = Math.round(n(s.hotTokensPer5m, 25_000_000, 100_000, 10_000_000_000));
@@ -171,9 +175,10 @@ function saveSettings(settings) {
 }
 
 let settings = loadSettings();
-// Drop settings of removed features from config.json
+// Drop settings of removed features from config.json; "balance" became spread + the Balance switch
 try {
-  if (existsSync(CONFIG_FILE) && REMOVED_SETTINGS.some(k => k in JSON.parse(readFileSync(CONFIG_FILE, 'utf8')))) saveSettings(settings);
+  const raw = existsSync(CONFIG_FILE) ? JSON.parse(readFileSync(CONFIG_FILE, 'utf8')) : null;
+  if (raw && (REMOVED_SETTINGS.some(k => k in raw) || raw.rotationStrategy === 'balance')) saveSettings(settings);
 } catch { /* unreadable config  - leave it */ }
 let lastRotationTime = 0; // tracks when proactive rotation last happened
 let _consecutive400s = 0;  // global: consecutive 400 errors across requests (reset on success)
@@ -286,6 +291,7 @@ import {
   pickBestAccount as _pickBestAccount,
   pickLeastLoaded as _pickLeastLoaded,
   pickDrainFirst as _pickDrainFirst,
+  pickSoonestReset as _pickSoonestReset,
   pickConserve as _pickConserve,
   pickAnyUntried as _pickAnyUntried,
   getEarliestReset as _getEarliestReset,
@@ -306,6 +312,10 @@ import {
   createPerAccountLock,
   ROTATION_STRATEGIES,
   ROTATION_INTERVALS,
+  BALANCE_STRATEGIES,
+  BALANCE_WITHIN_HOURS,
+  normalizeRotation,
+  isRotationStrategy,
   createThroughputStore,
   throughputFromRollups,
   HOUR_MS,
@@ -1040,6 +1050,7 @@ async function handleAPI(req, res) {
         if (p.rateLimits) p.rateLimits = { ...p.rateLimits, fiveH: null };
       }
       p.inflight = balanceLimiter.get(p.name); // balance-mode concurrent in-flight (0 in other modes)
+      p.lastSentAt = _lastSentAt.get(p.name) || 0;
       p.sessions = accountSessions(p.name);
       p.artifactCount = (artifactIndex.accounts[p.name]?.frames || []).length;
       p.blocked = blockedInfo(p.name);
@@ -1051,9 +1062,12 @@ async function handleAPI(req, res) {
     const allOut = allUsedUp(allAccounts, accountState, null);
     const out = allOut || allUsedUp(allAccounts, accountState, 'fable');
     const usedUp = out ? { fable: !allOut, until: formatResetAt(out.at), first: out.account.label || out.account.name } : null;
+    const next = nextAccountName(allAccounts);
+    for (const p of profiles) p.isNext = p.name === next;
     json(res, {
       profiles, probeStats, usedUp,
-      rotationStrategy: settings.rotationStrategy, balanceCap: settings.maxConcurrentPerAccount || 8,
+      rotationStrategy: settings.rotationStrategy, balance: isBalanceMode(), balanceWithinHours: settings.balanceWithinHours,
+      balanceCap: settings.maxConcurrentPerAccount || 8,
       sessionAffinity: settings.sessionAffinity !== false, sessionHistory: settings.sessionHistory === true, hotTokensPer5m: settings.hotTokensPer5m,
       queueStats: getQueueStats(),
     });
@@ -1226,16 +1240,13 @@ async function handleAPI(req, res) {
       }
     }
     if (typeof patch.notifications === 'boolean') settings.notifications = patch.notifications;
-    if (typeof patch.rotationStrategy === 'string' && ROTATION_STRATEGIES[patch.rotationStrategy]) {
-      settings.rotationStrategy = patch.rotationStrategy;
+    const wasBalance = isBalanceMode();
+    if (isRotationStrategy(patch.rotationStrategy) || patch.rotationStrategy === 'balance') {
+      Object.assign(settings, normalizeRotation(patch.rotationStrategy, settings.balanceLoad));
       lastRotationTime = Date.now(); // reset timer on strategy change
-      // Balance mode supersedes the global serialize gate — disarm it so the two
-      // beta gates never both apply.
-      if (patch.rotationStrategy === 'balance' && settings.serializeRequests) {
-        settings.serializeRequests = false;
-        drainSerializationQueue();
-      }
     }
+    if (typeof patch.balanceLoad === 'boolean') settings.balanceLoad = patch.balanceLoad;
+    if (BALANCE_WITHIN_HOURS.includes(patch.balanceWithinHours)) settings.balanceWithinHours = patch.balanceWithinHours;
     if (typeof patch.rotationIntervalMin === 'number' && ROTATION_INTERVALS.includes(patch.rotationIntervalMin)) {
       settings.rotationIntervalMin = patch.rotationIntervalMin;
       lastRotationTime = Date.now(); // reset timer on interval change
@@ -1244,6 +1255,12 @@ async function handleAPI(req, res) {
       settings.serializeRequests = patch.serializeRequests;
       // If turning off, drain queued requests immediately
       if (!patch.serializeRequests) drainSerializationQueue();
+    }
+    // Balance supersedes the global serialize gate: disarm it when balance turns on, so the
+    // two beta gates never both apply.
+    if (!wasBalance && isBalanceMode() && settings.serializeRequests) {
+      settings.serializeRequests = false;
+      drainSerializationQueue();
     }
     if (typeof patch.serializeDelayMs === 'number' && patch.serializeDelayMs >= 0 && patch.serializeDelayMs <= 2000) {
       settings.serializeDelayMs = patch.serializeDelayMs;
@@ -1274,7 +1291,7 @@ async function handleAPI(req, res) {
     if (JSON.stringify(historyConfig()) !== historyBefore) applyHistorySettings();
     logActivity('settings-changed', {
       autoSwitch: settings.autoSwitch, proxyEnabled: settings.proxyEnabled,
-      rotationStrategy: settings.rotationStrategy, rotationIntervalMin: settings.rotationIntervalMin,
+      rotationStrategy: settings.rotationStrategy, balance: isBalanceMode(), rotationIntervalMin: settings.rotationIntervalMin,
     });
     json(res, settings);
     return true;
@@ -1638,15 +1655,27 @@ function renderHTML() {
     transition: box-shadow 0.2s, border-color 0.2s;
   }
   .card:hover { box-shadow: var(--shadow-lg); }
-  .card.active { border-color: var(--green); border-width: 2px; }
-  /* Claude Code's own login (the Keychain account): a purple tint and an arrow beside the card */
-  .card.login { position: relative; background: var(--purple-soft); }
-  .card.login:not(.active) { border-color: var(--purple-border); }
-  .login-arrow {
+  /* Where new sessions start: set in place by placeMarks (no card re-render when it moves) */
+  .card.next { border-color: var(--green); border-width: 2px; }
+  .card .badge-next { display: none; }
+  .card.next .badge-next { display: inline-flex; }
+  .card { position: relative; }
+  /* The account the last request went out on: an arrow beside the card (moves with the traffic) */
+  .sent-arrow {
     position: absolute; left: -1.6rem; top: 1.25rem;
-    display: flex; width: 1.4rem; height: 1.4rem; color: var(--purple); cursor: help;
+    display: none; width: 1.4rem; height: 1.4rem; color: var(--primary); cursor: help;
   }
-  .login-arrow svg { width: 100%; height: 100%; }
+  .card.last-sent .sent-arrow { display: flex; }
+  @media (max-width: 560px) { .sent-arrow { left: -1.3rem; width: 1.15rem; height: 1.15rem; } }
+  .sent-arrow svg, .legend svg { width: 100%; height: 100%; }
+  /* Claude Code's own login (the Keychain account): a key after the name */
+  .login-key { display: inline-flex; flex: none; width: 1rem; height: 1rem; color: var(--muted); cursor: help; }
+  .login-key svg { width: 100%; height: 100%; }
+  .legend { display: flex; flex-wrap: wrap; gap: 0.375rem 1.25rem; margin: 0.875rem 0.25rem 0; font-size: 0.8125rem; color: var(--muted); }
+  .legend > span { display: inline-flex; align-items: center; gap: 0.375rem; cursor: help; }
+  .legend .lg-icon { display: inline-flex; width: 1rem; height: 1rem; }
+  .legend .lg-arrow { color: var(--primary); }
+  .legend .lg-next { width: 1.125rem; height: 0.75rem; border: 2px solid var(--green); border-radius: 4px; }
   .card.stale { opacity: 0.5; }
   .card.stale:hover { opacity: 0.7; }
   .stale-msg {
@@ -1681,7 +1710,7 @@ function renderHTML() {
     border-radius: 50%;
     flex-shrink: 0;
   }
-  .status-dot.active { background: var(--green); box-shadow: 0 0 0 3px hsl(142 71% 45% / 0.15); }
+  .status-dot.active, .card.next .status-dot { background: var(--green); box-shadow: 0 0 0 3px hsl(142 71% 45% / 0.15); }
   .status-dot.inactive { background: var(--border); }
   .card-name {
     font-size: 1.0625rem;
@@ -1718,7 +1747,7 @@ function renderHTML() {
   .badge-inflight .inflight-dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; flex: none; }
   .inflight-idle { color: var(--muted); background: var(--bg); border-color: var(--border); }
   .inflight-idle .inflight-dot { opacity: 0.35; }
-  .inflight-active { color: var(--purple); background: var(--purple-soft); border-color: var(--purple-border); }
+  .inflight-active { color: var(--primary); background: var(--blue-soft); border-color: var(--blue-border); }
   .inflight-active .inflight-dot { animation: inflightPulse 1.4s ease-in-out infinite; }
   .inflight-full { color: var(--yellow); background: var(--yellow-soft); border-color: var(--yellow-border); }
   @keyframes inflightPulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.3; } }
@@ -2668,6 +2697,11 @@ function renderHTML() {
     <div id="accounts" class="accounts">
       <div class="empty-state">Loading...</div>
     </div>
+    <div class="legend" id="accounts-legend">
+      <span title="The account the last request to Anthropic went out on. It moves with the traffic: often in Balance or Spread, rarely in Sticky."><span class="lg-icon lg-arrow"><svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M2 7.6h8.6V3.4L18.6 10l-8 6.6v-4.2H2z"/></svg></span>Last request went here</span>
+      <span title="Where vdm sends the next new session. Running sessions stay on their own account while their cache is warm."><span class="lg-next"></span>New sessions start here</span>
+      <span title="Claude Code is logged in with this account. Artifacts and claude.ai connectors always use it. Your prompts can still go to other accounts."><span class="lg-icon"><svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6.5" cy="13.5" r="3.5"/><path d="M9 11l8-8M14 6l2.5 2.5M11.5 8.5l2 2"/></svg></span>Claude Code login (artifacts, connectors)</span>
+    </div>
   </div>
 
   <div id="tab-activity" class="tab-content">
@@ -2812,7 +2846,25 @@ function renderHTML() {
             <option value="round-robin">Round-robin</option>
             <option value="spread">Spread</option>
             <option value="drain-first">Drain first</option>
-            <option value="balance">Balance</option>
+            <option value="soonest-reset">Soonest reset</option>
+          </select>
+        </div>
+        <div class="config-row" id="balance-ctrl" style="display:none">
+          <div class="config-info">
+            <div class="config-label">Balance</div>
+            <div class="config-desc" id="balance-hint">Spread sessions over several accounts, a few at a time on each.</div>
+          </div>
+          <input type="checkbox" class="sw" id="toggle-balance" aria-label="Balance" onchange="changeBalance(this.checked)">
+        </div>
+        <div class="config-row" id="balance-within-ctrl" style="display:none">
+          <div class="config-info">
+            <div class="config-label">Balance accounts that reset within</div>
+            <div class="config-desc">These accounts share the new sessions. When they are full, the account that resets next takes the rest.</div>
+          </div>
+          <select class="config-select" id="sel-balance-within" onchange="changeBalanceWithin(Number(this.value))">
+            <option value="24">1 day</option>
+            <option value="48">2 days</option>
+            <option value="72">3 days</option>
           </select>
         </div>
         <div class="config-row" id="interval-ctrl" style="display:none">
@@ -3310,23 +3362,25 @@ function quickHash(obj) {
 async function refresh() {
   try {
     const resp = await fetch('/api/profiles');
-    const { profiles, probeStats, usedUp, rotationStrategy, balanceCap, sessionAffinity, sessionHistory, hotTokensPer5m, queueStats } = await resp.json();
+    const { profiles, probeStats, usedUp, rotationStrategy, balance, balanceCap, sessionAffinity, sessionHistory, hotTokensPer5m, queueStats } = await resp.json();
     HIST.enabled = !!sessionHistory;
     if (hotTokensPer5m) HOT_TOKENS = hotTokensPer5m;
     _cachedProfiles = profiles;
     updateSessionsBadge(profiles);
-    const balanceMode = rotationStrategy === 'balance';
+    const balanceMode = balance === true || rotationStrategy === 'balance';
     const cap = balanceCap || 8;
     // Fold balance context into the hash so strategy/cap flips also force a re-render.
-    const ph = quickHash({ profiles, balanceMode, cap, hot: HOT_TOKENS, hist: HIST.enabled });
+    const ph = quickHash({ profiles: profiles.map(function(p) { return Object.assign({}, p, { isNext: 0, lastSentAt: 0 }); }), balanceMode, cap, hot: HOT_TOKENS, hist: HIST.enabled });
     if (ph !== _lastProfilesHash) {
       _lastProfilesHash = ph;
       renderAccounts(profiles, _firstRender, balanceMode, cap);
     }
+    placeMarks(profiles);
     document.getElementById('account-count').textContent = profiles.length;
     if (rotationStrategy) {
-      const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first', balance: 'Balance' };
+      const strategyNames = { sticky: 'Sticky', conserve: 'Conserve', 'round-robin': 'Round-robin', spread: 'Spread', 'drain-first': 'Drain first', 'soonest-reset': 'Soonest reset', balance: 'Balance' };
       document.getElementById('current-strategy').textContent = ' \\u00b7 ' + (strategyNames[rotationStrategy] || rotationStrategy) + ' strategy' +
+        (balanceMode && rotationStrategy !== 'balance' ? ', balanced' : '') +
         (sessionAffinity ? '' : ' \\u00b7 session affinity off');
     }
     if (probeStats) renderProbeStats(probeStats);
@@ -3374,6 +3428,26 @@ async function refresh() {
 // Per-card HTML from the last render, keyed by account name. Only cards whose HTML
 // changed are replaced, so a click on a card isn't lost to the 5s refresh.
 var _cardHtml = {};
+
+// Marks that follow the traffic: the arrow beside the account the last request went out
+// on, and the green card where the next new session starts. Set in place on every refresh
+// (no card re-render), so a moving mark never replaces a card under the mouse.
+function placeMarks(profiles) {
+  var last = null, next = null;
+  profiles.forEach(function(p) {
+    if (p.lastSentAt && (!last || p.lastSentAt > last.lastSentAt)) last = p;
+    if (p.isNext || (p.isNext === undefined && p.isActive)) next = p;
+  });
+  [].forEach.call(document.querySelectorAll('#accounts .card'), function(c) {
+    var sent = !!last && c.dataset.name === last.name;
+    c.classList.toggle('last-sent', sent);
+    c.classList.toggle('next', !!next && c.dataset.name === next.name);
+    if (sent) {
+      var a = c.querySelector('.sent-arrow');
+      if (a) a.title = 'Last request went here, at ' + new Date(last.lastSentAt).toLocaleTimeString('en-GB');
+    }
+  });
+}
 
 function renderAccounts(profiles, animate, balanceMode, balanceCap) {
   var el = document.getElementById('accounts');
@@ -3428,8 +3502,11 @@ function rateGroup(label, util, reset, opts) {
   '</div>';
 }
 
+var SENT_ARROW_SVG = '<svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M2 7.6h8.6V3.4L18.6 10l-8 6.6v-4.2H2z"/></svg>';
+var LOGIN_KEY_SVG = '<svg viewBox="0 0 20 20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="6.5" cy="13.5" r="3.5"/><path d="M9 11l8-8M14 6l2.5 2.5M11.5 8.5l2 2"/></svg>';
+
 function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
-  var active = p.isActive;
+  var active = p.isActive; // the route account (buttons); the green mark follows p.isNext, see placeMarks
   var displayName = p.label || p.name;
   var eName = p.name.replace(/'/g, "\\\\'");
 
@@ -3492,11 +3569,11 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
       : '<div class="stale-msg">Login expired. Auto-refresh will retry shortly.</div>';
   }
   var cardClass = 'card' + (active ? ' active' : '') + (p.isLogin ? ' login' : '') + (isStale ? ' stale' : '');
-  var loginTip = 'Claude Code is logged in to this one right now!&#10;Artifacts and claude.ai connectors use this login. Your prompts can still run on another account.';
-  var loginArrow = p.isLogin
-    ? '<span class="login-arrow" title="' + loginTip + '" aria-label="Claude Code is logged in to this account">' +
-        '<svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M2 7.6h8.6V3.4L18.6 10l-8 6.6v-4.2H2z"/></svg></span>'
+  var loginKey = p.isLogin
+    ? '<span class="login-key" title="Claude Code login.&#10;Claude Code is logged in with this account: artifacts and claude.ai connectors use it. Your prompts can still go to other accounts." aria-label="Claude Code login">' + LOGIN_KEY_SVG + '</span>'
     : '';
+  // Shown by placeMarks on the account the last request went out on
+  var sentArrow = '<span class="sent-arrow" title="Last request went here" aria-label="Last request went here">' + SENT_ARROW_SVG + '</span>';
   var sessLink = accountSessionsLink(p);
   var buttonsHtml = '';
   if (!active) {
@@ -3509,18 +3586,19 @@ function accountCardHtml(p, i, animate, balanceMode, balanceCap) {
   var arts = p.artifactCount
     ? '<button class="chip" onclick="openArtifactsFor(\\'' + eName + '\\')" title="Artifacts this account owns on claude.ai">' + p.artifactCount + ' artifact' + (p.artifactCount === 1 ? '' : 's') + '</button>' : '';
   return '<div class="' + cardClass + '"' + animStyle + ' data-name="' + escHtml(p.name) + '">' +
-    loginArrow +
+    sentArrow +
     '<div class="card-top">' +
       '<div class="card-identity">' +
-        '<div class="status-dot ' + (active ? 'active' : 'inactive') + '"></div>' +
+        '<div class="status-dot inactive"></div>' +
         '<span class="card-name" title="' + escHtml(displayName) + '">' + escHtml(displayName) + '</span>' +
+        loginKey +
         (active ? renderVelocityInline(p) : '') +
       '</div>' +
       '<div class="card-badges">' +
         arts +
         inflightBadge(p, balanceMode, balanceCap) +
         planBadge(p.plan) +
-        (active ? '<span class="badge badge-active" title="' + (p.isLogin ? 'Claude Code is logged in with this account; new sessions start here' : 'New sessions start here. Claude Code stays logged in with another account, so its artifacts keep working') + '">Active</span>' : '') +
+        '<span class="badge badge-active badge-next" title="New sessions start here. Running sessions stay on their own account while their cache is warm.">Next</span>' +
       '</div>' +
     '</div>' +
     blockedHtml +
@@ -3643,7 +3721,13 @@ const STRATEGY_HINTS = {
   'round-robin': 'Rotates to the least-used account on a timer. Good balance of safety and efficiency.',
   spread: 'Picks the least-used account on every request. Switches often  - may trigger Anthropic notices.',
   'drain-first': 'Uses the most-used account first. Good for short sessions.',
-  balance: 'Spreads sessions across accounts by load, capped per account. Skips accounts whose 5h (not on Ultra), weekly or Fable window is used up. Best for running many sessions at once.',
+  'soonest-reset': 'Uses the account whose weekly limit resets first, so what is left on it is not lost at the reset.',
+};
+// What Balance does for each strategy that has it
+const BALANCE_HINTS = {
+  spread: 'Spread sessions over all accounts by load, a few at a time on each. Nearly full accounts go last. Best for many sessions at once.',
+  conserve: 'Spread sessions over the accounts whose limits have started, a few at a time on each. Untouched accounts stay dormant.',
+  'soonest-reset': 'Spread sessions over the accounts that reset soon, a few at a time on each.',
 };
 
 async function loadSettingsUI() {
@@ -3655,6 +3739,8 @@ async function loadSettingsUI() {
     document.getElementById('sel-strategy').value = s.rotationStrategy || 'conserve';
     document.getElementById('sel-interval').value = s.rotationIntervalMin || 60;
     document.getElementById('sel-max-concurrent').value = s.maxConcurrentPerAccount || 8;
+    document.getElementById('sel-balance-within').value = s.balanceWithinHours || 48;
+    _balanceOn = s.balanceLoad === true;
     updateStrategyUI(s.rotationStrategy || 'conserve');
     // [BETA] Serialization
     document.getElementById('toggle-serialize').checked = !!s.serializeRequests;
@@ -3696,16 +3782,26 @@ const STRATEGY_DETAILS = {
   'round-robin': { name: 'Round-robin', desc: 'Rotate to the least-used account on a fixed timer. Balances load evenly while limiting switch frequency.' },
   spread:        { name: 'Spread',      desc: 'Always pick the least-used account on every request. Switches often  - best for short, bursty sessions.' },
   'drain-first': { name: 'Drain first', desc: 'Use the most-used account first, draining it before moving on. Good for finishing off nearly-exhausted windows.' },
-  balance:       { name: 'Balance',     desc: 'Place new sessions on the least-loaded account (in-flight requests plus warm sessions), capped per account. Accounts whose 5h (not on Ultra), weekly or Fable window is used up are skipped, and nearly full ones go last. With session affinity a running session stays on its account (it waits for a slot there instead of moving). Best when running many sessions/subagents at once.' },
+  'soonest-reset': { name: 'Soonest reset', desc: 'Use the account whose weekly limit resets first, then the next one. What is left on an account is lost at its reset, so this uses it first. Accounts whose weekly window has not started go last.' },
+  balance:       { name: '+ Balance',   desc: 'A switch for Spread, Conserve and Soonest reset. New sessions go to the least-loaded account (in-flight requests plus warm sessions), at most a set number in flight on each. Spread uses all accounts, Conserve the ones whose limits have started, Soonest reset the ones that reset within 1-3 days (then the next one). With session affinity a running session stays on its account (it waits for a slot there instead of moving).' },
 };
 
+var BALANCE_FITS = { spread: 1, conserve: 1, 'soonest-reset': 1 };
+var _balanceOn = false;
+
 function updateStrategyUI(strategy) {
+  var fits = !!BALANCE_FITS[strategy];
+  var balanced = fits && _balanceOn;
   document.getElementById('interval-ctrl').style.display = strategy === 'round-robin' ? '' : 'none';
-  document.getElementById('max-concurrent-ctrl').style.display = strategy === 'balance' ? '' : 'none';
+  document.getElementById('balance-ctrl').style.display = fits ? '' : 'none';
+  document.getElementById('toggle-balance').checked = _balanceOn;
+  document.getElementById('balance-hint').textContent = BALANCE_HINTS[strategy] || '';
+  document.getElementById('balance-within-ctrl').style.display = balanced && strategy === 'soonest-reset' ? '' : 'none';
+  document.getElementById('max-concurrent-ctrl').style.display = balanced ? '' : 'none';
   document.getElementById('strategy-hint').textContent = STRATEGY_HINTS[strategy] || '';
   const list = document.getElementById('strategy-list');
   list.innerHTML = Object.entries(STRATEGY_DETAILS).map(([key, s]) =>
-    '<div class="strategy-item' + (key === strategy ? ' active' : '') + '">' +
+    '<div class="strategy-item' + (key === strategy || (key === 'balance' && balanced) ? ' active' : '') + '">' +
       '<span class="strategy-item-name">' + s.name + '</span>' +
       '<span class="strategy-item-desc">' + s.desc + '</span>' +
     '</div>'
@@ -3748,20 +3844,47 @@ async function changeSerializeDelay(value) {
   } catch { showToast('Failed to update'); }
 }
 
+// Show what the server saved (it may have changed more than was asked, e.g. serialize off)
+function applySavedRotation(saved) {
+  _balanceOn = saved.balanceLoad === true;
+  document.getElementById('sel-strategy').value = saved.rotationStrategy;
+  updateStrategyUI(saved.rotationStrategy);
+  document.getElementById('toggle-serialize').checked = !!saved.serializeRequests;
+  document.getElementById('serialize-delay-ctrl').style.display = saved.serializeRequests ? '' : 'none';
+  setTimeout(refresh, 300);
+}
+
+async function saveRotation(patch) {
+  const resp = await fetch('/api/settings', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(patch)
+  });
+  if (!resp.ok) throw new Error('HTTP ' + resp.status);
+  const saved = await resp.json();
+  applySavedRotation(saved);
+  return saved;
+}
+
 async function changeStrategy(value) {
   try {
-    await fetch('/api/settings', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ rotationStrategy: value })
-    });
-    updateStrategyUI(value);
-    // Balance mode supersedes serialize — reflect the server-side auto-disable in the UI.
-    if (value === 'balance') {
-      document.getElementById('toggle-serialize').checked = false;
-      document.getElementById('serialize-delay-ctrl').style.display = 'none';
-    }
-    showToast('Rotation: ' + (document.getElementById('sel-strategy').selectedOptions[0]?.text || value));
+    const saved = await saveRotation({ rotationStrategy: value });
+    showToast('Rotation: ' + (document.getElementById('sel-strategy').selectedOptions[0]?.text || value) +
+      (saved.balanceLoad && BALANCE_FITS[saved.rotationStrategy] ? ', balanced' : ''));
+  } catch { showToast('Failed to update'); }
+}
+
+async function changeBalance(on) {
+  try {
+    await saveRotation({ balanceLoad: on });
+    showToast(on ? 'Balance on: sessions spread over several accounts' : 'Balance off');
+  } catch { showToast('Failed to update'); }
+}
+
+async function changeBalanceWithin(hours) {
+  try {
+    await saveRotation({ balanceWithinHours: hours });
+    showToast('Balance accounts that reset within ' + (hours / 24) + (hours === 24 ? ' day' : ' days'));
   } catch { showToast('Failed to update'); }
 }
 
@@ -5567,6 +5690,12 @@ function pickBestAccount(excludeTokens = new Set(), model = null) {
   return _pickBestAccount(loadAllAccountTokens(), accountState, excludeTokens, model);
 }
 
+/** Where a request goes after a limit: soonest-reset keeps its order, the others take the least-used account. */
+function pickRetryAccount(excludeTokens = new Set(), model = null) {
+  if (settings.rotationStrategy === 'soonest-reset') return _pickSoonestReset(loadAllAccountTokens(), accountState, excludeTokens, model);
+  return pickBestAccount(excludeTokens, model);
+}
+
 // Fallback: any untried account that no known limit blocks (e.g. one whose token only needs
 // a refresh). An account used up until a known reset is skipped: trying it again can only
 // get the same 429.
@@ -5620,7 +5749,16 @@ function buildForwardHeaders(originalHeaders, token) {
 
 // ── Forward request with timeout ──
 
-function forwardToAnthropic(method, path, headers, body, timeout = PROXY_TIMEOUT) {
+// The account each request last went out on (name → ms). Keep-warm pings don't count.
+const _lastSentAt = new Map();
+function noteSent(headers) {
+  const token = String(headers?.authorization || '').replace(/^Bearer\s+/i, '');
+  const acct = token && loadAllAccountTokens().find(a => a.token === token);
+  if (acct) _lastSentAt.set(acct.name, Date.now());
+}
+
+function forwardToAnthropic(method, path, headers, body, timeout = PROXY_TIMEOUT, { quiet = false } = {}) {
+  if (!quiet) noteSent(headers);
   return new Promise((resolve, reject) => {
     const req = apiRequest({ path, method, headers, timeout }, resolve);
     req.on('timeout', () => { req.destroy(new Error('upstream timeout')); });
@@ -5671,7 +5809,7 @@ async function _passthroughSend(clientReq, clientRes, body, fwd, { label, timeou
     const usedAcct = loadAllAccountTokens().find(a => a.token === used);
     const usedName = usedAcct ? (usedAcct.label || usedAcct.name) : 'the session login';
     if (usedAcct) markAccountRejected(used, usedName, res.headers);
-    const next = pickBestAccount(new Set([used]), extractModel(body));
+    const next = pickRetryAccount(new Set([used]), extractModel(body));
     if (!next) return { res, resBuf };
     log('fallback', `${label}: ${usedName} is used up — sending on ${next.label || next.name}`);
     try {
@@ -6249,8 +6387,14 @@ const BALANCE_MIN_COOLDOWN_SEC = 3;              // floor for transient-429 cool
 const balanceLimiter = createBalanceLimiter();   // in-flight tracker + wait/overflow queue
 const _balanceCooldown = new Map();              // accountName -> cooldownUntil (ms); transient-429 backoff
 
+/** Balance: requests spread over several accounts, capped per account (only for strategies that fit). */
 function isBalanceMode() {
-  return settings.rotationStrategy === 'balance';
+  return settings.balanceLoad === true && BALANCE_STRATEGIES.has(settings.rotationStrategy);
+}
+
+/** The balance picker's options for the current strategy. */
+function balanceOpts(extra) {
+  return { strategy: settings.rotationStrategy, withinSec: (settings.balanceWithinHours || 48) * 3600, ...extra };
 }
 
 // Briefly sideline an account after a transient 429 WITHOUT polluting the global
@@ -6310,10 +6454,18 @@ async function acquireBalanceSlot(allAccounts, excludeTokens = new Set(), { mode
     // burst 429 on its own request is waited out on the same account instead.
     const pinnedUsable = () => !excludeTokens.has(only.token) && isAccountAvailable(only.token, only.expiresAt, model);
     if (!pinnedUsable()) return null;
-    const result = await balanceLimiter.acquire(
-      () => (pinnedUsable() ? { key: only.name, inflight: balanceLimiter.get(only.name), account: only } : null),
-      { cap, waitMs },
-    );
+    // Its account takes every request anyway (the only account, or conserve's only started
+    // one): waiting for a slot there could not spread the load, so don't.
+    const solo = () => {
+      if (allAccounts.length <= 1) return true;
+      const p = _pickLeastLoaded(allAccounts, balanceLimiter.inflight, accountState, cap, excludeTokens, Date.now(), balanceOpts({ model }));
+      return !!(p && p.solo && p.account.name === only.name);
+    };
+    const result = await balanceLimiter.acquire(() => {
+      if (!pinnedUsable()) return null;
+      const n = balanceLimiter.get(only.name);
+      return { key: only.name, inflight: n, solo: n >= cap && solo(), account: only };
+    }, { cap, waitMs });
     if (!result) return null;
     if (result.overflow) log('balance', `${only.label || only.name} over cap (${cap})  - kept for session affinity`);
     return { account: result.account, overflow: result.overflow };
@@ -6327,9 +6479,15 @@ async function acquireBalanceSlot(allAccounts, excludeTokens = new Set(), { mode
     return { account: only1, overflow: false };
   }
   const extraLoad = settings.sessionAffinity !== false ? sessionStore.warmLoad() : null;
+  // Accounts left out only for a short cooldown (not tried for this request)
+  const cooledOnly = () => {
+    const c = _balanceCooledTokens(allAccounts);
+    return c ? new Set([...c].filter(t => !excludeTokens.has(t))) : null;
+  };
   const result = await balanceLimiter.acquire(() => {
-    const pick = _pickLeastLoaded(allAccounts, balanceLimiter.inflight, accountState, cap, withCooldown(), Date.now(), { model, extraLoad, prefer });
-    return pick ? { key: pick.account.name, inflight: pick.inflight, account: pick.account } : null;
+    const pick = _pickLeastLoaded(allAccounts, balanceLimiter.inflight, accountState, cap, withCooldown(), Date.now(),
+      balanceOpts({ model, extraLoad, prefer, cooled: cooledOnly() }));
+    return pick ? { key: pick.account.name, inflight: pick.inflight, solo: pick.solo, wait: pick.wait, account: pick.account } : null;
   }, { cap, waitMs });
   if (!result) return null;                        // no available account → caller runs exhausted path
   if (result.overflow) {
@@ -7407,6 +7565,27 @@ function laneLabel(sid) {
   return sessionLabel(sessionStore.get(sid)?.meta, sid);
 }
 
+/**
+ * Where a new session would start right now: the balance pick, else the strategy's pick,
+ * else the route. With the proxy off, Claude Code sends its own login.
+ */
+function nextAccountName(allAccounts = loadAllAccountTokens()) {
+  if (!settings.proxyEnabled) return loginAccount(allAccounts)?.name || null;
+  if (isBalanceMode()) {
+    const extraLoad = settings.sessionAffinity !== false ? sessionStore.warmLoad() : null;
+    const pick = _pickLeastLoaded(allAccounts, balanceLimiter.inflight, accountState, settings.maxConcurrentPerAccount || 8,
+      _balanceCooledTokens(allAccounts) || new Set(), Date.now(), balanceOpts({ extraLoad }));
+    return pick?.account.name || null;
+  }
+  const route = routeAccount(allAccounts);
+  if (!settings.autoSwitch) return route?.name || null;
+  const { account } = _pickByStrategy({
+    strategy: settings.rotationStrategy || 'conserve', intervalMin: settings.rotationIntervalMin || 60,
+    currentToken: route?.token || getActiveToken(), lastRotationTime, accounts: allAccounts, stateManager: accountState,
+  });
+  return (account || route)?.name || null;
+}
+
 /** Session affinity (and so keep-warm) only works while the proxy chooses accounts. */
 function affinityActive() {
   return settings.sessionAffinity !== false && (isBalanceMode() || settings.autoSwitch);
@@ -7417,7 +7596,7 @@ function balanceAlternative(allAccounts, pinned, model) {
   const load = { ...sessionStore.warmLoad() };
   load[pinned.name] = Math.max(0, (load[pinned.name] || 0) - 1); // not counting this lane itself
   const pick = _pickLeastLoaded(allAccounts, balanceLimiter.inflight, accountState, settings.maxConcurrentPerAccount || 8,
-    _balanceCooledTokens(allAccounts) || new Set(), Date.now(), { model, extraLoad: load });
+    _balanceCooledTokens(allAccounts) || new Set(), Date.now(), balanceOpts({ model, extraLoad: load }));
   return pick && pick.account.name !== pinned.name ? pick.account.name : null;
 }
 
@@ -7566,7 +7745,7 @@ async function sendKeepWarmPing(l, snap, acct) {
     const headers = buildForwardHeaders(snap.headers, acct.token);
     headers['content-length'] = String(buf.length);
     headers['accept'] = 'application/json';
-    const res = await forwardToAnthropic('POST', snap.path, headers, buf, 60_000);
+    const res = await forwardToAnthropic('POST', snap.path, headers, buf, 60_000, { quiet: true });
     const text = (await readResponse(res, 60_000)).toString('utf8');
     return { status: res.statusCode, headers: res.headers, text };
   };
@@ -7866,6 +8045,7 @@ async function handleProxyRequest(clientReq, clientRes) {
   let _bulkRefreshAttempted = false;   // per-request: tried force-refreshing all tokens?
   let _minimalHeaderRetried = false;   // per-request: tried minimal-header last resort?
   let _sameAccountRetried = false;     // per-request: waited out a burst 429 on the pinned account?
+  let _burstMoved = false;             // per-request: left its account on a burst 429 (lane moves only once an answer comes)
 
   // ── Balance-mode concurrency slot ──
   // heldKey = the account name whose in-flight slot we currently hold (null = none).
@@ -7921,13 +8101,14 @@ async function handleProxyRequest(clientReq, clientRes) {
   };
   let usedUpRecheck = false; // this request tries used-up accounts again (the 15-minute check)
   // Retry target outside balance mode: a session follows the route account when it can
-  // take the request, else the least-used available account.
+  // take the request, else the least-used available account (soonest-reset: the one that
+  // resets next).
   const pickNext = () => {
     if (affinityOn) {
       const active = routeAccount();
       if (active && !triedTokens.has(active.token) && isAccountAvailable(active.token, active.expiresAt, model)) return active;
     }
-    return pickBestAccount(triedTokens, model) || pickAnyUntried(triedTokens, model, { recheck: usedUpRecheck });
+    return pickRetryAccount(triedTokens, model) || pickAnyUntried(triedTokens, model, { recheck: usedUpRecheck });
   };
   // The route account is where new sessions start. Only move the route when the failing
   // account IS the route account  - a pinned session failing elsewhere must not drag
@@ -8224,7 +8405,12 @@ async function handleProxyRequest(clientReq, clientRes) {
         const next = await balanceSwitch(triedTokens);
         if (next) {
           token = next.token;
-          pinLane(next, transient ? '429-burst' : '429-limit');
+          // A burst 429 says nothing lasting about the account. Move the lane only when the
+          // new account answers: if every account refuses, the session stays where its
+          // cache is warm (one request once hopped over 6 accounts in a second, each hop
+          // a lost cache).
+          if (transient) _burstMoved = true;
+          else pinLane(next, '429-limit');
           continue;
         }
         if (transient) {
@@ -8638,6 +8824,7 @@ async function handleProxyRequest(clientReq, clientRes) {
     // ── Any other response: success or client error → pipe through ──
     _consecutive400s = 0; // reset on any non-400 response
     _consecutiveExhausted = 0;
+    if (_burstMoved && status < 400) pinLane(allAccounts.find(a => a.token === token) || acct, '429-burst');
     updateAccountState(token, acctName, proxyRes.headers, getFingerprintFromToken(token));
 
     // Check if utilization is critically high and log a warning (only at 90%, 95%, 100%)

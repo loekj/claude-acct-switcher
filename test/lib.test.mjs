@@ -385,6 +385,22 @@ describe('createBalanceLimiter', () => {
     assert.equal(lim.waitingCount(), 0);
   });
 
+  it('a solo candidate takes the request over the cap at once (no wait)', async () => {
+    const lim = createBalanceLimiter();
+    lim.inflight.acquire('a'); lim.inflight.acquire('a'); // a=2, cap=2
+    const r = await lim.acquire(() => ({ key: 'a', inflight: lim.get('a'), solo: true }), { cap: 2, waitMs: 10000 });
+    assert.equal(r.overflow, false);
+    assert.equal(lim.waitingCount(), 0);
+    assert.equal(lim.get('a'), 3);
+  });
+
+  it('a candidate marked wait is waited for, then overflowed onto', async () => {
+    const lim = createBalanceLimiter();
+    const r = await lim.acquire(() => ({ key: 'a', inflight: 0, wait: true }), { cap: 2, waitMs: 40 });
+    assert.equal(r.overflow, true);
+    assert.equal(lim.get('a'), 1);
+  });
+
   it('release on an idle limiter is a safe no-op', () => {
     const lim = createBalanceLimiter();
     lim.release('nobody'); // should not throw
