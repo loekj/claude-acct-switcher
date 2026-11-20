@@ -241,6 +241,34 @@ get_config_string() {
   read_config | python3 -c "import sys,json; print(json.load(sys.stdin).get('$key', ''))" 2>/dev/null
 }
 
+# Balance is on and the strategy has it (spread, conserve, soonest-reset; "balance" = old spread + balance)
+is_balanced() {
+  local strategy="$1" bal="$2"
+  [[ "$strategy" == "balance" ]] && return 0
+  [[ "$bal" == "True" ]] || return 1
+  case "$strategy" in spread|conserve|soonest-reset) return 0 ;; esac
+  return 1
+}
+
+# The rotation for people: "soonest-reset + balance (2 days)"
+rotation_label() {
+  local strategy=$(get_config_string "rotationStrategy") bal=$(get_config_value "balanceLoad")
+  strategy="${strategy:-conserve}"
+  if is_balanced "$strategy" "$bal"; then
+    [[ "$strategy" == "balance" ]] && strategy="spread"
+    if [[ "$strategy" == "soonest-reset" ]]; then
+      local within=$(get_config_string "balanceWithinHours") days
+      case "$within" in 24|48|72) ;; *) within=48 ;; esac   # the dashboard uses 48 for anything else
+      days=$(( within / 24 ))
+      echo "$strategy + balance (accounts that reset within $days day$([[ $days == 1 ]] || echo s))"
+    else
+      echo "$strategy + balance"
+    fi
+  else
+    echo "$strategy"
+  fi
+}
+
 set_config_string() {
   local key="$1"
   local value="$2"
@@ -626,7 +654,7 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
   else
     echo -e "  Notifications: ${DIM}OFF${NC}"
   fi
-  echo -e "  Rotation:      ${CYAN}${strategy:-sticky}${NC}"
+  echo -e "  Rotation:      ${CYAN}$(rotation_label)${NC}"
   if [[ "$affinity" == "False" ]]; then
     echo -e "  Affinity:      ${DIM}OFF${NC}"
   else
@@ -645,7 +673,7 @@ print(f'{sub}|{tier}|{exp_str}|{scopes}')
   if [[ "${strategy:-sticky}" == "round-robin" ]]; then
     echo -e "  Interval:      ${interval:-60} min"
   fi
-  if [[ "${strategy:-sticky}" == "balance" ]]; then
+  if is_balanced "$strategy" "$(get_config_value "balanceLoad")"; then
     local cap=$(get_config_string "maxConcurrentPerAccount")
     echo -e "  Max/account:   ${cap:-8} in-flight"
     # Live in-flight spread from a running dashboard, if reachable
@@ -704,7 +732,7 @@ cmd_config() {
     else
       echo -e "  notifications:      ${DIM}off${NC}"
     fi
-    echo -e "  rotationStrategy:   ${CYAN}${strategy:-sticky}${NC}"
+    echo -e "  rotationStrategy:   ${CYAN}$(rotation_label)${NC}"
     echo -e "  rotationIntervalMin: ${interval:-60}"
     local serialize=$(get_config_value "serializeRequests")
     if [[ "$serialize" == "True" ]]; then
@@ -715,10 +743,10 @@ cmd_config() {
     local delay=$(get_config_string "serializeDelayMs")
     echo -e "  serializeDelayMs:   ${delay:-200}  ${DIM}[BETA]${NC}"
     local maxconc=$(get_config_string "maxConcurrentPerAccount")
-    if [[ "$strategy" == "balance" ]]; then
+    if is_balanced "$strategy" "$(get_config_value "balanceLoad")"; then
       echo -e "  maxConcurrentPerAccount: ${GREEN}${maxconc:-8}${NC}  ${DIM}[BETA] per-account in-flight cap${NC}"
     else
-      echo -e "  maxConcurrentPerAccount: ${maxconc:-8}  ${DIM}[BETA] (only used by rotation=balance)${NC}"
+      echo -e "  maxConcurrentPerAccount: ${maxconc:-8}  ${DIM}[BETA] (only used with balance on)${NC}"
     fi
     local affinity=$(get_config_value "sessionAffinity")
     if [[ "$affinity" == "False" ]]; then
@@ -751,9 +779,11 @@ cmd_config() {
     echo -e "  ${DIM}  vdm config proxy on${NC}"
     echo -e "  ${DIM}  vdm config autoswitch off${NC}"
     echo -e "  ${DIM}  vdm config notifications off${NC}"
-    echo -e "  ${DIM}  vdm config rotation sticky|conserve|round-robin|spread|drain-first|balance${NC}"
+    echo -e "  ${DIM}  vdm config rotation sticky|conserve|round-robin|spread|drain-first|soonest-reset${NC}"
+    echo -e "  ${DIM}  vdm config balance on|off${NC}  ${DIM}spread sessions over several accounts (spread, conserve, soonest-reset)${NC}"
+    echo -e "  ${DIM}  vdm config balance-within 1d|2d|3d${NC}  ${DIM}soonest-reset + balance: accounts that reset this soon share the load${NC}"
     echo -e "  ${DIM}  vdm config interval 15|30|60|120${NC}"
-    echo -e "  ${DIM}  vdm config max-concurrent 1-50${NC}  ${DIM}[BETA] per-account cap for rotation=balance${NC}"
+    echo -e "  ${DIM}  vdm config max-concurrent 1-50${NC}  ${DIM}[BETA] per-account cap when balance is on${NC}"
     echo -e "  ${DIM}  vdm config serialize on|off${NC}  ${DIM}[BETA]${NC}"
     echo -e "  ${DIM}  vdm config serialize-delay 0|100|200|500|1000${NC}  ${DIM}[BETA]${NC}"
     echo -e "  ${DIM}  vdm config affinity on|off${NC}  ${DIM}keep each session on one account (saves prompt cache)${NC}"
@@ -772,6 +802,8 @@ cmd_config() {
     autoswitch|autoSwitch|auto-switch)    key="autoSwitch" ;;
     notifications|notifs)                 key="notifications" ;;
     rotation|rotationStrategy|strategy)   key="rotationStrategy"; is_bool=false ;;
+    balance|balanceLoad|balance-load)     key="balanceLoad" ;;
+    balance-within|balanceWithinHours)    key="balanceWithinHours"; is_bool=false ;;
     interval|rotationIntervalMin)         key="rotationIntervalMin"; is_bool=false ;;
     serialize|serializeRequests|serialize-requests) key="serializeRequests" ;;
     serialize-delay|serializeDelayMs|serialize-delay-ms) key="serializeDelayMs"; is_bool=false ;;
@@ -786,7 +818,7 @@ cmd_config() {
     terminal|terminalApp|terminal-app) key="terminalApp"; is_bool=false ;;
     *)
       echo -e "${RED}Unknown setting: $key${NC}"
-      echo "  Available: proxy, autoswitch, notifications, rotation, interval, max-concurrent, serialize, serialize-delay, affinity, history, keep-warm, claude-cmd, history-keep, terminal"
+      echo "  Available: proxy, autoswitch, notifications, rotation, balance, balance-within, interval, max-concurrent, serialize, serialize-delay, affinity, history, keep-warm, claude-cmd, history-keep, terminal"
       return 1
       ;;
   esac
@@ -812,6 +844,11 @@ cmd_config() {
         return 1
         ;;
     esac
+    if [[ "$key" == "balanceLoad" && "$(get_config_string "rotationStrategy")" == "balance" ]]; then
+      # Old name (spread with balance on): write it out first, or the dashboard turns balance back on
+      set_config_string "rotationStrategy" "spread"
+      apply_setting_live "rotationStrategy"
+    fi
     set_config_value "$key" "$value"
     if [[ "$value" == "True" ]]; then
       echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${GREEN}on${NC}"
@@ -820,19 +857,34 @@ cmd_config() {
     fi
   elif [[ "$key" == "rotationStrategy" ]]; then
     case "$value" in
-      sticky|conserve|round-robin|spread|drain-first|balance) ;;
+      sticky|conserve|round-robin|spread|drain-first|soonest-reset|balance) ;;
       *)
         echo -e "${RED}Invalid strategy: $value${NC}"
-        echo "  Options: sticky, conserve, round-robin, spread, drain-first, balance"
+        echo "  Options: sticky, conserve, round-robin, spread, drain-first, soonest-reset"
         return 1
         ;;
     esac
-    set_config_string "$key" "$value"
-    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}$value${NC}"
     if [[ "$value" == "balance" ]]; then
+      # Old name: spread with balance on
+      value="spread"
+      set_config_value "balanceLoad" "True"
+      apply_setting_live "balanceLoad"
+    fi
+    set_config_string "$key" "$value"
+    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}$(rotation_label)${NC}"
+    if is_balanced "$value" "$(get_config_value "balanceLoad")"; then
       local cap=$(get_config_string "maxConcurrentPerAccount")
       echo -e "  ${DIM}Spreading load across accounts, max ${cap:-8} in-flight each. Tune: vdm config max-concurrent N${NC}"
     fi
+  elif [[ "$key" == "balanceWithinHours" ]]; then
+    case "$value" in
+      1d|24) value=24 ;;
+      2d|48) value=48 ;;
+      3d|72) value=72 ;;
+      *) echo -e "${RED}Invalid value: $value${NC}  (use 1d, 2d or 3d)"; return 1 ;;
+    esac
+    set_config_number "$key" "$value"
+    echo -e "${GREEN}✓${NC} ${BOLD}$key${NC} = ${CYAN}${value} h${NC}  ${DIM}(soonest-reset + balance)${NC}"
   elif [[ "$key" == "rotationIntervalMin" ]]; then
     case "$value" in
       15|30|60|120) ;;

@@ -207,7 +207,7 @@ Saved sessions live in `~/.claude/account-switcher/history/` (only you can read 
 
 #### Artifacts
 
-Claude Code publishes and edits artifacts with its own login (the account in the Keychain), not through the proxy. So vdm keeps that login in place: when an account hits a limit, only the requests move to another account, and your artifacts stay reachable. The login moves only when its token dies or you switch by hand. The card of that account is tinted purple, with an arrow beside it (hover it: "Claude Code is logged in to this one right now!"). The Artifacts tab asks every account which artifacts it owns (every 15 minutes, or on demand). Paste an artifact link to find its owner. Artifact links seen in a session's messages are linked to that session.
+Claude Code publishes and edits artifacts with its own login (the account in the Keychain), not through the proxy. So vdm keeps that login in place: when an account hits a limit, only the requests move to another account, and your artifacts stay reachable. The login moves only when its token dies or you switch by hand. That account has a key after its name. A legend under the cards explains the marks: the blue arrow is the account the last request went out on (it moves with the traffic), the green card is where the next new session starts, and the key is Claude Code's login. The Artifacts tab asks every account which artifacts it owns (every 15 minutes, or on demand). Paste an artifact link to find its owner. Artifact links seen in a session's messages are linked to that session.
 
 #### Usage
 
@@ -221,7 +221,10 @@ Every request through the proxy is counted (input, output, cache reads, cache wr
 ```bash
 vdm config proxy on|off           # Token-swapping proxy
 vdm config autoswitch on|off      # Auto-switch on 429/401
-vdm config rotation <strategy>    # sticky|conserve|round-robin|spread|drain-first
+vdm config rotation <strategy>    # sticky|conserve|round-robin|spread|drain-first|soonest-reset
+vdm config balance on|off         # Spread sessions over several accounts (spread, conserve, soonest-reset)
+vdm config balance-within 1d|2d|3d  # Soonest reset + balance: accounts that reset this soon share the load
+vdm config max-concurrent <n>     # Balance: requests in flight per account before the next one takes over
 vdm config interval <minutes>     # Round-robin timer
 vdm config serialize on|off       # Serialize proxy requests
 vdm config serialize-delay <ms>   # Serialization delay
@@ -237,12 +240,22 @@ vdm config history-keep <days>    # Delete saved sessions older than this (0 = f
 
 | Strategy | Behavior |
 |----------|----------|
-| **Sticky** (default) | Stay on current account, only switch on rate limit |
-| **Conserve** | Drain active accounts first, keep unused ones dormant |
+| **Sticky** | Stay on current account, only switch on rate limit |
+| **Conserve** (default) | Drain active accounts first, keep unused ones dormant |
 | **Round-robin** | Rotate every N minutes |
 | **Spread** | Always pick lowest utilization |
 | **Drain first** | Use the most-used account first |
-| **Balance** | Put new sessions on the least-loaded account, capped per account |
+| **Soonest reset** | Use the account whose weekly limit resets first. What is left on an account is lost at its reset, so this uses it first |
+
+**Balance** is a switch for Spread, Conserve and Soonest reset. It puts new sessions on the least-loaded account (requests in flight plus warm sessions), with at most `max-concurrent` in flight on each:
+
+| With Balance | Shares the load over |
+|----------|----------|
+| **Spread** | All accounts. Nearly full ones go last |
+| **Conserve** | The accounts whose limits have started. Untouched ones stay dormant |
+| **Soonest reset** | The accounts that reset within 1, 2 or 3 days (`balance-within`). When they are full, the account that resets next takes the rest |
+
+The old `balance` strategy is Spread with Balance on; an old config is changed to that by itself.
 
 All strategies skip accounts whose 5h (not on Ultra) or weekly window is used up. Per-model weekly limits (Fable, and weekly Opus or Sonnet limits) only steer that model's requests away; other models keep using the account. When every account is used up for a request's model, vdm does not try them again: it answers at once with the first reset time, so Claude Code shows it and stops instead of retrying for minutes. If only Fable is used up everywhere, other models keep working. The dashboard then shows a banner with **Try again**, for a limit that came back early (for example after buying extra usage): your next prompt tries each account once. With session affinity on, the strategy only places new and idle sessions.
 

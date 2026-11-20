@@ -440,8 +440,10 @@ export function createInflightTracker() {
  *   - pick() returns the currently-best candidate as `{ key, inflight, ...rest }`
  *     or null. It is re-invoked on every loop turn (in-flight counts change while
  *     waiting), so it must read live counts.
- *   - If the best candidate is under `cap`, acquires its slot and returns
- *     `{ ...candidate, overflow: false }`.
+ *   - If the best candidate is under `cap` (or `solo`: the only account the strategy
+ *     allows, so waiting could not spread the load), acquires its slot and returns
+ *     `{ ...candidate, overflow: false }`. A candidate with `wait` (cooling down) is
+ *     waited for like one at the cap.
  *   - If every candidate is at the cap, waits up to `waitMs` for a freed slot
  *     (woken by release()), then OVERFLOWS onto the best candidate
  *     (`overflow: true`) rather than dropping. Returns null only when pick()
@@ -468,7 +470,7 @@ export function createBalanceLimiter({ now = () => Date.now(), setTimer = setTim
     for (;;) {
       const best = pick();
       if (!best) return null;
-      if (best.inflight < cap) {
+      if (!best.wait && (best.inflight < cap || best.solo)) {
         inflight.acquire(best.key);
         return { ...best, overflow: false };
       }
@@ -554,6 +556,31 @@ export function pickDrainFirst(accounts, stateManager, excludeTokens = new Set()
 }
 
 /**
+ * When an account's weekly limit resets (epoch seconds). Infinity when its weekly window has
+ * not started or is over: nothing on it can be lost by waiting.
+ */
+export function weeklyResetAt(acctState, nowSec = Math.floor(Date.now() / 1000)) {
+  const r = acctState?.resetAt7d || 0;
+  return r > nowSec ? r : Infinity;
+}
+
+/**
+ * "Soonest reset": the available account whose weekly limit resets first, so what is left
+ * on it gets used before the reset takes it away. On a tie, the fuller one goes first.
+ */
+export function pickSoonestReset(accounts, stateManager, excludeTokens = new Set(), model = null, now = Date.now()) {
+  const nowSec = Math.floor(now / 1000);
+  const candidates = accounts
+    .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager, now, model))
+    .map(a => {
+      const st = stateManager.get(a.token);
+      return { a, reset: weeklyResetAt(st, nowSec), score: usageScore(st, model, now) };
+    })
+    .sort((x, y) => (x.reset - y.reset) || (y.score - x.score));
+  return candidates[0] ? { ...candidates[0].a, score: candidates[0].score } : null;
+}
+
+/**
  * Score for the "conserve" strategy.
  * Concentrates usage on accounts whose windows are already active.
  * Weekly utilization is primary (scarce resource  - resets once/week).
@@ -561,12 +588,15 @@ export function pickDrainFirst(accounts, stateManager, excludeTokens = new Set()
  * Untouched accounts (0% on both) score 0  - their windows stay dormant.
  */
 export function scoreAccountConserve(token, stateManager) {
-  const acctState = stateManager.get(token);
+  return conserveScore(stateManager.get(token));
+}
+
+function conserveScore(acctState, nowSec = Math.floor(Date.now() / 1000)) {
   if (!acctState) return 0; // unknown = untouched, preserve it
   // A window whose reset has passed is over: count it as untouched (0), so a fresh week
   // is kept for later instead of looking like the busiest account.
-  const w7d = liveUtil(acctState.utilization7d, acctState.resetAt7d);
-  const w5h = liveUtil(acctState.utilization5h, acctState.resetAt);
+  const w7d = liveUtil(acctState.utilization7d, acctState.resetAt7d, nowSec);
+  const w5h = liveUtil(acctState.utilization5h, acctState.resetAt, nowSec);
   // Weekly dominates (×100), 5hr is tiebreaker (×1)
   return w7d * 100 + w5h;
 }
@@ -584,15 +614,24 @@ export function pickAnyUntried(accounts, excludeTokens) {
 }
 
 /**
- * Pick the least-loaded available account for concurrency load-balancing (`balance` mode).
+ * Pick an account for one request in balance mode: spread the load over several accounts,
+ * capped per account. `opts.strategy` decides which accounts the load is spread over:
  *
- * Among accounts that are available (not limited/expired/cooling-down/used-up for this
- * model) and not excluded, prefers accounts that are not nearly full, then the lowest load
- * (in-flight requests plus `extraLoad`, e.g. warm session lanes pinned there), then the
- * lowest utilization. `prefer` names an account to take when it has a free slot and
- * headroom (keeps a session's subagents next to their parent). The returned `overCap`
- * flag is true when the chosen account is already at or above `cap`  - the caller decides
- * whether to wait for a slot or overflow.
+ *   spread (default)  all available accounts: the lowest load (in-flight requests plus
+ *                     `extraLoad`, e.g. warm session lanes pinned there), then the lowest
+ *                     utilization. Nearly full accounts go last.
+ *   conserve          only accounts whose limit windows have started, so untouched
+ *                     accounts stay dormant. When that is one account, it is `solo`: it
+ *                     takes every request (no cap; waiting could not spread the load).
+ *   soonest-reset     accounts whose weekly limit resets within `withinSec`, then the rest
+ *                     by reset time. The first account with room (load under the cap)
+ *                     wins, so a full group spills onto the account that resets next.
+ *
+ * Accounts that can't take the request (limited, expired, used up for this model) and
+ * excluded tokens are skipped. `prefer` names an account to take when it has a free slot
+ * and fits the strategy (keeps a session's subagents next to their parent). `overCap` is
+ * true when the chosen account is at or above `cap`: the caller waits for a slot or
+ * overflows.
  *
  * @param {Array}  accounts        - account objects { name, token, expiresAt, ... }
  * @param {object} inflightTracker - createInflightTracker() instance (keyed by account name)
@@ -600,33 +639,70 @@ export function pickAnyUntried(accounts, excludeTokens) {
  * @param {number} cap             - max concurrent in-flight per account
  * @param {Set}    excludeTokens   - tokens to skip (already tried this request)
  * @param {number} [now]           - current time (for testing cooldown windows)
- * @param {object} [opts]          - { model, extraLoad: { [name]: n }, prefer: name }
- * @returns {{ account: object, inflight: number, overCap: boolean } | null}
+ * @param {object} [opts]          - { model, extraLoad: { [name]: n }, prefer: name, strategy, withinSec,
+ *                                     cooled: tokens excluded only for a short cooldown }
+ * @returns {{ account: object, inflight: number, overCap: boolean, solo: boolean, wait?: boolean } | null}
+ *   `wait`: the account is cooling down; wait for it rather than send now.
  */
 export function pickLeastLoaded(accounts, inflightTracker, stateManager, cap, excludeTokens = new Set(), now = Date.now(), opts = {}) {
-  const { model = null, extraLoad = null, prefer = null } = opts;
+  const { model = null, extraLoad = null, prefer = null, strategy = 'spread', withinSec = 48 * 3600, cooled = null } = opts;
+  const nowSec = Math.floor(now / 1000);
   const candidates = accounts
     .filter(a => !excludeTokens.has(a.token) && isAccountAvailable(a.token, a.expiresAt, stateManager, now, model))
     .map(a => {
+      const st = stateManager.get(a.token);
       const inflight = inflightTracker.get(a.name);
-      const score = usageScore(stateManager.get(a.token), model, now);
+      const score = usageScore(st, model, now);
       return {
         account: a,
         inflight,
         load: inflight + ((extraLoad && extraLoad[a.name]) || 0),
         score,
         nearFull: score >= NEAR_FULL_UTILIZATION ? 1 : 0,
+        reset: weeklyResetAt(st, nowSec),
+        used: conserveScore(st, nowSec),
       };
-    })
-    .sort((x, y) => (x.nearFull - y.nearFull) || (x.load - y.load) || (x.score - y.score));
+    });
+  if (!candidates.length) return null;
+  const out = (c, solo = false) => ({ account: c.account, inflight: c.inflight, overCap: !solo && c.inflight >= cap, solo });
+  const preferred = prefer ? candidates.find(c => c.account.name === prefer && c.inflight < cap) : null;
 
-  let best = candidates[0];
-  if (!best) return null;
-  if (prefer) {
-    const p = candidates.find(c => c.account.name === prefer);
-    if (p && !p.nearFull && p.inflight < cap) best = p;
+  if (strategy === 'soonest-reset') {
+    const near = (c) => c.reset - nowSec <= withinSec;
+    const byReset = (x, y) => (x.reset === y.reset ? 0 : x.reset < y.reset ? -1 : 1);
+    const group = candidates.filter(near).sort((x, y) => (x.load - y.load) || byReset(x, y) || (y.score - x.score));
+    // Accounts whose week has not started all tie on reset (Infinity): keep them in a fixed
+    // order, not by load, so a burst fills one of them before it starts the next week.
+    const rest = candidates.filter(c => !near(c))
+      .sort((x, y) => byReset(x, y) || (x.reset === Infinity ? 0 : x.load - y.load) || (y.score - x.score));
+    const order = group.concat(rest);
+    const best = order.find(c => c.load < cap) || order[0];
+    if (preferred && (near(preferred) || preferred.reset <= best.reset)) return out(preferred);
+    return out(best);
   }
-  return { account: best.account, inflight: best.inflight, overCap: best.inflight >= cap };
+
+  if (strategy === 'conserve') {
+    const started = candidates.filter(c => c.used > 0);
+    const startedElsewhere = !started.length && accounts.filter(a => conserveScore(stateManager.get(a.token), nowSec) > 0
+      && isAccountAvailable(a.token, a.expiresAt, stateManager, now, model));
+    if (startedElsewhere && startedElsewhere.length) {
+      // The started accounts are only cooling down or already tried for this request: that
+      // is no reason to wake a dormant one. A cooling one is waited for (`wait`), a tried
+      // one gives null (the caller passes the 429 on).
+      const c = startedElsewhere.find(a => cooled && cooled.has(a.token));
+      return c ? { account: c, inflight: inflightTracker.get(c.name), overCap: true, solo: false, wait: true } : null;
+    }
+    const group = started.length ? started : [candidates[0]];
+    group.sort((x, y) => (x.load - y.load) || (y.used - x.used));
+    const solo = group.length === 1;
+    if (preferred && group.includes(preferred)) return out(preferred, solo);
+    return out(group[0], solo);
+  }
+
+  candidates.sort((x, y) => (x.nearFull - y.nearFull) || (x.load - y.load) || (x.score - y.score));
+  let best = candidates[0];
+  if (preferred && !preferred.nearFull) best = preferred;
+  return out(best);
 }
 
 // ─────────────────────────────────────────────────
@@ -639,17 +715,38 @@ export const ROTATION_STRATEGIES = {
   'round-robin': { label: 'Round-robin',   desc: 'Rotate to lowest-utilization account on a timer' },
   spread:        { label: 'Spread',        desc: 'Always pick lowest utilization (switches often)' },
   'drain-first': { label: 'Drain first',   desc: 'Use highest-utilization account first' },
-  balance:       { label: 'Balance',       desc: 'Spread sessions across accounts by load, capped per account' },
+  'soonest-reset': { label: 'Soonest reset', desc: 'Use the account whose weekly limit resets first, so what is left on it is not lost' },
 };
 
 export const ROTATION_INTERVALS = [15, 30, 60, 120]; // minutes
+
+// Strategies that can balance load: spread sessions over several accounts, capped per account
+// (the "Balance" switch). Sticky, round-robin and drain-first send everything to one account.
+export const BALANCE_STRATEGIES = new Set(['spread', 'conserve', 'soonest-reset']);
+
+// "Soonest reset" + balance: accounts whose weekly limit resets within this many hours share the load.
+export const BALANCE_WITHIN_HOURS = [24, 48, 72];
+
+/**
+ * The rotation settings, cleaned. Before v4.6 "balance" was a strategy of its own: it is
+ * spread with the Balance switch on. An unknown strategy becomes conserve (the default).
+ */
+export function normalizeRotation(strategy, balanceLoad) {
+  if (strategy === 'balance') return { rotationStrategy: 'spread', balanceLoad: true };
+  return { rotationStrategy: isRotationStrategy(strategy) ? strategy : 'conserve', balanceLoad: balanceLoad === true };
+}
+
+/** A known strategy name (not an Object prototype key like "toString"). */
+export function isRotationStrategy(name) {
+  return typeof name === 'string' && Object.hasOwn(ROTATION_STRATEGIES, name);
+}
 
 /**
  * Pick the proactive account based on rotation strategy.
  * Returns null if the current account should be kept (sticky / timer not elapsed).
  *
  * @param {object} opts
- * @param {string} opts.strategy - 'sticky' | 'conserve' | 'round-robin' | 'spread' | 'drain-first'
+ * @param {string} opts.strategy - 'sticky' | 'conserve' | 'round-robin' | 'spread' | 'drain-first' | 'soonest-reset'
  * @param {number} opts.intervalMin - rotation interval in minutes (for round-robin)
  * @param {string|null} opts.currentToken - token currently in the keychain
  * @param {number} opts.lastRotationTime - timestamp of last proactive rotation
@@ -674,8 +771,10 @@ export function pickByStrategy(opts) {
     isAccountAvailable(currentToken, currentAcct.expiresAt, stateManager, now, model);
 
   if (!currentAvailable) {
-    // Must switch  - pick lowest utilization as safe default
-    const best = pickBestAccount(accounts, stateManager, excludeTokens, model);
+    // Must switch: soonest-reset keeps its order; the others take the lowest utilization as a safe default
+    const best = strategy === 'soonest-reset'
+      ? pickSoonestReset(accounts, stateManager, excludeTokens, model, now)
+      : pickBestAccount(accounts, stateManager, excludeTokens, model);
     return { account: best, rotated: !!best };
   }
 
@@ -719,6 +818,14 @@ export function pickByStrategy(opts) {
       const drain = pickDrainFirst(accounts, stateManager, excludeTokens, model);
       if (drain && drain.token !== currentToken) {
         return { account: drain, rotated: true };
+      }
+      return { account: null, rotated: false };
+    }
+
+    case 'soonest-reset': {
+      const soonest = pickSoonestReset(accounts, stateManager, excludeTokens, model, now);
+      if (soonest && soonest.token !== currentToken) {
+        return { account: soonest, rotated: true };
       }
       return { account: null, rotated: false };
     }

@@ -20,6 +20,7 @@ struct Profile: Decodable {
   let name: String
   let label: String?
   let isActive: Bool?
+  let isNext: Bool?   // where vdm sends the next new session (newer vdm)
   let expired: Bool?
   let expiresAt: Double?
   let refreshFailed: RefreshFailed?
@@ -80,7 +81,7 @@ func menuLines(_ state: State) -> [String] {
   case .up(let st):
     var lines = ["vdm is running"]
     if let u = st.usedUp { lines.append((u.fable == true ? "Fable is used up on every account until " : "Every account is used up until ") + (u.until ?? "?")) }
-    lines += st.profiles.map { ($0.isActive == true ? "✓ " : "   ") + accountLine($0) }
+    lines += st.profiles.map { (($0.isNext ?? $0.isActive) == true ? "✓ " : "   ") + accountLine($0) }
     return lines
   }
 }
