@@ -1170,18 +1170,31 @@ stop_plain_dashboard() {
   wait_port_free "$PROXY_PORT" 5 || true
 }
 
-# The shell block: sets ANTHROPIC_BASE_URL; starts vdm only when the daemon is not installed.
+# The shell block: starts vdm only when the daemon is not installed, and sets ANTHROPIC_BASE_URL only when the
+# proxy answers. So Claude Code keeps working when vdm is down (it talks to Anthropic with its own login).
 shell_block() {
   cat <<SHELL_EOF
 # BEGIN claude-account-switcher
-if ! lsof -iTCP:3333 -sTCP:LISTEN -t >/dev/null 2>&1; then
+_vdm_wait=1
+if ! lsof -iTCP:$DASHBOARD_PORT -sTCP:LISTEN -t >/dev/null 2>&1; then
   # The daemon (vdm daemon on) runs vdm when it is loaded; else start it here
   if ! { [ -f "\$HOME/Library/LaunchAgents/$LAUNCH_LABEL.plist" ] && launchctl print "gui/\$(id -u)/$LAUNCH_LABEL" >/dev/null 2>&1; }; then
     nohup node ~/.claude/account-switcher/dashboard.mjs >/dev/null 2>&1 &
     disown
+    _vdm_wait=6 # just started: wait up to 3 s for the proxy
   fi
 fi
-export ANTHROPIC_BASE_URL=http://localhost:3334
+# Use the proxy only when it answers. A terminal opened while vdm ran keeps it: open a new one after vdm stops.
+while :; do
+  if nc -z localhost $PROXY_PORT >/dev/null 2>&1; then export ANTHROPIC_BASE_URL=http://localhost:$PROXY_PORT; break; fi
+  _vdm_wait=\$((_vdm_wait - 1))
+  if [ "\$_vdm_wait" -le 0 ]; then
+    if [ "\${ANTHROPIC_BASE_URL:-}" = "http://localhost:$PROXY_PORT" ]; then unset ANTHROPIC_BASE_URL; fi
+    break
+  fi
+  sleep 0.5
+done
+unset _vdm_wait
 # END claude-account-switcher
 SHELL_EOF
 }

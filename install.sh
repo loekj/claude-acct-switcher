@@ -101,7 +101,7 @@ rm -f "$LINK_DIR/csw"
 echo -e "  ${GREEN}✓${NC} Linked ${CYAN}vdm${NC} to ${DIM}$LINK_DIR${NC}"
 
 # ── Configure shell ──
-# Sets ANTHROPIC_BASE_URL; starts vdm in new terminals only while the daemon is off
+# Sets ANTHROPIC_BASE_URL only when the proxy answers; starts vdm in new terminals only while the daemon is off
 
 SHELL_RC="$("$INSTALL_DIR/vdm" _setup-shell || true)"
 if [[ -n "$SHELL_RC" ]]; then

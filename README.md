@@ -37,7 +37,7 @@ Restart your terminal. Done.
 
 The installer:
 - copies vdm to `~/.claude/account-switcher/` and links the `vdm` command,
-- sets `ANTHROPIC_BASE_URL=http://localhost:3334` in your shell file (`.zshrc` or `.bashrc`),
+- adds a block to your shell file (`.zshrc` or `.bashrc`) that sets `ANTHROPIC_BASE_URL=http://localhost:3334` when vdm answers,
 - turns on the **daemon**: vdm runs in the background, starts when you log in, and starts again after a crash,
 - builds the **menu bar icon**, if the Command Line Tools are installed.
 
@@ -96,7 +96,7 @@ vdm menubar off      Remove the icon
 - **Why a daemon.** Without it, your shell starts vdm when you open a terminal. After a crash or a reboot, vdm stays down until you open a new terminal, and Claude Code cannot connect meanwhile. The daemon is the same program (same ports, same memory: about 70 MB), but macOS keeps it running.
 - **Files.** `~/Library/LaunchAgents/io.github.loekj.vdm.plist` (daemon) and `io.github.loekj.vdm.menubar.plist` (icon). The log is `~/.claude/account-switcher/dashboard.log` (emptied when it passes 10 MB).
 - **Stop for a while.** `vdm dashboard stop` (or the icon's *Quit vdm…*) stops vdm until your next login (or `vdm dashboard start`). A crash restarts it; a stop does not.
-- **Your shell file** still sets `ANTHROPIC_BASE_URL`. It starts vdm only when the daemon is not loaded. vdm updates the block in place, also through a symlink (dotfiles repo), and keeps a backup (`.zshrc.vdm-backup`).
+- **Your shell file** sets `ANTHROPIC_BASE_URL` only when the vdm proxy answers. When vdm is down, a new terminal leaves it unset, so Claude Code talks to Anthropic directly with its own login. A terminal opened while vdm ran keeps the proxy: open a new one after you stop vdm. The block starts vdm only when the daemon is not loaded, and then waits up to 3 s for it. vdm updates the block in place, also through a symlink (dotfiles repo), and keeps a backup (`.zshrc.vdm-backup`).
 - **Node from nvm, fnm, asdf, mise or volta?** The daemon remembers the real path of `node` (not the shim). If that version is removed, it falls back to Homebrew's `node`, and `vdm daemon status` tells you to run `vdm daemon on` again.
 - **No GUI login (only SSH)?** launchd cannot start the daemon then; `vdm dashboard start` and new terminals start vdm the old way.
 - **Sessions you start with *Start in background*** keep running when vdm restarts or upgrades.
